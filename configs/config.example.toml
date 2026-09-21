@@ -2,7 +2,9 @@
 # file behaves exactly like no file at all.
 #
 # Environment variables override the file. Nesting uses a double underscore:
-# MAST__MQTT__ADDR=":8883" sets mqtt.addr.
+# MAST__MQTT__ADDR=":8883" sets mqtt.addr. List settings — core.routes and
+# edge.core_urls — are comma-separated:
+# MAST__EDGE__CORE_URLS="nats-leaf://a:7422,nats-leaf://b:7422"
 
 # all-in-one runs both jobs in one process with no cluster, which is the right
 # answer for an edge site or a laptop. Split into core and edge once the MQTT

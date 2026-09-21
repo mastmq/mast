@@ -280,12 +280,8 @@ func Load(path string) (Config, error) {
 	}
 
 	envProvider := env.Provider(".", env.Opt{
-		Prefix: EnvPrefix,
-		TransformFunc: func(key, value string) (string, any) {
-			key = strings.ToLower(strings.TrimPrefix(key, EnvPrefix))
-
-			return strings.ReplaceAll(key, "__", "."), value
-		},
+		Prefix:        EnvPrefix,
+		TransformFunc: transformEnv,
 	})
 
 	if err := k.Load(envProvider, nil); err != nil {
@@ -298,6 +294,45 @@ func Load(path string) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// isListKey reports whether a setting's value is a list. A comma-separated
+// environment variable is split for these and only these: splitting every
+// value would corrupt anything that legitimately contains a comma, such as a
+// URL with a query parameter or a header.
+func isListKey(key string) bool {
+	switch key {
+	case "core.routes", "edge.core_urls":
+		return true
+	default:
+		return false
+	}
+}
+
+// transformEnv maps MAST__SECTION__KEY onto section.key, splitting the values
+// of list-valued settings on commas.
+//
+// koanf's env provider has no list syntax of its own, so without this a
+// multi-node deployment could not be configured by environment alone — which
+// is exactly how a container is usually configured.
+func transformEnv(key, value string) (string, any) {
+	key = strings.ToLower(strings.TrimPrefix(key, EnvPrefix))
+	key = strings.ReplaceAll(key, "__", ".")
+
+	if !isListKey(key) {
+		return key, value
+	}
+
+	if strings.TrimSpace(value) == "" {
+		return key, []string{}
+	}
+
+	parts := strings.Split(value, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+
+	return key, parts
 }
 
 // Validate reports the first reason cfg could not be run.
