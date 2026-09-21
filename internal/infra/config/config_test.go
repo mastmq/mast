@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -106,6 +107,31 @@ func TestEnvDoesNotSplitScalars(t *testing.T) {
 
 	if want := "http://policy/auth?tags=a,b,c"; cfg.Auth.HTTP.AuthnURL != want {
 		t.Errorf("authn_url = %q, want %q — a comma in a scalar must not split", cfg.Auth.HTTP.AuthnURL, want)
+	}
+}
+
+// TestEnvHeaderNames covers a bug the Helm chart would otherwise have
+// shipped: an environment variable cannot contain a hyphen, so a header has
+// to arrive as X_TENANT_HINT and must be turned back into X-Tenant-Hint
+// before it goes on the wire.
+//
+// Not parallel: t.Setenv and t.Parallel are mutually exclusive.
+func TestEnvHeaderNames(t *testing.T) {
+	t.Setenv("MAST__AUTH__HTTP__HEADERS__AUTHORIZATION", "Bearer tok")
+	t.Setenv("MAST__AUTH__HTTP__HEADERS__X_TENANT_HINT", "edge-1")
+
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	want := map[string]string{
+		"authorization": "Bearer tok",
+		"x-tenant-hint": "edge-1",
+	}
+
+	if !maps.Equal(cfg.Auth.HTTP.Headers, want) {
+		t.Errorf("headers = %v, want %v", cfg.Auth.HTTP.Headers, want)
 	}
 }
 

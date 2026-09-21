@@ -309,15 +309,29 @@ func isListKey(key string) bool {
 	}
 }
 
+// headersPrefix is the config path under which every key is an HTTP header
+// name rather than a setting of ours.
+const headersPrefix = "auth.http.headers."
+
 // transformEnv maps MAST__SECTION__KEY onto section.key, splitting the values
-// of list-valued settings on commas.
+// of list-valued settings on commas and restoring hyphens in header names.
 //
-// koanf's env provider has no list syntax of its own, so without this a
+// koanf's env provider has no list syntax of its own, so without the split a
 // multi-node deployment could not be configured by environment alone — which
 // is exactly how a container is usually configured.
 func transformEnv(key, value string) (string, any) {
 	key = strings.ToLower(strings.TrimPrefix(key, EnvPrefix))
 	key = strings.ReplaceAll(key, "__", ".")
+
+	// An environment variable cannot contain a hyphen, so a header like
+	// X-Tenant-Hint has to arrive as X_TENANT_HINT. Turn the remaining
+	// underscores back into hyphens, or the header would go out on the wire
+	// as "x_tenant_hint" and the policy server would never see it. HTTP
+	// header names do not conventionally contain underscores, and some
+	// servers reject the ones that do, so this direction is unambiguous.
+	if name, ok := strings.CutPrefix(key, headersPrefix); ok {
+		return headersPrefix + strings.ReplaceAll(name, "_", "-"), value
+	}
 
 	if !isListKey(key) {
 		return key, value
