@@ -176,9 +176,7 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	// A connection on the internal listener is trusted by virtue of having
 	// reached it. Nothing is asked of it and nothing is asked about it later.
 	if h.isInternal(cl) {
-		h.mu.Lock()
-		h.tenants[cl.ID] = tenant.Identity{Tenant: h.internalTenant, Superuser: true}
-		h.mu.Unlock()
+		h.onConnected(cl, tenant.Identity{Tenant: h.internalTenant, Superuser: true})
 
 		return true
 	}
@@ -198,16 +196,9 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 		return false
 	}
 
-	h.mu.Lock()
-	h.tenants[cl.ID] = identity
-	h.mu.Unlock()
-
 	h.log.Debug("client authenticated",
 		"client", cl.ID, "tenant", string(identity.Tenant), "superuser", identity.Superuser)
-	h.count(func(m *obs.Metrics) {
-		m.ConnectionsTotal.WithLabelValues(string(identity.Tenant)).Inc()
-		m.ConnectionsOpen.WithLabelValues(string(identity.Tenant)).Inc()
-	})
+	h.onConnected(cl, identity)
 
 	return true
 }
@@ -366,6 +357,13 @@ func (h *Hook) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet) {
 // case this is through expire, which it computes from the clean flag and the
 // v5 session expiry interval.
 func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
+	// The connection is gone either way, so the gauge drops either way.
+	// Only the session's other state depends on whether it expires — and
+	// conflating the two is what made this gauge drift: a persistent
+	// session reconnecting was counted twice, once per CONNECT, and never
+	// decremented in between.
+	h.onDisconnected(cl)
+
 	if !expire {
 		h.log.Debug("client away, session retained", "client", cl.ID)
 
@@ -721,15 +719,38 @@ func (h *Hook) forget(clientID string) {
 	h.subs.releaseAll(clientID)
 
 	h.mu.Lock()
-	identity, known := h.tenants[clientID]
 	delete(h.tenants, clientID)
 	h.mu.Unlock()
+}
 
-	if known {
-		h.count(func(m *obs.Metrics) {
-			m.ConnectionsOpen.WithLabelValues(string(identity.Tenant)).Dec()
-		})
+// onConnected records an established connection, whichever listener it
+// arrived on.
+//
+// Both listeners come through here precisely because they did not before:
+// the internal listener returned early, so a node holding thousands of
+// connections on it reported none, and the gauge was blind to the one
+// listener a load test is most likely to use.
+func (h *Hook) onConnected(cl *mqtt.Client, identity tenant.Identity) {
+	h.mu.Lock()
+	h.tenants[cl.ID] = identity
+	h.mu.Unlock()
+
+	h.count(func(m *obs.Metrics) {
+		m.ConnectionsTotal.WithLabelValues(string(identity.Tenant)).Inc()
+		m.ConnectionsOpen.WithLabelValues(string(identity.Tenant)).Inc()
+	})
+}
+
+// onDisconnected records a connection going away.
+func (h *Hook) onDisconnected(cl *mqtt.Client) {
+	identity, known := h.identityOf(cl)
+	if !known {
+		return
 	}
+
+	h.count(func(m *obs.Metrics) {
+		m.ConnectionsOpen.WithLabelValues(string(identity.Tenant)).Dec()
+	})
 }
 
 // count records a metric when metrics are enabled, so every call site stays

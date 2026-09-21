@@ -677,3 +677,86 @@ func TestJWTAuthEndToEnd(t *testing.T) {
 		}
 	})
 }
+
+// TestConnectionMetrics pins two gauge bugs found while load testing.
+//
+// Connections on the internal listener were not counted at all, because
+// authentication returned early on that path — so a node holding thousands
+// of them reported none, and the gauge was blind to the one listener a load
+// test is most likely to use.
+//
+// And a persistent session inflated the count: its disconnect deliberately
+// does not forget the session, and the decrement had been attached to that
+// same branch, so each reconnect added one and nothing ever subtracted.
+func TestConnectionMetrics(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Default()
+	cfg.MQTT.Addr = freeAddr(t)
+	cfg.MQTT.InternalAddr = freeAddr(t)
+	cfg.NATS.MonitorAddr = ""
+	cfg.Core.StoreDir = t.TempDir()
+	cfg.Obs.Addr = freeAddr(t)
+	// The internal listener bypasses the resolver and places its clients in
+	// tenant.default, so the two have to agree for both listeners to land in
+	// one tenant. A deployment where they disagree has two tenants without
+	// meaning to.
+	cfg.Tenant.Default = "acme"
+
+	log := slog.New(slog.DiscardHandler)
+
+	node, err := broker.Start(t.Context(), cfg, tenant.Static{Tenant: "acme"}, tenant.AllowAll{}, log)
+	if err != nil {
+		t.Fatalf("starting broker: %v", err)
+	}
+
+	t.Cleanup(node.Close)
+
+	open := func() int {
+		t.Helper()
+
+		for line := range strings.SplitSeq(scrape(t, "http://"+cfg.Obs.Addr+"/metrics"), "\n") {
+			if after, ok := strings.CutPrefix(line, `mast_connections_open{tenant="acme"} `); ok {
+				var n int
+				if _, err := fmt.Sscanf(after, "%d", &n); err == nil {
+					return n
+				}
+			}
+		}
+
+		return 0
+	}
+
+	t.Run("internal listener connections are counted", func(t *testing.T) {
+		before := open()
+
+		c := connect(t, cfg.MQTT.InternalAddr, "internal-counted", "")
+		if !waitFor(func() bool { return open() == before+1 }) {
+			t.Errorf("an internal-listener connection did not move the gauge: %d -> %d", before, open())
+		}
+
+		c.client.Disconnect(200)
+
+		if !waitFor(func() bool { return open() == before }) {
+			t.Errorf("the gauge did not drop on disconnect: %d, want %d", open(), before)
+		}
+	})
+
+	t.Run("a persistent session does not inflate the count", func(t *testing.T) {
+		before := open()
+
+		for range 3 {
+			c := connectAs(t, cfg.MQTT.Addr, "persistent-counted", false)
+
+			if !waitFor(func() bool { return open() == before+1 }) {
+				t.Fatalf("connect did not move the gauge: %d, want %d", open(), before+1)
+			}
+
+			c.Disconnect(200)
+
+			if !waitFor(func() bool { return open() == before }) {
+				t.Fatalf("reconnecting a persistent session left the gauge at %d, want %d", open(), before)
+			}
+		}
+	})
+}
