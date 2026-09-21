@@ -1,6 +1,6 @@
-# mast
-
-Multi-tenant MQTT broker built on core NATS. One binary, one artifact, from a single edge box to a clustered fleet.
+<div align="center">
+  <img src="https://raw.githubusercontent.com/mastmq/.github/main/assets/banner.png" alt="mast — multi-tenant MQTT broker built on core NATS" width="760">
+</div>
 
 > **Status: early, but it runs.** A single `mast` process starts an embedded nats-server, terminates MQTT, and moves messages end to end with tenant isolation, wildcards, and shared subscriptions. Persistence is not wired yet, so QoS is 0 across the bridge, sessions do not survive a restart, and retained messages are node-local. See [what works](#what-works).
 
