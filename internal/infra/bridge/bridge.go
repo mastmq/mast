@@ -42,6 +42,7 @@ import (
 
 	"github.com/mastmq/mast/internal/domain/tenant"
 	"github.com/mastmq/mast/internal/domain/topic"
+	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/packets"
@@ -91,6 +92,8 @@ type Hook struct {
 	mu      sync.RWMutex
 	tenants map[string]tenant.Identity
 
+	metrics *obs.Metrics
+
 	// internalListener is the mochi listener id whose connections skip
 	// authentication, and internalTenant is where they land.
 	internalListener string
@@ -99,6 +102,9 @@ type Hook struct {
 
 // Options configures a [Hook].
 type Options struct {
+	// Metrics records broker activity. Nil disables recording.
+	Metrics *obs.Metrics
+
 	// InternalListener is the mochi listener id that bypasses authentication
 	// and authorization. Empty disables the bypass.
 	InternalListener string
@@ -119,6 +125,7 @@ func New(
 	log *slog.Logger,
 ) *Hook {
 	h := &Hook{
+		metrics:          opts.Metrics,
 		internalListener: opts.InternalListener,
 		internalTenant:   opts.InternalTenant,
 		HookBase:         mqtt.HookBase{},
@@ -186,6 +193,7 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	})
 	if err != nil {
 		h.log.Debug("authentication refused", "client", cl.ID, "error", err)
+		h.count(func(m *obs.Metrics) { m.AuthFailures.WithLabelValues("refused").Inc() })
 
 		return false
 	}
@@ -196,6 +204,10 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 
 	h.log.Debug("client authenticated",
 		"client", cl.ID, "tenant", string(identity.Tenant), "superuser", identity.Superuser)
+	h.count(func(m *obs.Metrics) {
+		m.ConnectionsTotal.WithLabelValues(string(identity.Tenant)).Inc()
+		m.ConnectionsOpen.WithLabelValues(string(identity.Tenant)).Inc()
+	})
 
 	return true
 }
@@ -300,6 +312,8 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	if err := h.nc.PublishMsg(msg); err != nil {
 		h.log.Error("forwarding publish to nats", "subject", subject, "error", err)
 	}
+
+	h.count(func(m *obs.Metrics) { m.MessagesIn.WithLabelValues(string(id)).Inc() })
 
 	return pk, packets.CodeSuccessIgnore
 }
@@ -495,7 +509,11 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 
 	if err := h.server.Publish(mount(tenant.ID(tenantID), mqttTopic), msg.Data, false, qos); err != nil {
 		h.log.Error("injecting message from nats", "subject", msg.Subject, "error", err)
+
+		return
 	}
+
+	h.count(func(m *obs.Metrics) { m.MessagesOut.WithLabelValues(tenantID).Inc() })
 }
 
 // qosOf reads the QoS a message was published at, defaulting to 0 for
@@ -642,6 +660,12 @@ func (h *Hook) replayRetained(cl *mqtt.Client, id tenant.ID, filter packets.Subs
 		return
 	}
 
+	if len(messages) > 0 {
+		h.count(func(m *obs.Metrics) {
+			m.RetainedReplayed.WithLabelValues(string(id)).Add(float64(len(messages)))
+		})
+	}
+
 	for _, msg := range messages {
 		if err := h.writeRetained(cl, id, filter, msg); err != nil {
 			h.log.Debug("delivering retained message",
@@ -697,8 +721,23 @@ func (h *Hook) forget(clientID string) {
 	h.subs.releaseAll(clientID)
 
 	h.mu.Lock()
+	identity, known := h.tenants[clientID]
 	delete(h.tenants, clientID)
 	h.mu.Unlock()
+
+	if known {
+		h.count(func(m *obs.Metrics) {
+			m.ConnectionsOpen.WithLabelValues(string(identity.Tenant)).Dec()
+		})
+	}
+}
+
+// count records a metric when metrics are enabled, so every call site stays
+// a single line rather than a nil check.
+func (h *Hook) count(record func(*obs.Metrics)) {
+	if h.metrics != nil {
+		record(h.metrics)
+	}
 }
 
 // isInternal reports whether a client arrived on the unauthenticated

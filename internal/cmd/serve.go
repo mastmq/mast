@@ -56,6 +56,10 @@ func serve(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	// Close bounds its own shutdown. Handing it ctx would be worse than
+	// useless: ctx is already cancelled by the time shutdown runs, so it
+	// would abort the drain it exists to perform.
+	//nolint:contextcheck // deliberate, see above
 	defer node.Close()
 
 	log.InfoContext(ctx, "ready",

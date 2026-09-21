@@ -17,8 +17,11 @@ import (
 	"github.com/mastmq/mast/internal/infra/config"
 	"github.com/mastmq/mast/internal/infra/mqttd"
 	"github.com/mastmq/mast/internal/infra/natsd"
+	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mochi-mqtt/server/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
 // storeOpenTimeout bounds bucket creation at startup.
@@ -30,6 +33,7 @@ type Broker struct {
 	hook   *bridge.Hook
 	server *mqtt.Server
 	store  *store.Store
+	obs    *obs.Server
 	log    *slog.Logger
 }
 
@@ -65,7 +69,7 @@ func Start(
 		return nil, err
 	}
 
-	b := &Broker{nats: nats, hook: nil, server: nil, store: nil, log: log}
+	b := &Broker{nats: nats, hook: nil, server: nil, store: nil, obs: nil, log: log}
 
 	// A core node carries storage and consensus and terminates no MQTT.
 	if cfg.Role == config.RoleCore {
@@ -85,10 +89,22 @@ func Start(
 		return nil, err
 	}
 
+	// The subscription gauge reads through the hook, so the registry is
+	// built before it and handed the accessor.
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collectors.NewGoCollector())
+	//nolint:exhaustruct_v5 // the collector's defaults are what we want
+	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+
+	metrics := obs.NewMetrics(registry, func() float64 { return float64(b.Subscriptions()) })
+
 	b.hook = bridge.New(nats.Conn(), b.store, resolver, policy, bridge.Options{
+		Metrics:          metrics,
 		InternalListener: mqttd.InternalListenerID,
 		InternalTenant:   tenant.ID(cfg.Tenant.Default),
 	}, log)
+
+	b.obs = obs.Serve(cfg.Obs.Addr, registry, log)
 
 	b.server, err = mqttd.New(cfg, b.hook, log)
 	if err != nil {
@@ -110,6 +126,8 @@ func Start(
 // Close stops the node, MQTT first so that no new message enters the bridge
 // after the fabric beneath it has gone.
 func (b *Broker) Close() {
+	b.obs.Close()
+
 	if b.server != nil {
 		if err := b.server.Close(); err != nil {
 			b.log.Warn("closing mqtt server", "error", err)

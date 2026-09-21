@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -444,4 +445,83 @@ func TestHTTPAuthEndToEnd(t *testing.T) {
 			t.Errorf("a topic the policy server denied was delivered: %v", got)
 		}
 	})
+}
+
+// TestMetricsEndpoint covers a setting that used to be a lie: obs.addr was
+// configurable, the Helm chart wired a port and a ServiceMonitor to it, and
+// nothing served anything there.
+func TestMetricsEndpoint(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Default()
+	cfg.MQTT.Addr = freeAddr(t)
+	cfg.NATS.MonitorAddr = ""
+	cfg.Core.StoreDir = t.TempDir()
+	cfg.Obs.Addr = freeAddr(t)
+
+	log := slog.New(slog.DiscardHandler)
+
+	node, err := broker.Start(t.Context(), cfg, tenant.Static{Tenant: "acme"}, tenant.AllowAll{}, log)
+	if err != nil {
+		t.Fatalf("starting broker: %v", err)
+	}
+
+	t.Cleanup(node.Close)
+
+	// Generate something worth counting.
+	sub := connect(t, cfg.MQTT.Addr, "metrics-sub", "acme")
+	sub.subscribe(t, "metrics/#")
+	connect(t, cfg.MQTT.Addr, "metrics-pub", "acme").publish(t, "metrics/x", "1")
+
+	if !waitFor(func() bool { return len(sub.messages()) > 0 }) {
+		t.Fatal("message not delivered, so there is nothing to count")
+	}
+
+	body := scrape(t, "http://"+cfg.Obs.Addr+"/metrics")
+
+	for _, want := range []string{
+		`mast_connections_total{tenant="acme"}`,
+		`mast_connections_open{tenant="acme"}`,
+		`mast_messages_in_total{tenant="acme"}`,
+		`mast_messages_out_total{tenant="acme"}`,
+		"mast_nats_subscriptions",
+		"go_goroutines",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics does not expose %s", want)
+		}
+	}
+
+	if health := scrape(t, "http://"+cfg.Obs.Addr+"/healthz"); !strings.Contains(health, "ok") {
+		t.Errorf("/healthz returned %q", health)
+	}
+
+	// pprof earns its place the first time a broker leaks goroutines under
+	// load and cannot be redeployed with a debug build.
+	if idx := scrape(t, "http://"+cfg.Obs.Addr+"/debug/pprof/"); !strings.Contains(idx, "goroutine") {
+		t.Error("/debug/pprof is not served")
+	}
+}
+
+func scrape(t *testing.T, url string) string {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading %s: %v", url, err)
+	}
+
+	return string(body)
 }
