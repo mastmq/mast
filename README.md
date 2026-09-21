@@ -2,7 +2,20 @@
 
 Multi-tenant MQTT broker built on core NATS. One binary, one artifact, from a single edge box to a clustered fleet.
 
-> **Status: early.** The topic codec, configuration, and command tree are in place and tested. The runtime — embedded nats-server, the mochi-mqtt bridge, and the KV-backed session store — is not written yet. `mast` currently resolves its configuration, reports the role it would run, and exits.
+> **Status: early, but it runs.** A single `mast` process starts an embedded nats-server, terminates MQTT, and moves messages end to end with tenant isolation, wildcards, and shared subscriptions. Persistence is not wired yet, so QoS is 0 across the bridge, sessions do not survive a restart, and retained messages are node-local. See [what works](#what-works).
+
+## What works
+
+Verified by the end-to-end tests in `internal/infra/broker`, which drive a real MQTT client against a real node:
+
+- Publish and subscribe across the NATS fabric, including `+` and `#` wildcards
+- `foo/#` matching `foo` itself, which needs the second subscription `FilterSubjects` opens
+- Topics containing `.`, a leading `/`, empty levels, and non-ASCII, all arriving byte-identical
+- **Tenant isolation** — two tenants subscribing to the same topic never see each other's traffic
+- **Shared subscriptions** — `$share/<group>/<filter>` maps onto a NATS queue group, and each message reaches exactly one member
+- One NATS subscription per distinct filter rather than per device
+
+Not yet: QoS 1 and 2 across the bridge, persistent sessions, offline queues, cluster-wide retained messages, and per-tenant quotas. Those all need the KV-backed session store, which is the next piece.
 
 ## Why
 

@@ -42,5 +42,12 @@ replicas = 1          # use 3 for a real core tier
 core_urls = []        # required in the edge role
 credentials = ""
 
+[tenant]
+# Every connection resolves to this tenant while mast ships only the static
+# resolver. A real deployment replaces the resolver with one backed by its own
+# identity system, exactly as BifroMQ's auth provider does: mast does not own
+# tenant lifecycle.
+default = "default"
+
 [obs]
 addr = "127.0.0.1:9090"  # /metrics and net/http/pprof

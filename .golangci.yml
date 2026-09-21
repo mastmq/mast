@@ -20,6 +20,9 @@ linters:
       ignore-patterns:
         - '^github\.com/urfave/cli/v3\..*'
         - '^github\.com/knadh/koanf/.*'
+        - '^github\.com/nats-io/.*'
+        - '^github\.com/mochi-mqtt/.*'
+        - '^crypto/tls\..*'
     revive:
       rules:
         - name: exported

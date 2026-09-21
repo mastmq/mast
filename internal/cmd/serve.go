@@ -2,9 +2,10 @@ package cmd
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 
+	"github.com/mastmq/mast/internal/domain/tenant"
+	"github.com/mastmq/mast/internal/infra/broker"
 	"github.com/mastmq/mast/internal/infra/config"
 	"github.com/mastmq/mast/internal/infra/logger"
 	"github.com/urfave/cli/v3"
@@ -44,22 +45,28 @@ func serve(ctx context.Context, cmd *cli.Command) error {
 	log := logger.New(cfg.Log.Level, cfg.Log.Format)
 	slog.SetDefault(log)
 
-	log.InfoContext(ctx, "starting mast",
-		"version", cmd.Version,
+	log.InfoContext(ctx, "starting mast", "version", cmd.Version, "role", string(cfg.Role))
+
+	node, err := broker.Start(
+		cfg,
+		tenant.Static{Tenant: tenant.ID(cfg.Tenant.Default)},
+		tenant.AllowAll{},
+		log,
+	)
+	if err != nil {
+		return err
+	}
+	defer node.Close()
+
+	log.InfoContext(ctx, "ready",
 		"role", string(cfg.Role),
+		"jetstream", node.NATS().JetStreamEnabled(),
+		"mqtt_addr", cfg.MQTT.Addr,
 	)
 
-	switch cfg.Role {
-	case config.RoleEdge:
-		log.InfoContext(ctx, "edge role", "core_urls", cfg.Edge.CoreURLs, "mqtt_addr", cfg.MQTT.Addr)
-	case config.RoleCore:
-		log.InfoContext(ctx, "core role", "store_dir", cfg.Core.StoreDir, "replicas", cfg.Core.Replicas)
-	case config.RoleAllInOne:
-		log.InfoContext(ctx, "all-in-one role", "store_dir", cfg.Core.StoreDir, "mqtt_addr", cfg.MQTT.Addr)
-	}
+	<-ctx.Done()
 
-	// The runtime lands in the next commit: embedded nats-server for the core
-	// and all-in-one roles, a leaf connection for the edge role, and the
-	// mochi-mqtt listeners bridged onto core NATS through internal/domain/topic.
-	return fmt.Errorf("role %s: %w", cfg.Role, errNotImplemented)
+	log.InfoContext(ctx, "shutting down", "nats_subscriptions", node.Subscriptions())
+
+	return nil
 }

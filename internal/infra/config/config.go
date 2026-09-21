@@ -64,13 +64,22 @@ func Roles() []Role { return []Role{RoleAllInOne, RoleCore, RoleEdge} }
 
 // Config is the whole configuration tree.
 type Config struct {
-	Role Role   `json:"role" koanf:"role"`
-	Log  Log    `json:"log"  koanf:"log"`
-	MQTT MQTT   `json:"mqtt" koanf:"mqtt"`
-	NATS NATS   `json:"nats" koanf:"nats"`
-	Core Core   `json:"core" koanf:"core"`
-	Edge Edge   `json:"edge" koanf:"edge"`
-	Obs  Observ `json:"obs"  koanf:"obs"`
+	Role   Role   `json:"role"   koanf:"role"`
+	Log    Log    `json:"log"    koanf:"log"`
+	MQTT   MQTT   `json:"mqtt"   koanf:"mqtt"`
+	NATS   NATS   `json:"nats"   koanf:"nats"`
+	Core   Core   `json:"core"   koanf:"core"`
+	Edge   Edge   `json:"edge"   koanf:"edge"`
+	Obs    Observ `json:"obs"    koanf:"obs"`
+	Tenant Tenant `json:"tenant" koanf:"tenant"`
+}
+
+// Tenant configures how connections are mapped to tenants.
+type Tenant struct {
+	// Default is the tenant every connection resolves to while mast ships
+	// only the static resolver. A real deployment replaces the resolver with
+	// one backed by its own identity system.
+	Default string `json:"default" koanf:"default"`
 }
 
 // Log configures the slog handler.
@@ -171,6 +180,9 @@ func Default() Config {
 		Obs: Observ{
 			Addr: "127.0.0.1:9090",
 		},
+		Tenant: Tenant{
+			Default: "default",
+		},
 	}
 }
 
@@ -223,6 +235,10 @@ func (c Config) Validate() error {
 
 	if c.Role != RoleEdge && c.Core.StoreDir == "" {
 		return ErrCoreNeedsStore
+	}
+
+	if c.Role != RoleCore && c.Tenant.Default == "" {
+		return ErrNoDefaultTenant
 	}
 
 	return nil
