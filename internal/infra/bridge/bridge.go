@@ -34,6 +34,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -46,6 +47,14 @@ import (
 
 // hookID names this hook in mochi's logs.
 const hookID = "mast-bridge"
+
+// Headers carried with every message on the fabric. MQTT delivery semantics
+// do not survive a bare payload, so the parts mochi needs to reproduce them
+// travel alongside it.
+const (
+	headerQoS    = "Mast-Qos"
+	headerRetain = "Mast-Retain"
+)
 
 // ErrNoServer is returned when the hook is started without a server attached.
 var ErrNoServer = errors.New("bridge: no mqtt server attached")
@@ -211,7 +220,15 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		return pk, packets.CodeSuccessIgnore
 	}
 
-	if err := h.nc.Publish(subject, pk.Payload); err != nil {
+	msg := nats.NewMsg(subject)
+	msg.Data = pk.Payload
+	msg.Header.Set(headerQoS, strconv.Itoa(int(pk.FixedHeader.Qos)))
+
+	if pk.FixedHeader.Retain {
+		msg.Header.Set(headerRetain, "1")
+	}
+
+	if err := h.nc.PublishMsg(msg); err != nil {
 		h.log.Error("forwarding publish to nats", "subject", subject, "error", err)
 	}
 
@@ -318,11 +335,32 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 		return
 	}
 
-	// QoS 0 to local subscribers. Raising this needs the session store, so
-	// that an offline subscriber's message has somewhere to wait.
-	if err := h.server.Publish(mount(tenant.ID(tenantID), mqttTopic), msg.Data, false, 0); err != nil {
+	// Inject at the QoS the publisher used. mochi then downgrades per
+	// subscription to the minimum of that and what each subscriber
+	// negotiated, which is what the spec asks for. Without this every
+	// subscriber silently received QoS 0 however it subscribed.
+	qos := qosOf(msg)
+	retain := msg.Header.Get(headerRetain) == "1"
+
+	if err := h.server.Publish(mount(tenant.ID(tenantID), mqttTopic), msg.Data, retain, qos); err != nil {
 		h.log.Error("injecting message from nats", "subject", msg.Subject, "error", err)
 	}
+}
+
+// qosOf reads the QoS a message was published at, defaulting to 0 for
+// anything that reached the subject without going through the bridge.
+func qosOf(msg *nats.Msg) byte {
+	raw := msg.Header.Get(headerQoS)
+	if raw == "" {
+		return 0
+	}
+
+	qos, err := strconv.Atoi(raw)
+	if err != nil || qos < 0 || qos > 2 {
+		return 0
+	}
+
+	return byte(qos)
 }
 
 // sharePrefix introduces a shared subscription. MQTT spells it "$share" and

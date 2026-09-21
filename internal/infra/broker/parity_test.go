@@ -57,10 +57,6 @@ func TestParityQoS(t *testing.T) {
 
 	for _, level := range []byte{0, 1, 2} {
 		t.Run(fmt.Sprintf("qos%d", level), func(t *testing.T) {
-			if level > 0 {
-				t.Skip("gap: subscribers are always delivered at QoS 0 (issue #3)")
-			}
-
 			got := make(chan byte, 4)
 			topic := fmt.Sprintf("parity/qos%d", level)
 
