@@ -1,0 +1,46 @@
+# mast configuration. Every value here is the built-in default, so an empty
+# file behaves exactly like no file at all.
+#
+# Environment variables override the file. Nesting uses a double underscore:
+# MAST__MQTT__ADDR=":8883" sets mqtt.addr.
+
+# all-in-one runs both jobs in one process with no cluster, which is the right
+# answer for an edge site or a laptop. Split into core and edge once the MQTT
+# tier needs to scale and restart independently of Raft.
+role = "all-in-one"
+
+[log]
+level = "info"   # debug, info, warn, error
+format = "text"  # text or json
+
+[mqtt]
+addr = ":1883"
+ws_addr = ""
+tls_cert = ""
+tls_key = ""
+# The main driver of memory at high connection counts. Budget this times the
+# connections you expect per process, not times the whole fleet.
+max_writes_pending = 1024
+connect_timeout = "10s"
+
+[nats]
+name = ""
+# Empty means the embedded server is reachable in-process only. Set it if you
+# want the nats CLI against this node.
+client_addr = ""
+# Keep this on. Without it you have no visibility into your own data plane.
+monitor_addr = "127.0.0.1:8222"
+
+[core]
+routes = []
+listen_addr = ""
+leaf_addr = ""
+store_dir = "./data"  # must be a persistent volume in the core role
+replicas = 1          # use 3 for a real core tier
+
+[edge]
+core_urls = []        # required in the edge role
+credentials = ""
+
+[obs]
+addr = "127.0.0.1:9090"  # /metrics and net/http/pprof

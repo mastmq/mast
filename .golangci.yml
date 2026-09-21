@@ -1,0 +1,52 @@
+---
+version: "2"
+linters:
+  default: all
+  disable:
+    # Keep this list short. Each entry needs a one-line "why".
+    - depguard       # noisy without a curated allowlist; revisit when one exists
+    - gomodguard     # same reasoning as depguard
+    - tagliatelle    # struct tags follow koanf/json naming, not Go style
+    - varnamelen     # short receiver and loop names are idiomatic Go
+    - wsl            # whitespace cop produces churn without signal
+    - exhaustruct    # deprecated in v2.13.0; exhaustruct_v5 replaces it
+    - gosmopolitan   # non-Latin topic literals are deliberate test fixtures
+    - noinlineerr    # `if err := f(); err != nil` is the idiomatic Go form
+  settings:
+    exhaustruct_v5:
+      # Third-party config structs carry dozens of optional fields that exist
+      # to be omitted: cli.Command has 45, and listing them is noise, not
+      # rigor. Our own structs stay enforced.
+      ignore-patterns:
+        - '^github\.com/urfave/cli/v3\..*'
+        - '^github\.com/knadh/koanf/.*'
+    revive:
+      rules:
+        - name: exported
+          arguments: ["checkPrivateReceivers", "disableStutteringCheck"]
+        - name: package-comments
+        - name: var-naming
+    wrapcheck:
+      ignore-package-globs:
+        # Our own packages wrap at the point of failure, where the context
+        # actually lives; re-wrapping at each call site only stutters.
+        - github.com/mastmq/mast/*
+        # The CLI root surfaces errors straight to the user already.
+        - github.com/urfave/cli/v3
+      ignore-sigs:
+        - .Errorf(
+        - errors.New(
+        - errors.Unwrap(
+        - errors.Join(
+        - .Wrap(
+        - .Wrapf(
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          # Table-driven tests repeat literals by design; extracting each one
+          # to a constant makes the table harder to read, not easier.
+          - goconst
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

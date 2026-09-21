@@ -1,0 +1,3 @@
+---
+# Prose is one paragraph per line; the renderer soft-wraps it.
+MD013: false
