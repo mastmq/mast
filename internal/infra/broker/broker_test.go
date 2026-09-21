@@ -27,12 +27,12 @@ const settle = 2 * time.Second
 // which is enough to exercise isolation without an identity system.
 type byUsername struct{}
 
-func (byUsername) Resolve(_ context.Context, creds tenant.Credentials) (tenant.ID, error) {
+func (byUsername) Resolve(_ context.Context, creds tenant.Credentials) (tenant.Identity, error) {
 	if creds.Username == "" {
-		return "", tenant.ErrUnauthenticated
+		return tenant.Identity{}, tenant.ErrUnauthenticated
 	}
 
-	return tenant.ID(creds.Username), nil
+	return tenant.Identity{Tenant: tenant.ID(creds.Username), Superuser: false}, nil
 }
 
 // start brings up an all-in-one node on free ports and returns its MQTT

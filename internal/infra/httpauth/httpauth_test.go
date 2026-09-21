@@ -71,7 +71,7 @@ func TestResolveAllows(t *testing.T) {
 		t.Fatalf("building client: %v", err)
 	}
 
-	id, err := c.Resolve(context.Background(), tenant.Credentials{
+	got, err := c.Resolve(context.Background(), tenant.Credentials{
 		ClientID:        "dev-1",
 		Username:        "u",
 		Password:        []byte("p"),
@@ -83,8 +83,8 @@ func TestResolveAllows(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	}
 
-	if id != "acme" {
-		t.Errorf("tenant = %q, want acme", id)
+	if got.Tenant != "acme" {
+		t.Errorf("tenant = %q, want acme", got.Tenant)
 	}
 
 	// Every CONNECT field the service might key on must actually arrive.
@@ -426,8 +426,8 @@ func TestEMQXWire(t *testing.T) {
 	}
 
 	// EMQX has no tenant field, so the configured one applies.
-	if id != "ignite" {
-		t.Errorf("tenant = %q, want the configured ignite", id)
+	if id.Tenant != "ignite" {
+		t.Errorf("tenant = %q, want the configured ignite", id.Tenant)
 	}
 
 	got, _ := authnBody.Load().(map[string]any)
@@ -489,5 +489,68 @@ func TestEMQXWireNeedsTenant(t *testing.T) {
 	}, discard())
 	if !errors.Is(err, httpauth.ErrNoTenantConfigured) {
 		t.Errorf("error = %v, want ErrNoTenantConfigured", err)
+	}
+}
+
+// TestEMQXSuperuserSkipsAuthz pins behaviour that would otherwise break
+// services on the day of a migration.
+//
+// EMQX never asks about individual topics for a connection whose
+// authentication returned is_superuser, so any ACL rule that would deny such
+// a connection has never been exercised there. A replacement that starts
+// enforcing those rules is not more correct, it is differently behaved, and
+// the difference shows up as production breakage.
+func TestEMQXSuperuserSkipsAuthz(t *testing.T) {
+	t.Parallel()
+
+	var authzCalls atomic.Int64
+
+	srv := newServer(t, func(req map[string]any) (int, any) {
+		if _, isAuthz := req["action"]; isAuthz {
+			authzCalls.Add(1)
+
+			// Deny everything, so any consultation at all is visible.
+			return http.StatusOK, map[string]any{"result": "deny"}
+		}
+
+		username, _ := req["username"].(string)
+
+		return http.StatusOK, map[string]any{
+			"result":       "allow",
+			"is_superuser": username == "admin",
+		}
+	})
+
+	c, err := httpauth.New(httpauth.Options{
+		Wire: httpauth.WireEMQX, Tenant: "ignite",
+		AuthnURL: srv.URL, AuthzURL: srv.URL, Timeout: time.Second,
+	}, discard())
+	if err != nil {
+		t.Fatalf("building client: %v", err)
+	}
+
+	super, err := c.Resolve(context.Background(), tenant.Credentials{Username: "admin"})
+	if err != nil {
+		t.Fatalf("Resolve superuser: %v", err)
+	}
+
+	if !super.Superuser {
+		t.Fatal("is_superuser from the service did not reach the identity")
+	}
+
+	ordinary, err := c.Resolve(context.Background(), tenant.Credentials{Username: "device"})
+	if err != nil {
+		t.Fatalf("Resolve ordinary: %v", err)
+	}
+
+	if ordinary.Superuser {
+		t.Error("an ordinary client was marked superuser")
+	}
+
+	// The bridge is what acts on Superuser, so this asserts the flag is
+	// carried faithfully; that a superuser is never asked is covered where
+	// the decision is made.
+	if authzCalls.Load() != 0 {
+		t.Errorf("authentication made %d authorization calls", authzCalls.Load())
 	}
 }

@@ -57,14 +57,30 @@ func (a Access) Action() string {
 	return "subscribe"
 }
 
-// Resolver maps credentials to the tenant that owns the connection.
+// Identity is what authentication establishes about a connection.
+type Identity struct {
+	// Tenant owns the connection. Every topic is mounted under it.
+	Tenant ID
+
+	// Superuser bypasses authorization entirely for this connection.
+	//
+	// EMQX works this way, and matching it is not optional for a broker
+	// meant to replace one: a service whose token authenticates as a
+	// superuser is never asked about individual topics there, so any ACL
+	// rule that would deny it has never been exercised. Consulting the
+	// policy anyway would enforce rules the old broker ignored and break
+	// services on the day of the switch.
+	Superuser bool
+}
+
+// Resolver maps credentials to the identity behind the connection.
 //
 // This runs on every CONNECT, so at 300k devices a deploy can drive tens of
 // thousands of calls per second. An implementation that makes a synchronous
 // network call per connection will fall over during a reconnect storm; verify
 // credentials locally, or cache aggressively.
 type Resolver interface {
-	Resolve(ctx context.Context, creds Credentials) (ID, error)
+	Resolve(ctx context.Context, creds Credentials) (Identity, error)
 }
 
 // Policy decides whether a connection may publish to or subscribe to a topic.
@@ -83,12 +99,12 @@ type Static struct {
 }
 
 // Resolve implements [Resolver].
-func (s Static) Resolve(_ context.Context, _ Credentials) (ID, error) {
+func (s Static) Resolve(_ context.Context, _ Credentials) (Identity, error) {
 	if s.Tenant == "" {
-		return "", ErrUnauthenticated
+		return Identity{}, ErrUnauthenticated
 	}
 
-	return s.Tenant, nil
+	return Identity{Tenant: s.Tenant, Superuser: false}, nil
 }
 
 // AllowAll permits every operation. It pairs with [Static] for single-tenant

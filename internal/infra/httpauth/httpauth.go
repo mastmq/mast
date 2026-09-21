@@ -242,7 +242,7 @@ type emqxResponse struct {
 func (r emqxResponse) allowed() bool { return r.Result == "allow" }
 
 // Resolve implements [tenant.Resolver]. It always fails closed.
-func (c *Client) Resolve(ctx context.Context, creds tenant.Credentials) (tenant.ID, error) {
+func (c *Client) Resolve(ctx context.Context, creds tenant.Credentials) (tenant.Identity, error) {
 	if c.opts.Wire == WireEMQX {
 		return c.resolveEMQX(ctx, creds)
 	}
@@ -261,18 +261,18 @@ func (c *Client) Resolve(ctx context.Context, creds tenant.Credentials) (tenant.
 		// Deliberately does not log the credentials.
 		c.log.Warn("authentication request failed", "client", creds.ClientID, "error", err)
 
-		return "", err
+		return tenant.Identity{}, err
 	}
 
 	if !reply.Allow {
-		return "", ErrDenied
+		return tenant.Identity{}, ErrDenied
 	}
 
 	if reply.Tenant == "" {
-		return "", ErrNoTenant
+		return tenant.Identity{}, ErrNoTenant
 	}
 
-	return tenant.ID(reply.Tenant), nil
+	return tenant.Identity{Tenant: tenant.ID(reply.Tenant), Superuser: false}, nil
 }
 
 // Allows implements [tenant.Policy].
@@ -370,7 +370,7 @@ type statusError int
 func (e statusError) Error() string { return fmt.Sprintf("status %d", int(e)) }
 
 // resolveEMQX authenticates against a service written for EMQX.
-func (c *Client) resolveEMQX(ctx context.Context, creds tenant.Credentials) (tenant.ID, error) {
+func (c *Client) resolveEMQX(ctx context.Context, creds tenant.Credentials) (tenant.Identity, error) {
 	var reply emqxResponse
 
 	err := c.post(ctx, c.opts.AuthnURL, emqxAuthnRequest{
@@ -383,14 +383,14 @@ func (c *Client) resolveEMQX(ctx context.Context, creds tenant.Credentials) (ten
 		// Deliberately does not log the credentials.
 		c.log.Warn("authentication request failed", "client", creds.ClientID, "error", err)
 
-		return "", err
+		return tenant.Identity{}, err
 	}
 
 	if !reply.allowed() {
-		return "", ErrDenied
+		return tenant.Identity{}, ErrDenied
 	}
 
-	return c.opts.Tenant, nil
+	return tenant.Identity{Tenant: c.opts.Tenant, Superuser: reply.IsSuperuser}, nil
 }
 
 // ask puts one authorization question to the service in the configured wire

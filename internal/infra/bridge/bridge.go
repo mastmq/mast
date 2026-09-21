@@ -89,7 +89,7 @@ type Hook struct {
 	store  *store.Store
 
 	mu      sync.RWMutex
-	tenants map[string]tenant.ID
+	tenants map[string]tenant.Identity
 
 	// internalListener is the mochi listener id whose connections skip
 	// authentication, and internalTenant is where they land.
@@ -130,7 +130,7 @@ func New(
 		log:              log.With("component", "bridge"),
 		server:           nil,
 		subs:             nil,
-		tenants:          make(map[string]tenant.ID),
+		tenants:          make(map[string]tenant.Identity),
 	}
 	h.subs = newRegistry(nc, h.onNATSMessage)
 
@@ -169,13 +169,13 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	// reached it. Nothing is asked of it and nothing is asked about it later.
 	if h.isInternal(cl) {
 		h.mu.Lock()
-		h.tenants[cl.ID] = h.internalTenant
+		h.tenants[cl.ID] = tenant.Identity{Tenant: h.internalTenant, Superuser: true}
 		h.mu.Unlock()
 
 		return true
 	}
 
-	id, err := h.resolver.Resolve(context.Background(), tenant.Credentials{
+	identity, err := h.resolver.Resolve(context.Background(), tenant.Credentials{
 		ClientID:        cl.ID,
 		Username:        string(pk.Connect.Username),
 		Password:        pk.Connect.Password,
@@ -190,10 +190,11 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	}
 
 	h.mu.Lock()
-	h.tenants[cl.ID] = id
+	h.tenants[cl.ID] = identity
 	h.mu.Unlock()
 
-	h.log.Debug("client authenticated", "client", cl.ID, "tenant", string(id))
+	h.log.Debug("client authenticated",
+		"client", cl.ID, "tenant", string(identity.Tenant), "superuser", identity.Superuser)
 
 	return true
 }
@@ -235,14 +236,19 @@ func (h *Hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 // OnACLCheck consults the policy with the tenant resolved at authentication
 // and the topic as the client wrote it, never as the client asserted it.
 func (h *Hook) OnACLCheck(cl *mqtt.Client, mountedTopic string, write bool) bool {
-	id, ok := h.tenantOf(cl)
+	identity, ok := h.identityOf(cl)
 	if !ok {
 		return false
 	}
 
-	if h.isInternal(cl) {
+	// A superuser is never asked about individual topics, exactly as EMQX
+	// does it. Asking anyway would enforce rules the broker being replaced
+	// has never applied to these connections.
+	if identity.Superuser || h.isInternal(cl) {
 		return true
 	}
+
+	id := identity.Tenant
 
 	return h.policy.Allows(context.Background(), tenant.Access{
 		Tenant:     id,
@@ -363,12 +369,19 @@ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 
 // tenantOf returns the tenant resolved for a client at CONNECT.
 func (h *Hook) tenantOf(cl *mqtt.Client) (tenant.ID, bool) {
+	identity, ok := h.identityOf(cl)
+
+	return identity.Tenant, ok
+}
+
+// identityOf returns what authentication established about a client.
+func (h *Hook) identityOf(cl *mqtt.Client) (tenant.Identity, bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	id, ok := h.tenants[cl.ID]
+	identity, ok := h.tenants[cl.ID]
 
-	return id, ok
+	return identity, ok
 }
 
 // keysFor turns one granted MQTT filter into the NATS subscriptions it needs.
