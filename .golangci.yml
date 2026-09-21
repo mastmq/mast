@@ -50,6 +50,9 @@ linters:
           # Table-driven tests repeat literals by design; extracting each one
           # to a constant makes the table harder to read, not easier.
           - goconst
+          # Naming only the fields under test is how a table test isolates a
+          # variable. Spelling out every zero value hides what is being tested.
+          - exhaustruct_v5
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
