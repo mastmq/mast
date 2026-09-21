@@ -113,10 +113,12 @@ func (h *Hook) Provides(b byte) bool {
 // untenanted client.
 func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	id, err := h.resolver.Resolve(context.Background(), tenant.Credentials{
-		ClientID:   cl.ID,
-		Username:   string(pk.Connect.Username),
-		Password:   pk.Connect.Password,
-		RemoteAddr: cl.Net.Remote,
+		ClientID:        cl.ID,
+		Username:        string(pk.Connect.Username),
+		Password:        pk.Connect.Password,
+		RemoteAddr:      cl.Net.Remote,
+		ProtocolVersion: cl.Properties.ProtocolVersion,
+		CleanStart:      pk.Connect.Clean,
 	})
 	if err != nil {
 		h.log.Debug("authentication refused", "client", cl.ID, "error", err)
@@ -175,7 +177,14 @@ func (h *Hook) OnACLCheck(cl *mqtt.Client, mountedTopic string, write bool) bool
 		return false
 	}
 
-	return h.policy.Allows(id, bare(id, mountedTopic), write)
+	return h.policy.Allows(context.Background(), tenant.Access{
+		Tenant:     id,
+		ClientID:   cl.ID,
+		Username:   string(cl.Properties.Username),
+		RemoteAddr: cl.Net.Remote,
+		Topic:      bare(id, mountedTopic),
+		Write:      write,
+	})
 }
 
 // OnPublish forwards the message to NATS and tells mochi not to deliver it

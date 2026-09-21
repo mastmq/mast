@@ -19,12 +19,42 @@ type ID string
 // ErrUnauthenticated is returned when credentials do not identify a tenant.
 var ErrUnauthenticated = errors.New("tenant: unauthenticated")
 
-// Credentials are what an MQTT CONNECT offers about who is connecting.
+// Credentials are the CONNECT fields an authenticator may decide on.
+//
+// Password is the raw CONNECT password. Anything that forwards it off the
+// process is responsible for doing so over TLS and for keeping it out of logs.
 type Credentials struct {
+	ClientID        string
+	Username        string
+	Password        []byte
+	RemoteAddr      string
+	ProtocolVersion byte
+	CleanStart      bool
+}
+
+// Access is one authorization question: may this connection use this topic,
+// in this direction.
+//
+// It carries the connection's identity and not just the topic, because a real
+// policy server keys on who is asking. The tenant is the one resolved at
+// authentication, never one the client asserted.
+type Access struct {
+	Tenant     ID
 	ClientID   string
 	Username   string
-	Password   []byte
 	RemoteAddr string
+	Topic      string
+	// Write is true for a publish and false for a subscribe.
+	Write bool
+}
+
+// Action names the direction of an [Access] for wire formats and logs.
+func (a Access) Action() string {
+	if a.Write {
+		return "publish"
+	}
+
+	return "subscribe"
 }
 
 // Resolver maps credentials to the tenant that owns the connection.
@@ -37,12 +67,13 @@ type Resolver interface {
 	Resolve(ctx context.Context, creds Credentials) (ID, error)
 }
 
-// Policy decides whether a tenant may publish to or subscribe to a topic.
+// Policy decides whether a connection may publish to or subscribe to a topic.
 //
-// It is consulted with the tenant resolved at authentication time, never with
-// anything the client asserted on the wire.
+// This runs on every publish, which is a far hotter path than authentication.
+// An implementation that talks to the network here must cache, or it becomes
+// the throughput ceiling of the whole broker.
 type Policy interface {
-	Allows(tenant ID, topic string, write bool) bool
+	Allows(ctx context.Context, access Access) bool
 }
 
 // Static resolves every connection to the same tenant. It is the default, and
@@ -65,4 +96,4 @@ func (s Static) Resolve(_ context.Context, _ Credentials) (ID, error) {
 type AllowAll struct{}
 
 // Allows implements [Policy].
-func (AllowAll) Allows(_ ID, _ string, _ bool) bool { return true }
+func (AllowAll) Allows(_ context.Context, _ Access) bool { return true }
