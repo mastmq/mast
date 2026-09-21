@@ -15,6 +15,9 @@ test:
 fuzz TIME="60s":
     go test -run='^$' -fuzz=FuzzRoundTrip -fuzztime={{ TIME }} ./internal/domain/topic/
 
+image:
+    docker build -f build/package/Dockerfile -t mast:dev .
+
 lint:
     golangci-lint run -c .golangci.yml
 

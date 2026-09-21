@@ -1,0 +1,9 @@
+.git
+.github
+/mast
+/dist
+/data
+*.out
+coverage.*
+docs
+README.md
