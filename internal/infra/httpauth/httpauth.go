@@ -55,6 +55,28 @@ import (
 	"github.com/mastmq/mast/internal/domain/tenant"
 )
 
+// Wire selects the request and response shape used with the auth service.
+type Wire string
+
+const (
+	// WireMast is mast's own shape: the service names the tenant, which is
+	// what multi-tenancy needs.
+	WireMast Wire = "mast"
+
+	// WireEMQX is the shape EMQX v5's http authn and authz backends use, so
+	// an existing auth service written for EMQX works unchanged.
+	//
+	// Requests carry {token, username, password, client_id} for
+	// authentication and {token, username, password, topic, action} for
+	// authorization, and a reply is {"result":"allow"|"deny"} with HTTP 200
+	// either way. EMQX has no notion of a tenant, so the service cannot name
+	// one and mast falls back to Tenant.
+	WireEMQX Wire = "emqx"
+)
+
+// Valid reports whether w is a wire format mast knows.
+func (w Wire) Valid() bool { return w == WireMast || w == WireEMQX }
+
 // FailMode says what to do when the policy server cannot be reached.
 type FailMode string
 
@@ -80,10 +102,21 @@ var (
 	ErrNoTenant = errors.New("httpauth: service allowed the connection but named no tenant")
 	// ErrDenied is returned when the service refuses a connection.
 	ErrDenied = errors.New("httpauth: service denied the connection")
+	// ErrBadWire is returned for an unrecognized wire format.
+	ErrBadWire = errors.New("httpauth: wire must be mast or emqx")
+	// ErrNoTenantConfigured is returned when the emqx wire is selected
+	// without a tenant to place connections in.
+	ErrNoTenantConfigured = errors.New("httpauth: wire emqx requires a tenant")
 )
 
 // Options configures a [Client].
 type Options struct {
+	// Wire selects the request and response shape. Defaults to mast.
+	Wire Wire
+	// Tenant is the tenant every connection joins under the emqx wire, which
+	// has no field for the service to name one.
+	Tenant tenant.ID
+
 	// AuthnURL answers authentication. Required.
 	AuthnURL string
 	// AuthzURL answers authorization. Empty means every authenticated
@@ -116,6 +149,18 @@ type Client struct {
 func New(opts Options, log *slog.Logger) (*Client, error) {
 	if opts.AuthnURL == "" {
 		return nil, ErrNoAuthnURL
+	}
+
+	if opts.Wire == "" {
+		opts.Wire = WireMast
+	}
+
+	if !opts.Wire.Valid() {
+		return nil, fmt.Errorf("%w: got %q", ErrBadWire, opts.Wire)
+	}
+
+	if opts.Wire == WireEMQX && opts.Tenant == "" {
+		return nil, ErrNoTenantConfigured
 	}
 
 	if opts.OnError == "" {
@@ -165,8 +210,43 @@ type authzResponse struct {
 	Allow bool `json:"allow"`
 }
 
+// emqxAuthnRequest is what EMQX v5's http authentication backend posts.
+//
+// Token repeats the username because that is how EMQX deployments in the
+// wild carry a bearer credential: the device puts its token in the username
+// field, and the auth service is written to look in either place.
+type emqxAuthnRequest struct {
+	Token    string `json:"token"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	ClientID string `json:"client_id"`
+}
+
+// emqxAuthzRequest is what EMQX v5's http authorization backend posts.
+type emqxAuthzRequest struct {
+	Token    string `json:"token"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Topic    string `json:"topic"`
+	Action   string `json:"action"`
+}
+
+// emqxResponse is what both EMQX backends expect back. The status is 200
+// whether the answer is allow or deny; only the body decides.
+type emqxResponse struct {
+	Result      string `json:"result"`
+	IsSuperuser bool   `json:"is_superuser"`
+}
+
+// allowed reports whether the service said yes.
+func (r emqxResponse) allowed() bool { return r.Result == "allow" }
+
 // Resolve implements [tenant.Resolver]. It always fails closed.
 func (c *Client) Resolve(ctx context.Context, creds tenant.Credentials) (tenant.ID, error) {
+	if c.opts.Wire == WireEMQX {
+		return c.resolveEMQX(ctx, creds)
+	}
+
 	var reply authnResponse
 
 	err := c.post(ctx, c.opts.AuthnURL, authnRequest{
@@ -208,16 +288,7 @@ func (c *Client) Allows(ctx context.Context, access tenant.Access) bool {
 		return allow
 	}
 
-	var reply authzResponse
-
-	err := c.post(ctx, c.opts.AuthzURL, authzRequest{
-		Tenant:     string(access.Tenant),
-		ClientID:   access.ClientID,
-		Username:   access.Username,
-		RemoteAddr: access.RemoteAddr,
-		Topic:      access.Topic,
-		Action:     access.Action(),
-	}, &reply)
+	allow, err := c.ask(ctx, access)
 	if err != nil {
 		c.log.Warn("authorization request failed",
 			"tenant", string(access.Tenant), "topic", access.Topic, "error", err)
@@ -227,9 +298,9 @@ func (c *Client) Allows(ctx context.Context, access tenant.Access) bool {
 		return c.opts.OnError == FailAllow
 	}
 
-	c.cache.put(key, reply.Allow)
+	c.cache.put(key, allow)
 
-	return reply.Allow
+	return allow
 }
 
 // CacheSize reports how many authorization decisions are held, for metrics.
@@ -297,3 +368,58 @@ func (c *Client) post(ctx context.Context, url string, body, reply any) error {
 type statusError int
 
 func (e statusError) Error() string { return fmt.Sprintf("status %d", int(e)) }
+
+// resolveEMQX authenticates against a service written for EMQX.
+func (c *Client) resolveEMQX(ctx context.Context, creds tenant.Credentials) (tenant.ID, error) {
+	var reply emqxResponse
+
+	err := c.post(ctx, c.opts.AuthnURL, emqxAuthnRequest{
+		Token:    creds.Username,
+		Username: creds.Username,
+		Password: string(creds.Password),
+		ClientID: creds.ClientID,
+	}, &reply)
+	if err != nil {
+		// Deliberately does not log the credentials.
+		c.log.Warn("authentication request failed", "client", creds.ClientID, "error", err)
+
+		return "", err
+	}
+
+	if !reply.allowed() {
+		return "", ErrDenied
+	}
+
+	return c.opts.Tenant, nil
+}
+
+// ask puts one authorization question to the service in the configured wire
+// format.
+func (c *Client) ask(ctx context.Context, access tenant.Access) (bool, error) {
+	if c.opts.Wire == WireEMQX {
+		var reply emqxResponse
+
+		err := c.post(ctx, c.opts.AuthzURL, emqxAuthzRequest{
+			Token:    access.Username,
+			Username: access.Username,
+			Password: "",
+			Topic:    access.Topic,
+			Action:   access.Action(),
+		}, &reply)
+
+		return reply.allowed(), err
+	}
+
+	var reply authzResponse
+
+	err := c.post(ctx, c.opts.AuthzURL, authzRequest{
+		Tenant:     string(access.Tenant),
+		ClientID:   access.ClientID,
+		Username:   access.Username,
+		RemoteAddr: access.RemoteAddr,
+		Topic:      access.Topic,
+		Action:     access.Action(),
+	}, &reply)
+
+	return reply.Allow, err
+}

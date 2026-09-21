@@ -127,6 +127,11 @@ type Auth struct {
 
 // AuthHTTPConfig configures the HTTP backend.
 type AuthHTTPConfig struct {
+	// Wire selects the request and response shape: "mast", where the service
+	// names the tenant, or "emqx", which matches EMQX v5's http backends so
+	// an auth service written for EMQX works unchanged.
+	Wire string `json:"wire" koanf:"wire"`
+
 	// AuthnURL answers authentication, and is required in http mode.
 	AuthnURL string `json:"authn_url" koanf:"authn_url"`
 
@@ -173,6 +178,14 @@ type MQTT struct {
 	WSAddr  string `json:"ws_addr"  koanf:"ws_addr"`
 	TLSCert string `json:"tls_cert" koanf:"tls_cert"`
 	TLSKey  string `json:"tls_key"  koanf:"tls_key"`
+
+	// InternalAddr is a second listener that skips authentication and
+	// authorization entirely. It exists so trusted in-cluster services can
+	// connect without a credential, mirroring the internal listener an EMQX
+	// deployment typically runs. It must never be exposed outside the
+	// cluster: whatever reaches it is trusted completely.
+	InternalAddr string `json:"internal_addr" koanf:"internal_addr"`
+
 	// MaxWritesPending bounds the per-client outbound queue. It is the main
 	// driver of memory at high connection counts: budget it times the expected
 	// connections per process, not times the fleet.
@@ -234,6 +247,7 @@ func Default() Config {
 		MQTT: MQTT{
 			Addr:             ":1883",
 			WSAddr:           "",
+			InternalAddr:     "",
 			TLSCert:          "",
 			TLSKey:           "",
 			MaxWritesPending: defaultMaxWritesPending,
@@ -267,6 +281,7 @@ func Default() Config {
 		Auth: Auth{
 			Mode: AuthStatic,
 			HTTP: AuthHTTPConfig{
+				Wire:      "mast",
 				AuthnURL:  "",
 				AuthzURL:  "",
 				Timeout:   defaultAuthTimeout,

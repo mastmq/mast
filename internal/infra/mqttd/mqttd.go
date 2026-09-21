@@ -14,6 +14,10 @@ import (
 	"github.com/mochi-mqtt/server/v2/listeners"
 )
 
+// InternalListenerID names the unauthenticated listener. The bridge matches
+// on it to decide whether a connection has to prove anything.
+const InternalListenerID = "internal"
+
 // New builds an MQTT server with the bridge attached and the configured
 // listeners registered. The server is not yet serving when it returns.
 func New(cfg config.Config, hook *bridge.Hook, log *slog.Logger) (*mqtt.Server, error) {
@@ -47,6 +51,21 @@ func New(cfg config.Config, hook *bridge.Hook, log *slog.Logger) (*mqtt.Server, 
 		})
 		if err := server.AddListener(l); err != nil {
 			return nil, fmt.Errorf("mqttd: adding tcp listener on %s: %w", cfg.MQTT.Addr, err)
+		}
+	}
+
+	// The internal listener deliberately carries no TLS: it is for in-cluster
+	// traffic that the network already protects, and giving it a certificate
+	// would imply a trust boundary it does not have.
+	if cfg.MQTT.InternalAddr != "" {
+		l := listeners.NewTCP(listeners.Config{
+			Type:      listeners.TypeTCP,
+			ID:        InternalListenerID,
+			Address:   cfg.MQTT.InternalAddr,
+			TLSConfig: nil,
+		})
+		if err := server.AddListener(l); err != nil {
+			return nil, fmt.Errorf("mqttd: adding internal listener on %s: %w", cfg.MQTT.InternalAddr, err)
 		}
 	}
 

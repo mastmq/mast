@@ -27,6 +27,8 @@ func Build(cfg config.Config, log *slog.Logger) (tenant.Resolver, tenant.Policy,
 	switch cfg.Auth.Mode {
 	case config.AuthHTTP:
 		client, err := httpauth.New(httpauth.Options{
+			Wire:      httpauth.Wire(cfg.Auth.HTTP.Wire),
+			Tenant:    tenant.ID(cfg.Tenant.Default),
 			AuthnURL:  cfg.Auth.HTTP.AuthnURL,
 			AuthzURL:  cfg.Auth.HTTP.AuthzURL,
 			Timeout:   cfg.Auth.HTTP.Timeout,

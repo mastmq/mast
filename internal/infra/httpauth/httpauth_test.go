@@ -374,3 +374,120 @@ func TestNewValidates(t *testing.T) {
 		t.Errorf("bad on_error error = %v, want %v", err, httpauth.ErrBadFailMode)
 	}
 }
+
+// TestEMQXWire pins compatibility with an auth service written for EMQX v5.
+//
+// The shapes here are taken from snapp-incubator/soteria, which is what the
+// cluster mast is replacing actually talks to: requests carry token,
+// username, password and client_id or topic and action, and the reply is
+// {"result":"allow"|"deny"} with HTTP 200 either way.
+func TestEMQXWire(t *testing.T) {
+	t.Parallel()
+
+	var authnBody, authzBody atomic.Value
+
+	srv := newServer(t, func(req map[string]any) (int, any) {
+		if _, isAuthz := req["action"]; isAuthz {
+			authzBody.Store(req)
+
+			topic, _ := req["topic"].(string)
+
+			return http.StatusOK, map[string]any{"result": allowDeny(topic == "allowed")}
+		}
+
+		authnBody.Store(req)
+
+		username, _ := req["username"].(string)
+
+		return http.StatusOK, map[string]any{
+			"result":       allowDeny(username == "internal:tok"),
+			"is_superuser": false,
+		}
+	})
+
+	c, err := httpauth.New(httpauth.Options{
+		Wire:     httpauth.WireEMQX,
+		Tenant:   "ignite",
+		AuthnURL: srv.URL,
+		AuthzURL: srv.URL,
+		Timeout:  time.Second,
+	}, discard())
+	if err != nil {
+		t.Fatalf("building client: %v", err)
+	}
+
+	id, err := c.Resolve(context.Background(), tenant.Credentials{
+		ClientID: "dev-1",
+		Username: "internal:tok",
+		Password: []byte(""),
+	})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	// EMQX has no tenant field, so the configured one applies.
+	if id != "ignite" {
+		t.Errorf("tenant = %q, want the configured ignite", id)
+	}
+
+	got, _ := authnBody.Load().(map[string]any)
+	for field, want := range map[string]any{
+		"client_id": "dev-1",
+		"username":  "internal:tok",
+		// The token repeats the username: that is how these deployments
+		// carry a bearer credential, and the service looks in either place.
+		"token": "internal:tok",
+	} {
+		if got[field] != want {
+			t.Errorf("authn body %q = %v, want %v", field, got[field], want)
+		}
+	}
+
+	_, err = c.Resolve(context.Background(), tenant.Credentials{Username: "bogus"})
+	if !errors.Is(err, httpauth.ErrDenied) {
+		t.Errorf("a denied token was accepted: %v", err)
+	}
+
+	checkEMQXAuthz(t, c, &authzBody)
+}
+
+// checkEMQXAuthz covers the authorization half of the EMQX wire.
+func checkEMQXAuthz(t *testing.T, c *httpauth.Client, authzBody *atomic.Value) {
+	t.Helper()
+
+	if !c.Allows(context.Background(), tenant.Access{
+		Tenant: "ignite", Username: "internal:tok", Topic: "allowed", Write: true,
+	}) {
+		t.Error("an allowed topic was refused")
+	}
+
+	acl, _ := authzBody.Load().(map[string]any)
+	if acl["action"] != "publish" || acl["topic"] != "allowed" || acl["token"] != "internal:tok" {
+		t.Errorf("authz body = %v", acl)
+	}
+
+	if c.Allows(context.Background(), tenant.Access{
+		Tenant: "ignite", Username: "internal:tok", Topic: "denied", Write: false,
+	}) {
+		t.Error("a denied topic was permitted")
+	}
+}
+
+func allowDeny(ok bool) string {
+	if ok {
+		return "allow"
+	}
+
+	return "deny"
+}
+
+func TestEMQXWireNeedsTenant(t *testing.T) {
+	t.Parallel()
+
+	_, err := httpauth.New(httpauth.Options{
+		Wire: httpauth.WireEMQX, AuthnURL: "http://x",
+	}, discard())
+	if !errors.Is(err, httpauth.ErrNoTenantConfigured) {
+		t.Errorf("error = %v, want ErrNoTenantConfigured", err)
+	}
+}

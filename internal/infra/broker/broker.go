@@ -85,7 +85,10 @@ func Start(
 		return nil, err
 	}
 
-	b.hook = bridge.New(nats.Conn(), b.store, resolver, policy, log)
+	b.hook = bridge.New(nats.Conn(), b.store, resolver, policy, bridge.Options{
+		InternalListener: mqttd.InternalListenerID,
+		InternalTenant:   tenant.ID(cfg.Tenant.Default),
+	}, log)
 
 	b.server, err = mqttd.New(cfg, b.hook, log)
 	if err != nil {

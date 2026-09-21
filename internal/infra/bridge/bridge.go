@@ -90,6 +90,20 @@ type Hook struct {
 
 	mu      sync.RWMutex
 	tenants map[string]tenant.ID
+
+	// internalListener is the mochi listener id whose connections skip
+	// authentication, and internalTenant is where they land.
+	internalListener string
+	internalTenant   tenant.ID
+}
+
+// Options configures a [Hook].
+type Options struct {
+	// InternalListener is the mochi listener id that bypasses authentication
+	// and authorization. Empty disables the bypass.
+	InternalListener string
+	// InternalTenant is the tenant connections on that listener join.
+	InternalTenant tenant.ID
 }
 
 // New builds a bridge over an established NATS connection.
@@ -101,19 +115,22 @@ func New(
 	st *store.Store,
 	resolver tenant.Resolver,
 	policy tenant.Policy,
+	opts Options,
 	log *slog.Logger,
 ) *Hook {
 	h := &Hook{
-		HookBase: mqtt.HookBase{},
-		mu:       sync.RWMutex{},
-		nc:       nc,
-		store:    st,
-		resolver: resolver,
-		policy:   policy,
-		log:      log.With("component", "bridge"),
-		server:   nil,
-		subs:     nil,
-		tenants:  make(map[string]tenant.ID),
+		internalListener: opts.InternalListener,
+		internalTenant:   opts.InternalTenant,
+		HookBase:         mqtt.HookBase{},
+		mu:               sync.RWMutex{},
+		nc:               nc,
+		store:            st,
+		resolver:         resolver,
+		policy:           policy,
+		log:              log.With("component", "bridge"),
+		server:           nil,
+		subs:             nil,
+		tenants:          make(map[string]tenant.ID),
 	}
 	h.subs = newRegistry(nc, h.onNATSMessage)
 
@@ -148,6 +165,16 @@ func (h *Hook) Provides(b byte) bool {
 // that resolves to no tenant is refused: there is no such thing as an
 // untenanted client.
 func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
+	// A connection on the internal listener is trusted by virtue of having
+	// reached it. Nothing is asked of it and nothing is asked about it later.
+	if h.isInternal(cl) {
+		h.mu.Lock()
+		h.tenants[cl.ID] = h.internalTenant
+		h.mu.Unlock()
+
+		return true
+	}
+
 	id, err := h.resolver.Resolve(context.Background(), tenant.Credentials{
 		ClientID:        cl.ID,
 		Username:        string(pk.Connect.Username),
@@ -211,6 +238,10 @@ func (h *Hook) OnACLCheck(cl *mqtt.Client, mountedTopic string, write bool) bool
 	id, ok := h.tenantOf(cl)
 	if !ok {
 		return false
+	}
+
+	if h.isInternal(cl) {
+		return true
 	}
 
 	return h.policy.Allows(context.Background(), tenant.Access{
@@ -600,4 +631,10 @@ func (h *Hook) forget(clientID string) {
 	h.mu.Lock()
 	delete(h.tenants, clientID)
 	h.mu.Unlock()
+}
+
+// isInternal reports whether a client arrived on the unauthenticated
+// listener.
+func (h *Hook) isInternal(cl *mqtt.Client) bool {
+	return h.internalListener != "" && cl.Net.Listener == h.internalListener
 }
