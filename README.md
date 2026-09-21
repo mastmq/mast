@@ -6,14 +6,15 @@ Multi-tenant MQTT broker built on core NATS. One binary, one artifact, from a si
 
 ## What works
 
-Verified by the end-to-end tests in `internal/infra/broker`, which drive a real MQTT client against a real node:
+Verified by the end-to-end tests in `internal/infra/broker`, which drive a real MQTT client against a real node, and by a manual three-process cluster of one `core` and two `edge` nodes:
 
 - Publish and subscribe across the NATS fabric, including `+` and `#` wildcards
 - `foo/#` matching `foo` itself, which needs the second subscription `FilterSubjects` opens
 - Topics containing `.`, a leading `/`, empty levels, and non-ASCII, all arriving byte-identical
 - **Tenant isolation** — two tenants subscribing to the same topic never see each other's traffic
-- **Shared subscriptions** — `$share/<group>/<filter>` maps onto a NATS queue group, and each message reaches exactly one member
-- One NATS subscription per distinct filter rather than per device
+- **Shared subscriptions** — `$share/<group>/<filter>` maps onto a NATS queue group, and each message reaches exactly one member. Note that a queue group serves a local member first, so work stays on the producer's node rather than spreading round-robin across the group; see [ARCHITECTURE.md](docs/ARCHITECTURE.md) for why and what to do if that matters
+- One NATS subscription per distinct filter rather than per device, released when the last subscriber disconnects
+- **Cross-node delivery** — edges join the core as leaf nodes, and a message published on one edge reaches a subscriber on another, with tenant isolation holding across the boundary
 
 Not yet: QoS 1 and 2 across the bridge, persistent sessions, offline queues, cluster-wide retained messages, and per-tenant quotas. Those all need the KV-backed session store, which is the next piece.
 
