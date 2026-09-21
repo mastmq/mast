@@ -18,4 +18,8 @@ var (
 
 	// ErrNoAuthnURL is returned when http auth is selected without an endpoint.
 	ErrNoAuthnURL = errors.New("config: auth.mode http requires auth.http.authn_url")
+
+	// ErrNoJWTAlgorithms guards the classic JWT footgun: accepting whatever
+	// algorithm a token asks for.
+	ErrNoJWTAlgorithms = errors.New("config: auth.mode jwt requires auth.jwt.algorithms")
 )

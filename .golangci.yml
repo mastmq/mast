@@ -61,8 +61,10 @@ linters:
           - paralleltest
           - tparallel
           # An integration test that drives a real client through connect,
-          # subscribe, publish and assert is long because the scenario is.
+          # subscribe, publish and assert is long, and branches once per
+          # assertion, because the scenario is.
           - funlen
+          - cyclop
           # Some tests drive unexported constructors such as newRoot on
           # purpose. Forcing them into an external package would mean
           # rebuilding what they are meant to test. A //nolint cannot express

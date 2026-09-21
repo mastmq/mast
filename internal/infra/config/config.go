@@ -18,6 +18,11 @@ import (
 // spelled with a double underscore, so MAST__MQTT__ADDR sets mqtt.addr.
 const EnvPrefix = "MAST__"
 
+// defaultJWTSource is the CONNECT field a token is read from unless
+// configured otherwise. Username is the convention these deployments use,
+// because many clients log passwords and none log usernames.
+const defaultJWTSource = "username"
+
 // defaultSessionExpiry is how long a disconnected session and its queued
 // messages survive. Long enough for a device on a bad link or a rolling
 // deploy, short enough that decommissioned hardware releases storage.
@@ -111,18 +116,61 @@ const (
 
 	// AuthHTTP asks an HTTP service, posting the MQTT fields as JSON.
 	AuthHTTP AuthMode = "http"
+
+	// AuthJWT verifies a signed token locally. Unlike AuthHTTP it puts
+	// nothing on the network during a reconnect storm, at the price of
+	// revocation being only as fast as token expiry.
+	AuthJWT AuthMode = "jwt"
 )
 
 // Valid reports whether m is an authentication mode mast knows.
-func (m AuthMode) Valid() bool { return m == AuthStatic || m == AuthHTTP }
+func (m AuthMode) Valid() bool { return m == AuthStatic || m == AuthHTTP || m == AuthJWT }
 
 // AuthModes lists every valid mode, for help text and error messages.
-func AuthModes() []AuthMode { return []AuthMode{AuthStatic, AuthHTTP} }
+func AuthModes() []AuthMode { return []AuthMode{AuthStatic, AuthHTTP, AuthJWT} }
 
 // Auth configures authentication and authorization.
 type Auth struct {
 	Mode AuthMode       `json:"mode" koanf:"mode"`
 	HTTP AuthHTTPConfig `json:"http" koanf:"http"`
+	JWT  AuthJWTConfig  `json:"jwt"  koanf:"jwt"`
+}
+
+// AuthJWTConfig configures local token verification.
+//
+// Authorization is separate: set auth.http.authz_url alongside this and
+// topic decisions still go to a policy service, which is usually what you
+// want. A signature says who someone is, not what they may do.
+type AuthJWTConfig struct {
+	// Source is the CONNECT field carrying the token: "username", which is
+	// the convention these deployments use, or "password".
+	Source string `json:"source" koanf:"source"`
+
+	// VendorPrefix discards everything up to the first colon before
+	// parsing, for credentials namespaced as "<vendor>:<token>".
+	VendorPrefix bool `json:"vendor_prefix" koanf:"vendor_prefix"`
+
+	// Algorithms is the allowlist of accepted signing algorithms, and it is
+	// required. Accepting whatever a token asks for is how "alg":"none" and
+	// algorithm-confusion attacks work, so there is no default.
+	Algorithms []string `json:"algorithms" koanf:"algorithms"`
+
+	// Exactly one of these supplies the verification key.
+	HMACSecret     string `json:"hmac_secret"      koanf:"hmac_secret"`
+	HMACSecretFile string `json:"hmac_secret_file" koanf:"hmac_secret_file"`
+	PublicKeyFile  string `json:"public_key_file"  koanf:"public_key_file"`
+
+	// TenantClaim names the claim holding the tenant; tenant.default
+	// applies when it is empty or absent.
+	TenantClaim string `json:"tenant_claim" koanf:"tenant_claim"`
+
+	// SuperuserClaim names a boolean claim that bypasses authorization, the
+	// same way EMQX's is_superuser does.
+	SuperuserClaim string `json:"superuser_claim" koanf:"superuser_claim"`
+
+	// Issuer and Audience, when set, must match the token.
+	Issuer   string `json:"issuer"   koanf:"issuer"`
+	Audience string `json:"audience" koanf:"audience"`
 }
 
 // AuthHTTPConfig configures the HTTP backend.
@@ -278,18 +326,36 @@ func Default() Config {
 		Session: Session{
 			Expiry: defaultSessionExpiry,
 		},
-		Auth: Auth{
-			Mode: AuthStatic,
-			HTTP: AuthHTTPConfig{
-				Wire:      "mast",
-				AuthnURL:  "",
-				AuthzURL:  "",
-				Timeout:   defaultAuthTimeout,
-				OnError:   "deny",
-				CacheTTL:  defaultAuthCacheTTL,
-				CacheSize: defaultAuthCacheSize,
-				Headers:   nil,
-			},
+		Auth: defaultAuth(),
+	}
+}
+
+// defaultAuth is split out of [Default] only because the whole tree is long;
+// it carries no logic.
+func defaultAuth() Auth {
+	return Auth{
+		Mode: AuthStatic,
+		HTTP: AuthHTTPConfig{
+			Wire:      "mast",
+			AuthnURL:  "",
+			AuthzURL:  "",
+			Timeout:   defaultAuthTimeout,
+			OnError:   "deny",
+			CacheTTL:  defaultAuthCacheTTL,
+			CacheSize: defaultAuthCacheSize,
+			Headers:   nil,
+		},
+		JWT: AuthJWTConfig{
+			Source:         defaultJWTSource,
+			VendorPrefix:   false,
+			Algorithms:     nil,
+			HMACSecret:     "",
+			HMACSecretFile: "",
+			PublicKeyFile:  "",
+			TenantClaim:    "",
+			SuperuserClaim: "",
+			Issuer:         "",
+			Audience:       "",
 		},
 	}
 }
@@ -333,7 +399,7 @@ func Load(path string) (Config, error) {
 // URL with a query parameter or a header.
 func isListKey(key string) bool {
 	switch key {
-	case "core.routes", "edge.core_urls":
+	case "core.routes", "edge.core_urls", "auth.jwt.algorithms":
 		return true
 	default:
 		return false
@@ -420,6 +486,10 @@ func (c Config) validateAuth() error {
 
 	if c.Auth.Mode == AuthHTTP && c.Auth.HTTP.AuthnURL == "" {
 		return ErrNoAuthnURL
+	}
+
+	if c.Auth.Mode == AuthJWT && len(c.Auth.JWT.Algorithms) == 0 {
+		return ErrNoJWTAlgorithms
 	}
 
 	return nil

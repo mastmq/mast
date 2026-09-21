@@ -107,6 +107,8 @@ var (
 	// ErrNoTenantConfigured is returned when the emqx wire is selected
 	// without a tenant to place connections in.
 	ErrNoTenantConfigured = errors.New("httpauth: wire emqx requires a tenant")
+	// ErrNoAuthzURL is returned when an authorizer is built without one.
+	ErrNoAuthzURL = errors.New("httpauth: authz_url is required for an authorizer")
 )
 
 // Options configures a [Client].
@@ -177,6 +179,24 @@ func New(opts Options, log *slog.Logger) (*Client, error) {
 		cache: newCache(opts.CacheTTL, opts.CacheSize),
 		log:   log.With("component", "httpauth"),
 	}, nil
+}
+
+// NewAuthorizer builds a client that only answers authorization.
+//
+// It exists so a deployment can verify tokens locally and still delegate
+// topic decisions to a policy service — the combination most people
+// actually want, since a signature says who you are and not what you may
+// do.
+func NewAuthorizer(opts Options, log *slog.Logger) (*Client, error) {
+	if opts.AuthzURL == "" {
+		return nil, ErrNoAuthzURL
+	}
+
+	// Satisfy the shared validation, which is written for the full client;
+	// Resolve is simply never called on an authorizer.
+	opts.AuthnURL = opts.AuthzURL
+
+	return New(opts, log)
 }
 
 // authnRequest is the body posted to AuthnURL.

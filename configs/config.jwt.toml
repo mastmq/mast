@@ -1,0 +1,69 @@
+# Authentication by verifying a signed token locally, with authorization
+# still delegated to a policy service.
+#
+# This is the arrangement most deployments converge on. A signature says who
+# a connection is and costs microseconds to check, so a reconnect storm of
+# 50k devices touches no service at all. It does not say what that
+# connection may do, which is a question a policy server is better placed to
+# answer — and one whose answers can be cached.
+#
+# The trade against auth.mode = "http": revocation is only as fast as token
+# expiry. Keep lifetimes short enough that you can live with the window.
+
+role = "all-in-one"
+
+[mqtt]
+addr = "0.0.0.0:1883"
+
+[core]
+store_dir = "/data"
+
+[tenant]
+# Used when a token carries no tenant claim.
+default = "default"
+
+[auth]
+mode = "jwt"
+
+[auth.jwt]
+# Where the token travels. "username" is the convention these deployments
+# use: many clients log passwords and none log usernames.
+source = "username"
+
+# Discard a "<vendor>:" prefix before parsing, for credentials namespaced
+# that way.
+vendor_prefix = false
+
+# Required, and there is deliberately no default. Accepting whatever
+# algorithm a token asks for is how "alg":"none" and RSA-to-HMAC confusion
+# attacks work.
+algorithms = ["RS256"]
+
+# Exactly one key source. Prefer a file: a secret in a config file tends to
+# end up in version control.
+# hmac_secret_file = "/etc/mast/jwt.secret"
+public_key_file = "/etc/mast/jwt.pub"
+
+# The claim naming the tenant. Absent or empty falls back to tenant.default.
+tenant_claim = "tenant"
+
+# A boolean claim that bypasses authorization, as EMQX's is_superuser does.
+superuser_claim = "admin"
+
+# Checked when set.
+issuer = ""
+audience = ""
+
+# Authorization over HTTP, alongside local authentication. Drop this block
+# and a tenant's own subtree becomes the only boundary, which is a coherent
+# posture rather than an oversight.
+[auth.http]
+wire = "mast"
+authz_url = "http://policy:8080/acl"
+timeout = "2s"
+on_error = "deny"
+cache_ttl = "1m"
+cache_size = 100000
+
+[obs]
+addr = "0.0.0.0:9090"

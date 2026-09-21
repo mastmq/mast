@@ -52,6 +52,19 @@ $ ./mast --role=core          # not runnable yet; reports the plan and exits
 
 ## Authentication and authorization
 
+mast offers two backends, and they compose: authentication can be a callback or a locally verified token, while authorization independently goes to a policy service or nowhere.
+
+| | `auth.mode = "http"` | `auth.mode = "jwt"` |
+| --- | --- | --- |
+| Cost per CONNECT | a network round trip | a signature check |
+| Reconnect storm | your service absorbs it | nothing to absorb |
+| Revocation | immediate | when the token expires |
+| Needs | a reachable service | key distribution |
+
+Neither is better. A fleet that reconnects in bursts wants JWT; a deployment that must revoke a device now wants HTTP. Most end up verifying tokens locally and still asking a policy service about topics, which is what setting `auth.mode = "jwt"` alongside `auth.http.authz_url` does. See [`configs/config.jwt.toml`](configs/config.jwt.toml).
+
+### Callback
+
 Set `auth.mode = "http"` and mast asks your service both questions over plain JSON.
 
 On CONNECT it posts the connect fields to `authn_url`:
@@ -75,6 +88,14 @@ On each publish and subscribe it posts to `authz_url`:
 ```
 
 and expects `{"allow": true}`. Leave `authz_url` empty and an authenticated connection may use any topic inside its own tenant, which is a coherent posture when the tenant mount is boundary enough.
+
+### Tokens
+
+Set `auth.mode = "jwt"` and mast verifies the token itself. `auth.jwt.algorithms` is required and has no default: accepting whatever algorithm a token asks for is how `alg: "none"` and RSA-to-HMAC confusion attacks work, so the allowlist is mandatory rather than inferred. An expiry claim is also required — a bearer credential that never expires cannot be revoked by a broker that only checks signatures.
+
+The tenant comes from `auth.jwt.tenant_claim`, and `auth.jwt.superuser_claim` bypasses authorization the way EMQX's `is_superuser` does.
+
+### Both
 
 Two things worth knowing before you point this at production. Authorization is asked **on every publish**, so it is cached with a TTL — set `cache_ttl = "0s"` if decisions must take effect instantly, and accept a network round trip per message. And authentication **always fails closed** whatever `on_error` says, because admitting a connection whose tenant is unknown would mean inventing an isolation boundary; `on_error` governs authorization only.
 

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/mastmq/mast/internal/domain/tenant"
 	"github.com/mastmq/mast/internal/infra/auth"
 	"github.com/mastmq/mast/internal/infra/broker"
@@ -524,4 +525,155 @@ func scrape(t *testing.T, url string) string {
 	}
 
 	return string(body)
+}
+
+// TestJWTAuthEndToEnd covers the arrangement most deployments want once they
+// have both backends: authentication verified locally from a token, so a
+// reconnect storm touches no service, while topic decisions still go to a
+// policy server over HTTP.
+func TestJWTAuthEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	const secret = "shared-signing-secret"
+
+	var aclCalls atomic.Int64
+
+	policy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		aclCalls.Add(1)
+
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding: %v", err)
+		}
+
+		topic, _ := req["topic"].(string)
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"result": map[bool]string{true: "allow", false: "deny"}[!strings.HasPrefix(topic, "denied/")],
+		}); err != nil {
+			t.Errorf("encoding: %v", err)
+		}
+	}))
+	t.Cleanup(policy.Close)
+
+	cfg := config.Default()
+	cfg.MQTT.Addr = freeAddr(t)
+	cfg.NATS.MonitorAddr = ""
+	cfg.Core.StoreDir = t.TempDir()
+	cfg.Tenant.Default = "fallback"
+	cfg.Auth.Mode = config.AuthJWT
+	cfg.Auth.JWT.Algorithms = []string{"HS256"}
+	cfg.Auth.JWT.HMACSecret = secret
+	cfg.Auth.JWT.TenantClaim = "tenant"
+	cfg.Auth.JWT.SuperuserClaim = "admin"
+	// Authorization still goes over HTTP: the two backends compose.
+	cfg.Auth.HTTP.Wire = "emqx"
+	cfg.Auth.HTTP.AuthzURL = policy.URL
+	cfg.Auth.HTTP.Timeout = 2 * time.Second
+
+	log := slog.New(slog.DiscardHandler)
+
+	resolver, pol, err := auth.Build(cfg, log)
+	if err != nil {
+		t.Fatalf("building auth: %v", err)
+	}
+
+	node, err := broker.Start(t.Context(), cfg, resolver, pol, log)
+	if err != nil {
+		t.Fatalf("starting broker: %v", err)
+	}
+
+	t.Cleanup(node.Close)
+
+	token := func(claims jwt.MapClaims) string {
+		t.Helper()
+
+		claims["exp"] = time.Now().Add(time.Hour).Unix()
+
+		signed, signErr := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+		if signErr != nil {
+			t.Fatalf("signing: %v", signErr)
+		}
+
+		return signed
+	}
+
+	t.Run("an unsigned client is refused", func(t *testing.T) {
+		opts := paho.NewClientOptions().AddBroker("tcp://" + cfg.MQTT.Addr).
+			SetClientID("no-token").SetUsername("nonsense").
+			SetConnectTimeout(5 * time.Second).SetAutoReconnect(false)
+
+		tok := paho.NewClient(opts).Connect()
+		tok.WaitTimeout(5 * time.Second)
+
+		if tok.Error() == nil {
+			t.Error("a client with no valid token connected")
+		}
+	})
+
+	t.Run("the tenant comes from the token", func(t *testing.T) {
+		sub := connect(t, cfg.MQTT.Addr, "jwt-sub", token(jwt.MapClaims{"tenant": "tenant-a"}))
+		sub.subscribe(t, "data/#")
+
+		pub := connect(t, cfg.MQTT.Addr, "jwt-pub", token(jwt.MapClaims{"tenant": "tenant-a"}))
+		pub.publish(t, "data/x", "hello")
+
+		if !waitFor(func() bool { return len(sub.messages()) > 0 }) {
+			t.Fatal("same-tenant delivery failed")
+		}
+	})
+
+	t.Run("a different tenant claim is isolated", func(t *testing.T) {
+		other := connect(t, cfg.MQTT.Addr, "jwt-other", token(jwt.MapClaims{"tenant": "tenant-b"}))
+		other.subscribe(t, "data/#")
+
+		pub := connect(t, cfg.MQTT.Addr, "jwt-pub2", token(jwt.MapClaims{"tenant": "tenant-a"}))
+		pub.publish(t, "data/x", "hello")
+
+		time.Sleep(settle)
+
+		if got := other.messages(); len(got) != 0 {
+			t.Errorf("a token naming another tenant received %v", got)
+		}
+	})
+
+	t.Run("the HTTP policy still governs topics", func(t *testing.T) {
+		sub := connect(t, cfg.MQTT.Addr, "jwt-denied", token(jwt.MapClaims{"tenant": "tenant-c"}))
+		sub.subscribe(t, "denied/#")
+
+		pub := connect(t, cfg.MQTT.Addr, "jwt-pub3", token(jwt.MapClaims{"tenant": "tenant-c"}))
+		pub.publish(t, "denied/secret", "nope")
+
+		time.Sleep(settle)
+
+		if got := sub.messages(); len(got) != 0 {
+			t.Errorf("a topic the policy denied was delivered: %v", got)
+		}
+
+		if aclCalls.Load() == 0 {
+			t.Error("the policy server was never consulted")
+		}
+	})
+
+	t.Run("a superuser token skips the policy", func(t *testing.T) {
+		before := aclCalls.Load()
+
+		sub := connect(t, cfg.MQTT.Addr, "jwt-admin",
+			token(jwt.MapClaims{"tenant": "tenant-d", "admin": true}))
+		sub.subscribe(t, "denied/#")
+
+		pub := connect(t, cfg.MQTT.Addr, "jwt-admin-pub",
+			token(jwt.MapClaims{"tenant": "tenant-d", "admin": true}))
+		pub.publish(t, "denied/secret", "allowed-for-admin")
+
+		if !waitFor(func() bool { return len(sub.messages()) > 0 }) {
+			t.Error("a superuser was denied a topic the policy refuses for others")
+		}
+
+		if aclCalls.Load() != before {
+			t.Errorf("the policy was consulted %d times for a superuser", aclCalls.Load()-before)
+		}
+	})
 }
