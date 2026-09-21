@@ -16,6 +16,8 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 - One NATS subscription per distinct filter rather than per device, released when the last subscriber disconnects
 - **Cross-node delivery** — edges join the core as leaf nodes, and a message published on one edge reaches a subscriber on another, with tenant isolation holding across the boundary
 
+- **HTTP authentication and authorization** — post the MQTT fields to your own service and let it name the tenant and rule on each topic
+
 Not yet: QoS 1 and 2 across the bridge, persistent sessions, offline queues, cluster-wide retained messages, and per-tenant quotas. Those all need the KV-backed session store, which is the next piece.
 
 ## Why
@@ -47,6 +49,34 @@ $ go build ./cmd/mast
 $ ./mast config show          # resolved configuration as JSON
 $ ./mast --role=core          # not runnable yet; reports the plan and exits
 ```
+
+## Authentication and authorization
+
+Set `auth.mode = "http"` and mast asks your service both questions over plain JSON.
+
+On CONNECT it posts the connect fields to `authn_url`:
+
+```json
+{"client_id": "dev-1", "username": "u", "password": "p", "remote_addr": "10.0.0.1:52000", "protocol_version": 5, "clean_start": true}
+```
+
+and expects a tenant back:
+
+```json
+{"allow": true, "tenant": "acme"}
+```
+
+That tenant is authoritative for the whole connection — it is what every topic is mounted under and what every later authorization question carries — so a client can never influence it again.
+
+On each publish and subscribe it posts to `authz_url`:
+
+```json
+{"tenant": "acme", "client_id": "dev-1", "username": "u", "remote_addr": "10.0.0.1:52000", "topic": "a/b", "action": "publish"}
+```
+
+and expects `{"allow": true}`. Leave `authz_url` empty and an authenticated connection may use any topic inside its own tenant, which is a coherent posture when the tenant mount is boundary enough.
+
+Two things worth knowing before you point this at production. Authorization is asked **on every publish**, so it is cached with a TTL — set `cache_ttl = "0s"` if decisions must take effect instantly, and accept a network round trip per message. And authentication **always fails closed** whatever `on_error` says, because admitting a connection whose tenant is unknown would mean inventing an isolation boundary; `on_error` governs authorization only.
 
 ## Configuration
 

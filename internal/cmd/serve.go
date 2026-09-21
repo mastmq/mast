@@ -4,7 +4,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/mastmq/mast/internal/domain/tenant"
+	"github.com/mastmq/mast/internal/infra/auth"
 	"github.com/mastmq/mast/internal/infra/broker"
 	"github.com/mastmq/mast/internal/infra/config"
 	"github.com/mastmq/mast/internal/infra/logger"
@@ -47,12 +47,12 @@ func serve(ctx context.Context, cmd *cli.Command) error {
 
 	log.InfoContext(ctx, "starting mast", "version", cmd.Version, "role", string(cfg.Role))
 
-	node, err := broker.Start(
-		cfg,
-		tenant.Static{Tenant: tenant.ID(cfg.Tenant.Default)},
-		tenant.AllowAll{},
-		log,
-	)
+	resolver, policy, err := auth.Build(cfg, log)
+	if err != nil {
+		return err
+	}
+
+	node, err := broker.Start(cfg, resolver, policy, log)
 	if err != nil {
 		return err
 	}
@@ -60,6 +60,7 @@ func serve(ctx context.Context, cmd *cli.Command) error {
 
 	log.InfoContext(ctx, "ready",
 		"role", string(cfg.Role),
+		"auth", string(cfg.Auth.Mode),
 		"jetstream", node.NATS().JetStreamEnabled(),
 		"mqtt_addr", cfg.MQTT.Addr,
 	)

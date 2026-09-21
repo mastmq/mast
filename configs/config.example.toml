@@ -49,5 +49,47 @@ credentials = ""
 # tenant lifecycle.
 default = "default"
 
+[auth]
+# static: one tenant, everything allowed. Appropriate only where the
+#         deployment itself is the security boundary.
+# http:   ask an HTTP service, posting the MQTT fields as JSON.
+mode = "static"
+
+[auth.http]
+# Posted on CONNECT:
+#   {"client_id":"..","username":"..","password":"..","remote_addr":"..",
+#    "protocol_version":5,"clean_start":true}
+# Expected back:
+#   {"allow":true,"tenant":"acme"}
+# The tenant in that reply is authoritative for the whole connection.
+authn_url = ""
+
+# Posted on each publish and subscribe:
+#   {"tenant":"..","client_id":"..","username":"..","remote_addr":"..",
+#    "topic":"a/b","action":"publish"}
+# Expected back:
+#   {"allow":true}
+# Leaving this empty means an authenticated connection may use any topic
+# inside its own tenant, which is coherent when the tenant mount is boundary
+# enough.
+authz_url = ""
+
+timeout = "2s"
+
+# What to do when the service cannot be reached, for authorization only.
+# "deny" makes a policy-server outage look like a broker outage; "allow"
+# makes it look like an open door. Authentication always fails closed:
+# admitting a connection whose tenant is unknown would mean inventing an
+# isolation boundary.
+on_error = "deny"
+
+# Authorization is asked on every publish, so a zero TTL costs a network
+# round trip per message. A failed call is never cached.
+cache_ttl = "1m"
+cache_size = 100000
+
+# [auth.http.headers]
+# Authorization = "Bearer ..."
+
 [obs]
 addr = "127.0.0.1:9090"  # /metrics and net/http/pprof

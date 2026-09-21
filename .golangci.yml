@@ -53,6 +53,16 @@ linters:
           # Naming only the fields under test is how a table test isolates a
           # variable. Spelling out every zero value hides what is being tested.
           - exhaustruct_v5
+          # The broker tests share one node across their subtests on purpose,
+          # because standing up a NATS server per case is not what they are
+          # testing. Running those subtests in parallel made "a/#" swallow the
+          # "a/+/c" case's publish and the suite went green on the wrong
+          # message, so parallelism here is opt-in, not mandatory.
+          - paralleltest
+          - tparallel
+          # An integration test that drives a real client through connect,
+          # subscribe, publish and assert is long because the scenario is.
+          - funlen
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0

@@ -2,9 +2,13 @@ package broker_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +16,7 @@ import (
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/mastmq/mast/internal/domain/tenant"
+	"github.com/mastmq/mast/internal/infra/auth"
 	"github.com/mastmq/mast/internal/infra/broker"
 	"github.com/mastmq/mast/internal/infra/config"
 )
@@ -89,12 +94,27 @@ func (c *collector) messages() []string {
 func connect(t *testing.T, addr, clientID, username string) *collector {
 	t.Helper()
 
+	return dial(t, addr, clientID, username, "")
+}
+
+// connectWithPassword is for the HTTP backend, whose test service reads the
+// tenant out of the password.
+func connectWithPassword(t *testing.T, addr, clientID, password string) *collector {
+	t.Helper()
+
+	return dial(t, addr, clientID, "user", password)
+}
+
+func dial(t *testing.T, addr, clientID, username, password string) *collector {
+	t.Helper()
+
 	c := &collector{client: nil, mu: sync.Mutex{}, got: nil}
 
 	opts := paho.NewClientOptions().
 		AddBroker("tcp://" + addr).
 		SetClientID(clientID).
 		SetUsername(username).
+		SetPassword(password).
 		SetConnectTimeout(5 * time.Second).
 		SetAutoReconnect(false)
 
@@ -176,10 +196,10 @@ func TestEndToEnd(t *testing.T) {
 		{"non ascii", "fa/#", "fa/دما", "fa/دما=hello"},
 	}
 
+	// Deliberately sequential: the cases share one broker and their filters
+	// overlap, so "a/#" would otherwise catch the "a/+/c" case's publish.
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
 			sub := connect(t, addr, fmt.Sprintf("sub-%d", i), "acme")
 			sub.subscribe(t, tc.filter)
 
@@ -300,4 +320,128 @@ func TestSubscriptionsAreDeduplicated(t *testing.T) {
 		t.Errorf("%d devices on one filter produced %d NATS subscriptions, want 1",
 			devices, node.Subscriptions())
 	}
+}
+
+// TestHTTPAuthEndToEnd drives a real MQTT client against a node whose
+// authentication and authorization come from an HTTP service, which is how
+// most deployments will run it.
+// policyServer stands in for a deployment's own auth service. It reads the
+// tenant out of the password and refuses the "forbidden/" subtree.
+func policyServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding request: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		var reply map[string]any
+
+		if _, isAuthz := req["action"]; isAuthz {
+			// Nobody may touch the forbidden subtree.
+			topic, _ := req["topic"].(string)
+			reply = map[string]any{"allow": !strings.HasPrefix(topic, "forbidden/")}
+		} else {
+			// The password is the tenant; anything else is refused.
+			password, _ := req["password"].(string)
+			reply = map[string]any{"allow": password != "", "tenant": password}
+		}
+
+		if err := json.NewEncoder(w).Encode(reply); err != nil {
+			t.Errorf("encoding reply: %v", err)
+		}
+	}))
+
+	t.Cleanup(srv.Close)
+
+	return srv
+}
+
+func TestHTTPAuthEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	policy := policyServer(t)
+
+	cfg := config.Default()
+	cfg.MQTT.Addr = freeAddr(t)
+	cfg.NATS.MonitorAddr = ""
+	cfg.Core.StoreDir = t.TempDir()
+	cfg.Auth.Mode = config.AuthHTTP
+	cfg.Auth.HTTP.AuthnURL = policy.URL
+	cfg.Auth.HTTP.AuthzURL = policy.URL
+
+	log := slog.New(slog.DiscardHandler)
+
+	resolver, pol, err := auth.Build(cfg, log)
+	if err != nil {
+		t.Fatalf("building auth: %v", err)
+	}
+
+	node, err := broker.Start(cfg, resolver, pol, log)
+	if err != nil {
+		t.Fatalf("starting broker: %v", err)
+	}
+
+	t.Cleanup(node.Close)
+
+	// Deliberately sequential: the subtests share one broker and one auth
+	// service, and the isolation case depends on what ran before it.
+	t.Run("rejects bad credentials", func(t *testing.T) {
+		opts := paho.NewClientOptions().
+			AddBroker("tcp://" + cfg.MQTT.Addr).
+			SetClientID("nobody").
+			SetPassword("").
+			SetConnectTimeout(5 * time.Second).
+			SetAutoReconnect(false)
+
+		tok := paho.NewClient(opts).Connect()
+		tok.WaitTimeout(5 * time.Second)
+
+		if tok.Error() == nil {
+			t.Error("a connection the auth service refused was accepted")
+		}
+	})
+
+	t.Run("delivers within the tenant the service named", func(t *testing.T) {
+		sub := connectWithPassword(t, cfg.MQTT.Addr, "http-sub", "tenant-x")
+		sub.subscribe(t, "data/#")
+
+		pub := connectWithPassword(t, cfg.MQTT.Addr, "http-pub", "tenant-x")
+		pub.publish(t, "data/reading", "42")
+
+		if !waitFor(func() bool { return len(sub.messages()) > 0 }) {
+			t.Fatal("message was not delivered within the tenant")
+		}
+	})
+
+	t.Run("isolates tenants the service named differently", func(t *testing.T) {
+		other := connectWithPassword(t, cfg.MQTT.Addr, "http-other", "tenant-y")
+		other.subscribe(t, "data/#")
+
+		pub := connectWithPassword(t, cfg.MQTT.Addr, "http-pub2", "tenant-x")
+		pub.publish(t, "data/reading", "42")
+
+		time.Sleep(settle)
+
+		if got := other.messages(); len(got) != 0 {
+			t.Errorf("a differently-tenanted client received %v", got)
+		}
+	})
+
+	t.Run("denies a topic the service refuses", func(t *testing.T) {
+		sub := connectWithPassword(t, cfg.MQTT.Addr, "http-sub3", "tenant-z")
+		sub.subscribe(t, "forbidden/#")
+
+		pub := connectWithPassword(t, cfg.MQTT.Addr, "http-pub3", "tenant-z")
+		pub.publish(t, "forbidden/secret", "nope")
+
+		time.Sleep(settle)
+
+		if got := sub.messages(); len(got) != 0 {
+			t.Errorf("a topic the policy server denied was delivered: %v", got)
+		}
+	})
 }

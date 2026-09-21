@@ -18,6 +18,18 @@ import (
 // spelled with a double underscore, so MAST__MQTT__ADDR sets mqtt.addr.
 const EnvPrefix = "MAST__"
 
+// defaultAuthTimeout bounds a single call to the auth service. It is short
+// on purpose: this call sits in front of every CONNECT.
+const defaultAuthTimeout = 2 * time.Second
+
+// defaultAuthCacheTTL is how long an authorization decision is reused.
+const defaultAuthCacheTTL = time.Minute
+
+// defaultAuthCacheSize bounds the authorization cache. At roughly a hundred
+// bytes an entry this is single-digit megabytes, which is cheap next to
+// asking the network on every publish.
+const defaultAuthCacheSize = 100_000
+
 // defaultConnectTimeout bounds how long a client may take to complete CONNECT.
 const defaultConnectTimeout = 10 * time.Second
 
@@ -72,6 +84,59 @@ type Config struct {
 	Edge   Edge   `json:"edge"   koanf:"edge"`
 	Obs    Observ `json:"obs"    koanf:"obs"`
 	Tenant Tenant `json:"tenant" koanf:"tenant"`
+	Auth   Auth   `json:"auth"   koanf:"auth"`
+}
+
+// AuthMode selects how connections are authenticated and authorized.
+type AuthMode string
+
+const (
+	// AuthStatic puts every connection in one tenant and allows everything.
+	// It is the default, and appropriate only where the deployment itself is
+	// the security boundary.
+	AuthStatic AuthMode = "static"
+
+	// AuthHTTP asks an HTTP service, posting the MQTT fields as JSON.
+	AuthHTTP AuthMode = "http"
+)
+
+// Valid reports whether m is an authentication mode mast knows.
+func (m AuthMode) Valid() bool { return m == AuthStatic || m == AuthHTTP }
+
+// AuthModes lists every valid mode, for help text and error messages.
+func AuthModes() []AuthMode { return []AuthMode{AuthStatic, AuthHTTP} }
+
+// Auth configures authentication and authorization.
+type Auth struct {
+	Mode AuthMode       `json:"mode" koanf:"mode"`
+	HTTP AuthHTTPConfig `json:"http" koanf:"http"`
+}
+
+// AuthHTTPConfig configures the HTTP backend.
+type AuthHTTPConfig struct {
+	// AuthnURL answers authentication, and is required in http mode.
+	AuthnURL string `json:"authn_url" koanf:"authn_url"`
+
+	// AuthzURL answers authorization. Leaving it empty means an
+	// authenticated connection may use any topic inside its own tenant,
+	// which is a coherent posture when the tenant mount is boundary enough.
+	AuthzURL string `json:"authz_url" koanf:"authz_url"`
+
+	Timeout time.Duration `json:"timeout" koanf:"timeout"`
+
+	// OnError decides authorization when the service cannot be reached:
+	// "deny" makes an outage look like a broker outage, "allow" makes it look
+	// like an open door. Authentication always fails closed regardless.
+	OnError string `json:"on_error" koanf:"on_error"`
+
+	// CacheTTL and CacheSize bound the authorization decision cache.
+	// Authorization is asked on every publish, so a zero TTL costs a network
+	// round trip per message.
+	CacheTTL  time.Duration `json:"cache_ttl"  koanf:"cache_ttl"`
+	CacheSize int           `json:"cache_size" koanf:"cache_size"`
+
+	// Headers are sent with every request, for a bearer token or similar.
+	Headers map[string]string `json:"headers" koanf:"headers"`
 }
 
 // Tenant configures how connections are mapped to tenants.
@@ -183,6 +248,18 @@ func Default() Config {
 		Tenant: Tenant{
 			Default: "default",
 		},
+		Auth: Auth{
+			Mode: AuthStatic,
+			HTTP: AuthHTTPConfig{
+				AuthnURL:  "",
+				AuthzURL:  "",
+				Timeout:   defaultAuthTimeout,
+				OnError:   "deny",
+				CacheTTL:  defaultAuthCacheTTL,
+				CacheSize: defaultAuthCacheSize,
+				Headers:   nil,
+			},
+		},
 	}
 }
 
@@ -225,6 +302,16 @@ func Load(path string) (Config, error) {
 
 // Validate reports the first reason cfg could not be run.
 func (c Config) Validate() error {
+	if err := c.validateRole(); err != nil {
+		return err
+	}
+
+	return c.validateAuth()
+}
+
+// validateRole checks that the role is one mast knows and that it has what
+// that role needs.
+func (c Config) validateRole() error {
 	if !c.Role.Valid() {
 		return fmt.Errorf("%w: %q is not one of %v", ErrInvalidRole, c.Role, Roles())
 	}
@@ -239,6 +326,20 @@ func (c Config) Validate() error {
 
 	if c.Role != RoleCore && c.Tenant.Default == "" {
 		return ErrNoDefaultTenant
+	}
+
+	return nil
+}
+
+// validateAuth checks the authentication backend, eagerly, so a broken auth
+// setup is a startup failure rather than a flood of denials in production.
+func (c Config) validateAuth() error {
+	if !c.Auth.Mode.Valid() {
+		return fmt.Errorf("%w: %q is not one of %v", ErrInvalidAuthMode, c.Auth.Mode, AuthModes())
+	}
+
+	if c.Auth.Mode == AuthHTTP && c.Auth.HTTP.AuthnURL == "" {
+		return ErrNoAuthnURL
 	}
 
 	return nil
