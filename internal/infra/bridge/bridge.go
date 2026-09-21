@@ -32,14 +32,17 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mastmq/mast/internal/domain/tenant"
 	"github.com/mastmq/mast/internal/domain/topic"
+	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/packets"
 	"github.com/nats-io/nats.go"
@@ -56,6 +59,18 @@ const (
 	headerRetain = "Mast-Retain"
 )
 
+// storeTimeout bounds a single call to the durable store. It sits on the
+// subscribe and publish paths, so it is short.
+const storeTimeout = 5 * time.Second
+
+// retainHandlingNever is MQTT 5's "do not send retained messages on
+// subscribe" subscription option.
+const retainHandlingNever = 2
+
+// packetIDMask narrows mochi's uint32 allocation to the 16 bits an MQTT
+// packet identifier actually has.
+const packetIDMask = 0xFFFF
+
 // ErrNoServer is returned when the hook is started without a server attached.
 var ErrNoServer = errors.New("bridge: no mqtt server attached")
 
@@ -71,17 +86,28 @@ type Hook struct {
 
 	server *mqtt.Server
 	subs   *registry
+	store  *store.Store
 
 	mu      sync.RWMutex
 	tenants map[string]tenant.ID
 }
 
 // New builds a bridge over an established NATS connection.
-func New(nc *nats.Conn, resolver tenant.Resolver, policy tenant.Policy, log *slog.Logger) *Hook {
+//
+// A nil store disables everything durable — retained messages and offline
+// queues — which is only appropriate where nothing is expected to survive.
+func New(
+	nc *nats.Conn,
+	st *store.Store,
+	resolver tenant.Resolver,
+	policy tenant.Policy,
+	log *slog.Logger,
+) *Hook {
 	h := &Hook{
 		HookBase: mqtt.HookBase{},
 		mu:       sync.RWMutex{},
 		nc:       nc,
+		store:    st,
 		resolver: resolver,
 		policy:   policy,
 		log:      log.With("component", "bridge"),
@@ -220,6 +246,10 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		return pk, packets.CodeSuccessIgnore
 	}
 
+	if pk.FixedHeader.Retain {
+		h.storeRetained(subject, unmount(id, pk.TopicName), pk)
+	}
+
 	msg := nats.NewMsg(subject)
 	msg.Data = pk.Payload
 	msg.Header.Set(headerQoS, strconv.Itoa(int(pk.FixedHeader.Qos)))
@@ -255,6 +285,8 @@ func (h *Hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []by
 	if err := h.subs.acquire(cl.ID, keys); err != nil {
 		h.log.Error("acquiring nats subscriptions", "client", cl.ID, "error", err)
 	}
+
+	h.deliverRetained(cl, id, pk, reasonCodes)
 }
 
 // OnUnsubscribed closes the NATS subscriptions the dropped filters required.
@@ -339,10 +371,13 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 	// subscription to the minimum of that and what each subscriber
 	// negotiated, which is what the spec asks for. Without this every
 	// subscriber silently received QoS 0 however it subscribed.
+	// Retain is deliberately false here. A retained publish is stored in the
+	// KV bucket by the ingress node and replayed from there on subscribe;
+	// setting it on live delivery would both duplicate that and lie to a
+	// subscriber that was already present, which MQTT says gets retain=0.
 	qos := qosOf(msg)
-	retain := msg.Header.Get(headerRetain) == "1"
 
-	if err := h.server.Publish(mount(tenant.ID(tenantID), mqttTopic), msg.Data, retain, qos); err != nil {
+	if err := h.server.Publish(mount(tenant.ID(tenantID), mqttTopic), msg.Data, false, qos); err != nil {
 		h.log.Error("injecting message from nats", "subject", msg.Subject, "error", err)
 	}
 }
@@ -420,4 +455,122 @@ func unmount(id tenant.ID, mounted string) string {
 // using the same group name do not steal each other's messages.
 func queueName(id tenant.ID, share string) string {
 	return string(id) + "." + share
+}
+
+// storeRetained records a retained publish, or clears it when the payload is
+// empty, which is what MQTT says a retained publish with no payload means.
+func (h *Hook) storeRetained(subject, bareTopic string, pk packets.Packet) {
+	if h.store == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+
+	err := h.store.PutRetained(ctx, subject, store.Message{
+		Topic:   bareTopic,
+		Payload: pk.Payload,
+		QoS:     pk.FixedHeader.Qos,
+		Retain:  true,
+	})
+	if err != nil {
+		h.log.Error("storing retained message", "subject", subject, "error", err)
+	}
+}
+
+// deliverRetained replays the last known value of every topic a new
+// subscription matches, to that client alone.
+//
+// mochi keeps its own retained index, but it is per node and holds only what
+// that node happened to see, so a subscriber landing on a quiet node would
+// get nothing. Reading the KV bucket instead makes retention a property of
+// the cluster and survives a restart.
+func (h *Hook) deliverRetained(cl *mqtt.Client, id tenant.ID, pk packets.Packet, reasonCodes []byte) {
+	if h.store == nil {
+		return
+	}
+
+	for i, filter := range pk.Filters {
+		if i < len(reasonCodes) && reasonCodes[i] >= packets.ErrUnspecifiedError.Code {
+			continue // not granted
+		}
+
+		// A shared subscription receives no retained messages when it is
+		// first made. MQTT 5 section 4.8.2.
+		if _, _, shared := splitShare(filter.Filter); shared {
+			continue
+		}
+
+		if filter.RetainHandling == retainHandlingNever {
+			continue
+		}
+
+		h.replayRetained(cl, id, filter)
+	}
+}
+
+// replayRetained sends this client every retained message one filter matches.
+func (h *Hook) replayRetained(cl *mqtt.Client, id tenant.ID, filter packets.Subscription) {
+	subjects, err := topic.FilterSubjects(string(id), unmount(id, filter.Filter))
+	if err != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+
+	messages, err := h.store.MatchRetained(ctx, subjects)
+	if err != nil {
+		h.log.Error("reading retained messages", "tenant", string(id), "error", err)
+
+		return
+	}
+
+	for _, msg := range messages {
+		if err := h.writeRetained(cl, id, filter, msg); err != nil {
+			h.log.Debug("delivering retained message",
+				"client", cl.ID, "topic", msg.Topic, "error", err)
+		}
+	}
+}
+
+// writeRetained sends one retained message to a single client.
+//
+// It writes to that client directly rather than publishing, because a
+// retained replay belongs to the subscriber that just arrived and not to
+// everyone else already holding the same filter.
+func (h *Hook) writeRetained(
+	cl *mqtt.Client,
+	id tenant.ID,
+	filter packets.Subscription,
+	msg store.Message,
+) error {
+	qos := min(msg.QoS, filter.Qos)
+
+	out := packets.Packet{
+		FixedHeader: packets.FixedHeader{
+			Type:   packets.Publish,
+			Qos:    qos,
+			Retain: true,
+		},
+		TopicName: mount(id, msg.Topic),
+		Payload:   msg.Payload,
+	}
+
+	if qos > 0 {
+		packetID, err := cl.NextPacketID()
+		if err != nil {
+			return fmt.Errorf("bridge: packet id for retained message: %w", err)
+		}
+
+		// NextPacketID returns uint32 but MQTT packet ids are 16 bit, and
+		// mochi allocates them inside that range.
+		out.PacketID = uint16(packetID & packetIDMask)
+	}
+
+	if err := cl.WritePacket(out); err != nil {
+		return fmt.Errorf("bridge: writing retained message: %w", err)
+	}
+
+	return nil
 }

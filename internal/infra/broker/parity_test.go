@@ -20,9 +20,10 @@ import (
 // connectAs dials with an explicit clean-session flag, which the parity tests
 // need and the happy-path helpers do not expose.
 //
-// concrete type to return.
+// there is no concrete type to return; clean=false is reached only by the
+// persistent-session test, which is skipped until that gap closes.
 //
-//nolint:ireturn // paho.Client is an interface in the library; there is no
+//nolint:ireturn,unparam // paho.Client is an interface in the library, so
 func connectAs(t *testing.T, addr, clientID string, clean bool) paho.Client {
 	t.Helper()
 
@@ -88,7 +89,6 @@ func TestParityQoS(t *testing.T) {
 // still gets the last known value.
 func TestParityRetained(t *testing.T) {
 	t.Parallel()
-	t.Skip("gap: retained messages are stored nowhere (issue #4)")
 
 	addr := start(t, tenant.Static{Tenant: "acme"})
 

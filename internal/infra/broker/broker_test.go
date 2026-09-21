@@ -47,7 +47,7 @@ func start(t *testing.T, resolver tenant.Resolver) string {
 
 	log := slog.New(slog.DiscardHandler)
 
-	node, err := broker.Start(cfg, resolver, tenant.AllowAll{}, log)
+	node, err := broker.Start(t.Context(), cfg, resolver, tenant.AllowAll{}, log)
 	if err != nil {
 		t.Fatalf("starting broker: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestSubscriptionsAreDeduplicated(t *testing.T) {
 
 	log := slog.New(slog.DiscardHandler)
 
-	node, err := broker.Start(cfg, tenant.Static{Tenant: "acme"}, tenant.AllowAll{}, log)
+	node, err := broker.Start(t.Context(), cfg, tenant.Static{Tenant: "acme"}, tenant.AllowAll{}, log)
 	if err != nil {
 		t.Fatalf("starting broker: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestHTTPAuthEndToEnd(t *testing.T) {
 		t.Fatalf("building auth: %v", err)
 	}
 
-	node, err := broker.Start(cfg, resolver, pol, log)
+	node, err := broker.Start(t.Context(), cfg, resolver, pol, log)
 	if err != nil {
 		t.Fatalf("starting broker: %v", err)
 	}

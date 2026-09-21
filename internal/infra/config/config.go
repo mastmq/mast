@@ -18,6 +18,11 @@ import (
 // spelled with a double underscore, so MAST__MQTT__ADDR sets mqtt.addr.
 const EnvPrefix = "MAST__"
 
+// defaultSessionExpiry is how long a disconnected session and its queued
+// messages survive. Long enough for a device on a bad link or a rolling
+// deploy, short enough that decommissioned hardware releases storage.
+const defaultSessionExpiry = 24 * time.Hour
+
 // defaultAuthTimeout bounds a single call to the auth service. It is short
 // on purpose: this call sits in front of every CONNECT.
 const defaultAuthTimeout = 2 * time.Second
@@ -76,15 +81,23 @@ func Roles() []Role { return []Role{RoleAllInOne, RoleCore, RoleEdge} }
 
 // Config is the whole configuration tree.
 type Config struct {
-	Role   Role   `json:"role"   koanf:"role"`
-	Log    Log    `json:"log"    koanf:"log"`
-	MQTT   MQTT   `json:"mqtt"   koanf:"mqtt"`
-	NATS   NATS   `json:"nats"   koanf:"nats"`
-	Core   Core   `json:"core"   koanf:"core"`
-	Edge   Edge   `json:"edge"   koanf:"edge"`
-	Obs    Observ `json:"obs"    koanf:"obs"`
-	Tenant Tenant `json:"tenant" koanf:"tenant"`
-	Auth   Auth   `json:"auth"   koanf:"auth"`
+	Role    Role    `json:"role"    koanf:"role"`
+	Log     Log     `json:"log"     koanf:"log"`
+	MQTT    MQTT    `json:"mqtt"    koanf:"mqtt"`
+	NATS    NATS    `json:"nats"    koanf:"nats"`
+	Core    Core    `json:"core"    koanf:"core"`
+	Edge    Edge    `json:"edge"    koanf:"edge"`
+	Obs     Observ  `json:"obs"     koanf:"obs"`
+	Tenant  Tenant  `json:"tenant"  koanf:"tenant"`
+	Auth    Auth    `json:"auth"    koanf:"auth"`
+	Session Session `json:"session" koanf:"session"`
+}
+
+// Session configures what mast keeps for a client between connections.
+type Session struct {
+	// Expiry is how long a session and its queued messages survive after the
+	// client goes away. It bounds what an abandoned device can hold.
+	Expiry time.Duration `json:"expiry" koanf:"expiry"`
 }
 
 // AuthMode selects how connections are authenticated and authorized.
@@ -247,6 +260,9 @@ func Default() Config {
 		},
 		Tenant: Tenant{
 			Default: "default",
+		},
+		Session: Session{
+			Expiry: defaultSessionExpiry,
 		},
 		Auth: Auth{
 			Mode: AuthStatic,

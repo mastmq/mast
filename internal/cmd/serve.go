@@ -52,7 +52,7 @@ func serve(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 
-	node, err := broker.Start(cfg, resolver, policy, log)
+	node, err := broker.Start(ctx, cfg, resolver, policy, log)
 	if err != nil {
 		return err
 	}

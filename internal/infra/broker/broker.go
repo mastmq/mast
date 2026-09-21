@@ -7,24 +7,34 @@
 package broker
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/mastmq/mast/internal/domain/tenant"
 	"github.com/mastmq/mast/internal/infra/bridge"
 	"github.com/mastmq/mast/internal/infra/config"
 	"github.com/mastmq/mast/internal/infra/mqttd"
 	"github.com/mastmq/mast/internal/infra/natsd"
+	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mochi-mqtt/server/v2"
 )
+
+// storeOpenTimeout bounds bucket creation at startup.
+const storeOpenTimeout = 30 * time.Second
 
 // Broker is a running mast node.
 type Broker struct {
 	nats   *natsd.Server
 	hook   *bridge.Hook
 	server *mqtt.Server
+	store  *store.Store
 	log    *slog.Logger
 }
+
+// Store exposes the durable state, for tests and for administrative tools.
+func (b *Broker) Store() *store.Store { return b.store }
 
 // NATS exposes the embedded server, for monitoring and for tests.
 func (b *Broker) NATS() *natsd.Server { return b.nats }
@@ -44,6 +54,7 @@ func (b *Broker) Subscriptions() int {
 // The resolver and policy are injected rather than constructed here because
 // they are the seam a deployment replaces: mast does not own tenant lifecycle.
 func Start(
+	ctx context.Context,
 	cfg config.Config,
 	resolver tenant.Resolver,
 	policy tenant.Policy,
@@ -54,14 +65,27 @@ func Start(
 		return nil, err
 	}
 
-	b := &Broker{nats: nats, hook: nil, server: nil, log: log}
+	b := &Broker{nats: nats, hook: nil, server: nil, store: nil, log: log}
 
 	// A core node carries storage and consensus and terminates no MQTT.
 	if cfg.Role == config.RoleCore {
 		return b, nil
 	}
 
-	b.hook = bridge.New(nats.Conn(), resolver, policy, log)
+	// Opening the store is fatal rather than degraded. A broker that
+	// silently drops retained messages and offline queues looks like it is
+	// working, which is worse than refusing to start.
+	openCtx, cancel := context.WithTimeout(ctx, storeOpenTimeout)
+	defer cancel()
+
+	b.store, err = store.Open(openCtx, nats.Conn(), cfg.Core.Replicas, cfg.Session.Expiry)
+	if err != nil {
+		nats.Shutdown()
+
+		return nil, err
+	}
+
+	b.hook = bridge.New(nats.Conn(), b.store, resolver, policy, log)
 
 	b.server, err = mqttd.New(cfg, b.hook, log)
 	if err != nil {
