@@ -35,6 +35,20 @@ jobs:
           files: coverage.out
         continue-on-error: true
 
+  # A dependency can become vulnerable without a single line of our code
+  # changing, so this runs on every push rather than only on dependency
+  # bumps. It fails only on vulnerabilities actually reachable from our
+  # code; an unreachable one in the module graph is noise, and treating
+  # noise as failure is how a red pipeline stops meaning anything.
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
   # The topic codec is baked into stored subjects and authorization rules, so
   # a round-trip regression is a data-loss bug. Fuzz it on every change.
   fuzz:
@@ -47,7 +61,7 @@ jobs:
       - run: go test -run='^$' -fuzz=FuzzRoundTrip -fuzztime=60s ./internal/domain/topic/
 
   build:
-    needs: [lint, test]
+    needs: [lint, test, vuln]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

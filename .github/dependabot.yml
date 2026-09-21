@@ -5,7 +5,25 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # One PR for the long tail rather than a dozen. A direct dependency
+      # still gets its own, because those are the ones worth reading.
+      indirect:
+        dependency-type: production
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
   - package-ecosystem: github-actions
     directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # The builder and runtime base images go stale silently otherwise: nothing
+  # in the Go toolchain notices that the Debian underneath it has moved on.
+  - package-ecosystem: docker
+    directory: /build/package
     schedule:
       interval: weekly
