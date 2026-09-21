@@ -28,21 +28,23 @@ func showCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "show",
 		Usage: "print the resolved configuration as JSON",
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:    "config",
-				Aliases: []string{"c"},
-				Usage:   "path to a TOML config file",
-				Sources: cli.EnvVars("MAST_CONFIG"),
-			},
-		},
+		// No --config flag of its own. Redeclaring it here shadowed the
+		// root's persistent flag with an empty default, so
+		// `mast -c file config show` silently ignored the file and printed
+		// the built-in defaults instead — the worst possible answer from a
+		// command whose entire job is to tell you what the config is.
 		Action: func(_ context.Context, cmd *cli.Command) error {
 			cfg, err := config.Load(cmd.String("config"))
 			if err != nil {
 				return err
 			}
 
-			enc := json.NewEncoder(os.Stdout)
+			out := cmd.Root().Writer
+			if out == nil {
+				out = os.Stdout
+			}
+
+			enc := json.NewEncoder(out)
 			enc.SetIndent("", "  ")
 
 			if err := enc.Encode(cfg); err != nil {

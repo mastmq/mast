@@ -28,7 +28,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	root := &cli.Command{
+	return newRoot().Run(ctx, os.Args)
+}
+
+// newRoot builds the command tree. It is separate from [Execute] so tests can
+// drive the real tree rather than a reconstruction of it.
+func newRoot() *cli.Command {
+	return &cli.Command{
 		Name:    "mast",
 		Usage:   "multi-tenant MQTT broker built on core NATS",
 		Version: versioninfo.Short(),
@@ -38,8 +44,6 @@ func run() error {
 			configcmd.Command(),
 		},
 	}
-
-	return root.Run(ctx, os.Args)
 }
 
 // rootFlags are shared by the root action and every subcommand that needs to
