@@ -1,5 +1,9 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/mastmq/.github/main/assets/banner.png" alt="mast — multi-tenant MQTT broker built on core NATS" width="760">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mastmq/.github/main/assets/banner.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/mastmq/.github/main/assets/banner-light.png">
+    <img src="https://raw.githubusercontent.com/mastmq/.github/main/assets/banner.png" alt="mast — multi-tenant MQTT broker built on core NATS" width="820">
+  </picture>
 </div>
 
 > **Status: early, but it runs.** A single `mast` process starts an embedded nats-server, terminates MQTT, and moves messages end to end with tenant isolation, wildcards, and shared subscriptions. Persistence is not wired yet, so QoS is 0 across the bridge, sessions do not survive a restart, and retained messages are node-local. See [what works](#what-works).
