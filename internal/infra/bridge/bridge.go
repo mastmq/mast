@@ -139,6 +139,7 @@ func (h *Hook) Provides(b byte) bool {
 		mqtt.OnSubscribed,
 		mqtt.OnUnsubscribed,
 		mqtt.OnDisconnect,
+		mqtt.OnClientExpired,
 		mqtt.OnPacketEncode,
 	}, b)
 }
@@ -304,13 +305,29 @@ func (h *Hook) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet) {
 	h.subs.release(cl.ID, keys)
 }
 
-// OnDisconnect releases everything the client held.
-func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, _ bool) {
-	h.subs.releaseAll(cl.ID)
+// OnDisconnect releases what the client held, unless its session outlives
+// the connection.
+//
+// A persistent session keeps its NATS subscriptions open while the client is
+// away. That is what makes an offline queue possible at all: messages have to
+// keep arriving at a node for anything to queue them. mochi tells us which
+// case this is through expire, which it computes from the clean flag and the
+// v5 session expiry interval.
+func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
+	if !expire {
+		h.log.Debug("client away, session retained", "client", cl.ID)
 
-	h.mu.Lock()
-	delete(h.tenants, cl.ID)
-	h.mu.Unlock()
+		return
+	}
+
+	h.forget(cl.ID)
+}
+
+// OnClientExpired releases a session that outlived its client and has now
+// run out of time.
+func (h *Hook) OnClientExpired(cl *mqtt.Client) {
+	h.log.Debug("session expired", "client", cl.ID)
+	h.forget(cl.ID)
 }
 
 // tenantOf returns the tenant resolved for a client at CONNECT.
@@ -573,4 +590,14 @@ func (h *Hook) writeRetained(
 	}
 
 	return nil
+}
+
+// forget drops every trace of a client: its NATS subscriptions and the
+// tenant resolved for it.
+func (h *Hook) forget(clientID string) {
+	h.subs.releaseAll(clientID)
+
+	h.mu.Lock()
+	delete(h.tenants, clientID)
+	h.mu.Unlock()
 }
