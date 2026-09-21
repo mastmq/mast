@@ -157,6 +157,7 @@ func (h *Hook) Provides(b byte) bool {
 		mqtt.OnUnsubscribed,
 		mqtt.OnDisconnect,
 		mqtt.OnClientExpired,
+		mqtt.OnWill,
 		mqtt.OnPacketEncode,
 	}, b)
 }
@@ -359,6 +360,60 @@ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 
 	h.forget(cl.ID)
 }
+
+// OnWill forwards a last-will message onto the fabric and stops mochi
+// delivering it locally.
+//
+// mochi builds the will packet itself and hands it straight to
+// publishToSubscribers, bypassing OnPublish entirely, so a will would
+// otherwise never reach the bridge: its topic would stay unmounted, match no
+// subscriber's mounted filter, and never leave the node. Forwarding here and
+// then pointing the packet at a topic no filter can match keeps every
+// message on exactly one path — out to NATS and back — which is the same
+// rule ordinary publishes follow.
+func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
+	id, ok := h.tenantOf(cl)
+	if !ok {
+		return will, nil
+	}
+
+	subject, err := topic.EncodeTopic(string(id), will.TopicName)
+	if err != nil {
+		h.log.Warn("dropping will with unencodable topic",
+			"client", cl.ID, "topic", will.TopicName, "error", err)
+
+		return will, nil
+	}
+
+	if will.Retain {
+		h.storeRetained(subject, will.TopicName, packets.Packet{
+			FixedHeader: packets.FixedHeader{Qos: will.Qos, Retain: true},
+			Payload:     will.Payload,
+		})
+	}
+
+	msg := nats.NewMsg(subject)
+	msg.Data = will.Payload
+	msg.Header.Set(headerQoS, strconv.Itoa(int(will.Qos)))
+
+	if err := h.nc.PublishMsg(msg); err != nil {
+		h.log.Error("forwarding will to nats", "subject", subject, "error", err)
+	}
+
+	h.log.Debug("will forwarded", "client", cl.ID, "topic", will.TopicName)
+
+	// Send mochi somewhere nothing is listening. Every filter is mounted
+	// under a tenant, and a tenant cannot contain '$', so this matches none
+	// of them and the local publish becomes a no-op.
+	will.TopicName = droppedTopic
+	will.Retain = false
+
+	return will, nil
+}
+
+// droppedTopic is where a message goes when mochi must be handed something
+// but nothing should receive it.
+const droppedTopic = "$mast/dropped"
 
 // OnClientExpired releases a session that outlived its client and has now
 // run out of time.

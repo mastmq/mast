@@ -164,7 +164,6 @@ func TestParityPersistentSession(t *testing.T) {
 // without a DISCONNECT.
 func TestParityWill(t *testing.T) {
 	t.Parallel()
-	t.Skip("gap: the will topic is never mounted, so it matches no subscriber (issue #6)")
 
 	addr := start(t, tenant.Static{Tenant: "acme"})
 
@@ -177,22 +176,13 @@ func TestParityWill(t *testing.T) {
 		t.Fatalf("subscribing: %v", tok.Error())
 	}
 
-	opts := paho.NewClientOptions().
-		AddBroker("tcp://"+addr).
-		SetClientID("will-dying").
-		SetUsername("acme").
-		SetWill("parity/will", "gone", 0, false).
-		SetConnectTimeout(5 * time.Second).
-		SetAutoReconnect(false)
+	// A clean DISCONNECT suppresses the will by design, so this connection
+	// is made by hand and the socket is simply dropped underneath it.
+	dying := connectWithWill(t, addr, "will-dying", "acme", "parity/will", "gone")
 
-	dying := paho.NewClient(opts)
-	if tok := dying.Connect(); !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
-		t.Fatalf("connecting: %v", tok.Error())
+	if err := dying.Close(); err != nil {
+		t.Fatalf("closing the will client's socket: %v", err)
 	}
-
-	// A clean DISCONNECT suppresses the will by design, so the socket has to
-	// go away underneath the client.
-	forceClose(t, dying)
 
 	select {
 	case v := <-got:
