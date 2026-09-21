@@ -22,21 +22,21 @@ func TestEncodeTopic(t *testing.T) {
 
 		// The two cases nats-server's own MQTT mapping gets wrong: it turns a
 		// '.' into "//" and gives a leading '/' an empty token.
-		{"dot in level", "sensor/temp.1", "t.acme.sensor.temp%2E1"},
-		{"leading slash", "/foo/bar", "t.acme.%.foo.bar"},
+		{"dot in level", "sensor/temp.1", "t.acme.sensor.temp=2E1"},
+		{"leading slash", "/foo/bar", "t.acme.=.foo.bar"},
 
-		{"trailing slash", "foo/", "t.acme.foo.%"},
-		{"empty middle level", "a//b", "t.acme.a.%.b"},
-		{"only slash", "/", "t.acme.%.%"},
-		{"space", "a b/c", "t.acme.a%20b.c"},
-		{"percent", "100%/x", "t.acme.100%25.x"},
+		{"trailing slash", "foo/", "t.acme.foo.="},
+		{"empty middle level", "a//b", "t.acme.a.=.b"},
+		{"only slash", "/", "t.acme.=.="},
+		{"space", "a b/c", "t.acme.a=20b.c"},
+		{"percent", "100%/x", "t.acme.100=25.x"},
 
 		// NATS wildcards appearing literally in an MQTT topic name.
-		{"literal star", "a/*/b", "t.acme.a.%2A.b"},
-		{"literal gt", "a/>/b", "t.acme.a.%3E.b"},
+		{"literal star", "a/*/b", "t.acme.a.=2A.b"},
+		{"literal gt", "a/>/b", "t.acme.a.=3E.b"},
 
-		// '$' is printable ASCII and not reserved by NATS, so $SYS survives.
-		{"dollar", "$SYS/broker/uptime", "t.acme.$SYS.broker.uptime"},
+		// '$' is outside the allowlist, so even $SYS is escaped.
+		{"dollar", "$SYS/broker/uptime", "t.acme.=24SYS.broker.uptime"},
 	}
 
 	for _, tc := range cases {
@@ -61,6 +61,33 @@ func TestEncodeTopic(t *testing.T) {
 				t.Errorf("round trip %q -> %q -> %q", tc.topic, got, back)
 			}
 		})
+	}
+}
+
+// TestEncodedSubjectsAreValidKVKeys pins the property the escaping exists
+// for: a JetStream KV key may only contain [-/_=.a-zA-Z0-9], and mast stores
+// retained messages and session state under the same string a message routes
+// on. If this breaks, storage breaks.
+func TestEncodedSubjectsAreValidKVKeys(t *testing.T) {
+	t.Parallel()
+
+	// The set JetStream permits in a KV key.
+	const allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/_=."
+
+	for _, in := range []string{
+		"a/b/c", "sensor/temp.1", "/foo/bar", "a//b", "$SYS/x",
+		"دما/۱", "100%/x", "a=b", "a b/c", "a/*/>", "emoji/🙂",
+	} {
+		subject, err := EncodeOrFail(t, in)
+		if err != nil {
+			t.Fatalf("EncodeTopic(%q): %v", in, err)
+		}
+
+		for _, r := range subject {
+			if !strings.ContainsRune(allowed, r) {
+				t.Errorf("EncodeTopic(%q) = %q contains %q, invalid in a KV key", in, subject, r)
+			}
+		}
 	}
 }
 
@@ -225,8 +252,8 @@ func TestDecodeErrors(t *testing.T) {
 	}{
 		{"wrong prefix", "x.acme.a", topic.ErrBadSubject},
 		{"no levels", "t.acme", topic.ErrBadSubject},
-		{"truncated escape", "t.acme.%2", topic.ErrBadEscape},
-		{"non hex escape", "t.acme.%ZZ", topic.ErrBadEscape},
+		{"truncated escape", "t.acme.=2", topic.ErrBadEscape},
+		{"non hex escape", "t.acme.=ZZ", topic.ErrBadEscape},
 		{"bad tenant", "t.ac me.a", topic.ErrInvalidTenant},
 	}
 
@@ -291,4 +318,11 @@ func FuzzRoundTrip(f *testing.F) {
 			t.Errorf("round trip %q -> %q -> %q", in, subject, back)
 		}
 	})
+}
+
+// EncodeOrFail is a thin helper so the KV-key test reads as one assertion.
+func EncodeOrFail(t *testing.T, mqttTopic string) (string, error) {
+	t.Helper()
+
+	return topic.EncodeTopic("acme", mqttTopic)
 }

@@ -14,10 +14,19 @@
 //	t.<tenant>.<level>.<level>...
 //
 // The leading "t" token keeps MQTT traffic in a namespace of its own so a
-// tenant's native NATS subjects cannot collide with its MQTT topics. Every
-// MQTT level is percent-escaped so that the characters NATS reserves ('.',
-// '*', '>' and whitespace) can never appear in a token, and an empty level is
-// written as a bare "%" because NATS has no empty token.
+// tenant's native NATS subjects cannot collide with its MQTT topics.
+//
+// Each level is escaped down to an allowlist of [A-Za-z0-9_-], with anything
+// else written as "=XX". An empty level becomes a bare "=", which no
+// non-empty level can produce because a literal '=' escapes to "=3D".
+//
+// The allowlist is that narrow, and the escape character is '=' rather than
+// the more familiar '%', for one reason: a JetStream KV key may only contain
+// [-/_=.a-zA-Z0-9]. Encoding this way means an encoded subject is also a
+// valid KV key, so retained messages and session state are stored under the
+// very same string the message routes on, and a subscription filter doubles
+// as a KV watch pattern. The cost is louder subjects for topics full of
+// punctuation; the benefit is one encoding instead of two that must agree.
 package topic
 
 import (
@@ -35,9 +44,12 @@ const Prefix = "t"
 const MaxTopicLen = 65535
 
 // emptyLevel is the encoded form of an empty MQTT topic level. A non-empty
-// level can never encode to a bare "%" because a literal '%' escapes to "%25",
-// so the sentinel is unambiguous.
-const emptyLevel = "%"
+// level can never encode to a bare "=" because a literal '=' escapes to
+// "=3D", so the sentinel is unambiguous.
+const emptyLevel = "="
+
+// escapeChar introduces a two-hex-digit escape.
+const escapeChar = '='
 
 const hexDigits = "0123456789ABCDEF"
 
@@ -211,7 +223,7 @@ func encodeLevel(level string, sb *strings.Builder) {
 			continue
 		}
 
-		sb.WriteByte('%')
+		sb.WriteByte(escapeChar)
 		sb.WriteByte(hexDigits[b>>4])
 		sb.WriteByte(hexDigits[b&0x0F])
 	}
@@ -223,7 +235,7 @@ func decodeLevel(token string) (string, error) {
 		return "", nil
 	}
 
-	if !strings.Contains(token, "%") {
+	if !strings.ContainsRune(token, escapeChar) {
 		return token, nil
 	}
 
@@ -232,7 +244,7 @@ func decodeLevel(token string) (string, error) {
 	sb.Grow(len(token))
 
 	for i := 0; i < len(token); {
-		if token[i] != '%' {
+		if token[i] != escapeChar {
 			sb.WriteByte(token[i])
 			i++
 
@@ -258,24 +270,27 @@ func decodeLevel(token string) (string, error) {
 	return sb.String(), nil
 }
 
-// mustEscape reports whether b has to be percent-escaped to sit inside a NATS
-// subject token.
+// mustEscape reports whether b has to be escaped to sit inside a NATS subject
+// token that is also a valid JetStream KV key.
 //
-// Three groups are escaped. NATS reserves '.', '*' and '>', and '%' introduces
-// an escape sequence. Everything below 0x21 covers whitespace and control
-// bytes, which NATS rejects outright. Everything from 0x7F up covers DEL and
-// all non-ASCII, which is escaped not because NATS forbids it but because
-// keeping subjects pure ASCII is what makes them safe to paste into a metric
-// label, a KV bucket key, a log line, or a filesystem path without a second
-// encoding step. A topic of "دما/۱" costs more bytes this way; correctness at
+// It is an allowlist rather than a denylist, which is the conservative
+// direction: a new reserved character somewhere downstream cannot silently
+// start producing broken keys. NATS reserves '.', '*' and '>' in subjects; a
+// KV key additionally permits only [-/_=.a-zA-Z0-9]; and '=' is the escape
+// character. The intersection that survives unescaped is [A-Za-z0-9_-].
+//
+// A topic of "دما/۱" or "$SYS/#" costs more bytes this way. Correctness at
 // every downstream boundary is worth more than the bytes.
 func mustEscape(b byte) bool {
-	switch b {
-	case '.', '*', '>', '%':
+	switch {
+	case b >= 'a' && b <= 'z',
+		b >= 'A' && b <= 'Z',
+		b >= '0' && b <= '9',
+		b == '_', b == '-':
+		return false
+	default:
 		return true
 	}
-
-	return b < 0x21 || b >= 0x7F
 }
 
 func unhex(b byte) (byte, bool) {
