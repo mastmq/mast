@@ -94,6 +94,18 @@ mast imports `github.com/mastmq/mochi/v2`, not `github.com/mochi-mqtt/server/v2`
 
 Two consequences worth remembering. `go get -u ./...` will not pull mochi-mqtt updates any more, because we no longer depend on that path — watch upstream by hand. And `.golangci.yml`'s `exhaustruct_v5` ignore pattern is `^github\.com/mastmq/mochi/.*`; it has to move with the module path or every mochi struct literal starts reporting.
 
+## Session state
+
+Three hooks carry it, and the order they run in is the whole trick.
+
+`OnConnectAuthenticate` mounts the client id, claims the session and — on a clean start — drops the durable state. It cannot restore, because mochi has not added the client yet: registering the subscriptions there works, and then the replayed backlog publishes into a topic index whose subscriber is not in the client map, so every queued message lands on the floor. That was a real bug and the test caught it.
+
+`OnSessionEstablished` restores, because it runs after `Clients.Add` and after the CONNACK. It re-registers each stored filter with `server.Topics.Subscribe` **and** `cl.State.Subscriptions.Add` — both, exactly as mochi's own storage reload does, because a message matches nothing on the way out if the two disagree — then re-acquires the NATS subscriptions and drains the queue. A session mochi inherited locally is left alone: it already has subscriptions and richer inflight state than the bucket holds.
+
+`OnQosPublish` queues. It fires when a QoS 1 or 2 packet enters a client's inflight, which mochi does *before* deciding it cannot write to the connection, so it is the one place an absent client's message can be caught. **The offline check must mirror mochi's own** — `cl.Net.Conn == nil || cl.Closed()` — because a client that sent DISCONNECT with a session to keep is not marked closed, and that is precisely the client whose messages need keeping.
+
+QoS 0 is deliberately never queued: MQTT allows discarding it for an absent client, and persisting it turns fire-and-forget into storage that outlives the thing it described. A corollary that cost an hour: **queueing follows the subscription's QoS, not the publisher's.** A QoS 0 subscriber gets nothing kept however the publisher sent it, which is why `subscribeQoS` exists in the tests.
+
 ## The session control plane
 
 `mast.session.<tenant>.<client-id>` is the only control-plane subject, and it is deliberately **outside** the `t.` namespace that carries tenant traffic. Every filter a client can subscribe to is mounted under its tenant and encoded to `t.<tenant>....`, so no client — wildcard or otherwise — can read a notice or forge one. Keep it that way: a control subject reachable from a `#` subscription is a control subject a tenant owns.
@@ -167,7 +179,7 @@ This repo is one of six. A behaviour change usually touches more than one.
 
 | | |
 | --- | --- |
-| [#8](https://github.com/mastmq/mast/issues/8) | sessions do not survive a restart. `store.PutSession`, `Enqueue` and `Drain` are **written but not wired to the bridge** |
+| ~~[#8](https://github.com/mastmq/mast/issues/8)~~ | **fixed.** Sessions persist to KV and follow a device between nodes; QoS 1/2 for an absent client queues and replays |
 | ~~[#9](https://github.com/mastmq/mast/issues/9)~~ | **fixed**, by moving to `mastmq/mochi` v2.7.10 |
 | [#11](https://github.com/mastmq/mast/issues/11) | cross-node QoS 1/2 are best-effort |
 | ~~[#13](https://github.com/mastmq/mast/issues/13)~~ | **fixed.** Cross-node takeover, via the `mast.session.*` control plane |

@@ -213,3 +213,41 @@ func TestClusterTakeoverIsScopedToTenant(t *testing.T) {
 		t.Fatal("the other tenant's client is not connected")
 	}
 }
+
+// TestClusterSessionMovesBetweenNodes is the regression test for #8.
+//
+// A persistent session used to live only in the memory of the node that
+// accepted it. A device reconnecting to a different edge arrived as a
+// stranger: its subscriptions were gone, and so was anything published
+// while it was away.
+func TestClusterSessionMovesBetweenNodes(t *testing.T) {
+	c := startCluster(t)
+
+	// clean_session=false, so the session is meant to outlive the
+	// connection.
+	first := persistent(t, c.addrs[0], "wanderer", "acme")
+	first.subscribeQoS(t, "fleet/wanderer/cmd", 1)
+
+	// Let the subscription reach the bucket and the core.
+	if !waitForLeaf(func() bool { return true }) {
+		t.Fatal("unreachable")
+	}
+
+	first.client.Disconnect(100)
+
+	// Somebody publishes while it is away. QoS 1, because that is what
+	// MQTT promises to keep for an absent session.
+	pub := connect(t, c.addrs[1], "dispatcher", "acme")
+
+	tok := pub.client.Publish("fleet/wanderer/cmd", 1, false, "go-north")
+	if !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
+		t.Fatalf("publishing while the session was away: %v", tok.Error())
+	}
+
+	// It comes back on the other edge.
+	second := persistent(t, c.addrs[1], "wanderer", "acme")
+
+	if !waitForLeaf(func() bool { return len(second.messages()) > 0 }) {
+		t.Errorf("the session did not follow the device to the other node; got %v", second.messages())
+	}
+}

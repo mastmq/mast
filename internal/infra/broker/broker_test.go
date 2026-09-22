@@ -107,6 +107,40 @@ func connectWithPassword(t *testing.T, addr, clientID, password string) *collect
 	return dial(t, addr, clientID, "user", password)
 }
 
+// persistent connects with clean_session=false, so the broker is expected
+// to keep the session when the connection goes away. The default collector
+// uses a clean session, which is the opposite promise.
+func persistent(t *testing.T, addr, clientID, username string) *collector {
+	t.Helper()
+
+	c := &collector{client: nil, mu: sync.Mutex{}, got: nil}
+
+	opts := paho.NewClientOptions().
+		AddBroker("tcp://" + addr).
+		SetClientID(clientID).
+		SetUsername(username).
+		SetCleanSession(false).
+		SetConnectTimeout(5 * time.Second).
+		SetAutoReconnect(false).
+		SetDefaultPublishHandler(func(_ paho.Client, m paho.Message) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+
+			c.got = append(c.got, m.Topic()+"="+string(m.Payload()))
+		})
+
+	c.client = paho.NewClient(opts)
+
+	tok := c.client.Connect()
+	if !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
+		t.Fatalf("connecting %s: %v", clientID, tok.Error())
+	}
+
+	t.Cleanup(func() { c.client.Disconnect(250) })
+
+	return c
+}
+
 func dial(t *testing.T, addr, clientID, username, password string) *collector {
 	t.Helper()
 
@@ -135,7 +169,17 @@ func dial(t *testing.T, addr, clientID, username, password string) *collector {
 func (c *collector) subscribe(t *testing.T, filter string) {
 	t.Helper()
 
-	tok := c.client.Subscribe(filter, 0, func(_ paho.Client, m paho.Message) {
+	c.subscribeQoS(t, filter, 0)
+}
+
+// subscribeQoS matters for anything about offline sessions: a broker only
+// keeps messages for an absent client at the QoS the *subscription* asked
+// for, so a QoS 0 subscription is never queued however the publisher sent
+// it.
+func (c *collector) subscribeQoS(t *testing.T, filter string, qos byte) {
+	t.Helper()
+
+	tok := c.client.Subscribe(filter, qos, func(_ paho.Client, m paho.Message) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 

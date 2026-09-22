@@ -178,6 +178,8 @@ func (h *Hook) Provides(b byte) bool {
 		mqtt.OnClientExpired,
 		mqtt.OnWill,
 		mqtt.OnPacketEncode,
+		mqtt.OnQosPublish,
+		mqtt.OnSessionEstablished,
 	}, b)
 }
 
@@ -225,7 +227,42 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	// down. mochi has already displaced any local copy by this point.
 	h.claimSession(identity.Tenant, bare, cl.ID)
 
+	// A clean start means the durable state goes now; a resumed session is
+	// put back in OnSessionEstablished, once mochi has actually added the
+	// client and delivery has somewhere to land.
+	if pk.Connect.Clean {
+		h.dropSession(identity.Tenant, bare)
+	}
+
 	return true
+}
+
+// OnSessionEstablished restores a session that belongs to another node.
+//
+// It runs after mochi has added the client and sent the CONNACK, which is
+// the earliest point a message can actually be delivered: restoring in
+// OnConnectAuthenticate registered the subscriptions correctly and then
+// published the backlog into a topic index whose subscriber was not yet in
+// the client map, so every queued message was dropped on the floor.
+//
+// A session mochi inherited locally is left alone. It already carries
+// subscriptions, and its inflight state is richer than anything the bucket
+// holds.
+func (h *Hook) OnSessionEstablished(cl *mqtt.Client, pk packets.Packet) {
+	if pk.Connect.Clean {
+		return
+	}
+
+	id, ok := h.tenantOf(cl)
+	if !ok {
+		return
+	}
+
+	if len(cl.State.Subscriptions.GetAll()) > 0 {
+		return
+	}
+
+	h.restoreSession(cl, id, unmountClient(id, cl.ID))
 }
 
 // OnPacketRead mounts every inbound topic and filter under the client's
@@ -357,6 +394,7 @@ func (h *Hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []by
 		h.log.Error("acquiring nats subscriptions", "client", cl.ID, "error", err)
 	}
 
+	h.persistSession(cl, id, unmountClient(id, cl.ID))
 	h.deliverRetained(cl, id, pk, reasonCodes)
 }
 
@@ -373,6 +411,7 @@ func (h *Hook) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet) {
 	}
 
 	h.subs.release(cl.ID, keys)
+	h.persistSession(cl, id, unmountClient(id, cl.ID))
 }
 
 // OnDisconnect releases what the client held, unless its session outlives
@@ -395,6 +434,10 @@ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 		h.log.Debug("client away, session retained", "client", cl.ID)
 
 		return
+	}
+
+	if id, ok := h.tenantOf(cl); ok {
+		h.dropSession(id, unmountClient(id, cl.ID))
 	}
 
 	h.forget(cl.ID)
@@ -458,6 +501,11 @@ const droppedTopic = "$mast/dropped"
 // run out of time.
 func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	h.log.Debug("session expired", "client", cl.ID)
+
+	if id, ok := h.tenantOf(cl); ok {
+		h.dropSession(id, unmountClient(id, cl.ID))
+	}
+
 	h.forget(cl.ID)
 }
 
