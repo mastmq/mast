@@ -14,7 +14,7 @@
   &nbsp;·&nbsp; <a href="https://github.com/mastmq/bench">Benchmarks</a>
 </p>
 
-> **Status: early, but it runs.** A single `mast` process starts an embedded nats-server, terminates MQTT, and moves messages end to end with tenant isolation, wildcards, and shared subscriptions. QoS 0 through 2, retained messages, wills and persistent sessions all work. Two limits are worth knowing before you read further: sessions live in memory and do not survive a restart ([#8](https://github.com/mastmq/mast/issues/8)), and the hop between nodes is core NATS, so cross-node QoS 1 and 2 are best-effort ([delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md)). See [what works](#what-works).
+> **Status: early, but it runs.** A single `mast` process starts an embedded nats-server, terminates MQTT, and moves messages end to end with tenant isolation, wildcards, and shared subscriptions. QoS 0 through 2, retained messages, wills and persistent sessions all work, and a session now follows a device between nodes rather than living in one node's memory. The limit worth knowing before you read further: the hop between nodes is core NATS, so cross-node QoS 1 and 2 are best-effort ([delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md)). See [what works](#what-works).
 
 ## What works
 
@@ -29,8 +29,10 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 - **Cross-node delivery** — edges join the core as leaf nodes, and a message published on one edge reaches a subscriber on another, with tenant isolation holding across the boundary. The fabric hop is core NATS and therefore at-most-once, so a publisher is acknowledged before the message has crossed it: cross-node QoS 1 and 2 are best-effort, and [delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md) sets out exactly what each QoS promises and where
 
 - **HTTP authentication and authorization** — post the MQTT fields to your own service and let it name the tenant and rule on each topic
+- **Portable sessions** — subscriptions and the offline queue live in the shared key-value buckets, so a device that reconnects to a different node finds its session and whatever QoS 1 or 2 traffic it missed. Verified by a two-node test, not by hand
+- **Cross-node takeover** — a second connection with an existing client id disconnects the first wherever in the cluster it is, which MQTT requires and a single node cannot do alone. Client ids are scoped to their tenant, so one tenant cannot displace another's device by reusing an id
 
-Not yet: offline queues for disconnected clients, sessions that survive a restart or move between nodes ([#8](https://github.com/mastmq/mast/issues/8)), per-tenant quotas, and connection rate limiting. The store already has `PutSession`, `Enqueue` and `Drain`; they are written and not yet wired to the bridge.
+Not yet: per-tenant quotas, connection rate limiting, and end-to-end QoS across nodes ([#11](https://github.com/mastmq/mast/issues/11)).
 
 ## Why
 
