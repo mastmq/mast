@@ -343,6 +343,15 @@ func policyServer(t *testing.T) *httptest.Server {
 		var reply map[string]any
 
 		if _, isAuthz := req["action"]; isAuthz {
+			// The policy service must be told the client id the device
+			// actually sent. Client ids are mounted under their tenant
+			// inside the broker so one tenant cannot displace another's
+			// session, and that prefix must not leak out here: a rule
+			// written against "http-sub" would silently stop matching.
+			if id, _ := req["client_id"].(string); strings.Contains(id, "/") {
+				t.Errorf("authorization asked about a mounted client id %q; the policy service only knows the bare one", id)
+			}
+
 			// Nobody may touch the forbidden subtree.
 			topic, _ := req["topic"].(string)
 			reply = map[string]any{"allow": !strings.HasPrefix(topic, "forbidden/")}

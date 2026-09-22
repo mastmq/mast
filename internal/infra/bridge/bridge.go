@@ -176,6 +176,7 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	// A connection on the internal listener is trusted by virtue of having
 	// reached it. Nothing is asked of it and nothing is asked about it later.
 	if h.isInternal(cl) {
+		cl.ID = mountClient(h.internalTenant, cl.ID)
 		h.onConnected(cl, tenant.Identity{Tenant: h.internalTenant, Superuser: true})
 
 		return true
@@ -195,6 +196,11 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 
 		return false
 	}
+
+	// Scope the id to its tenant before anything keys on it. mochi is about
+	// to look up an existing session and add this client to a map, both by
+	// id, and mast's own tenant and subscription maps follow suit.
+	cl.ID = mountClient(identity.Tenant, cl.ID)
 
 	h.log.Debug("client authenticated",
 		"client", cl.ID, "tenant", string(identity.Tenant), "superuser", identity.Superuser)
@@ -255,8 +261,10 @@ func (h *Hook) OnACLCheck(cl *mqtt.Client, mountedTopic string, write bool) bool
 	id := identity.Tenant
 
 	return h.policy.Allows(context.Background(), tenant.Access{
-		Tenant:     id,
-		ClientID:   cl.ID,
+		Tenant: id,
+		// Unmounted: a policy service is told the id the client sent, which
+		// is also the only one it could have written a rule about.
+		ClientID:   unmountClient(id, cl.ID),
 		Username:   string(cl.Properties.Username),
 		RemoteAddr: cl.Net.Remote,
 		Topic:      bare(id, mountedTopic),
@@ -581,6 +589,34 @@ func mount(id tenant.ID, mqttTopic string) string {
 // unmount removes the tenant prefix that [mount] added.
 func unmount(id tenant.ID, mounted string) string {
 	return strings.TrimPrefix(mounted, string(id)+"/")
+}
+
+// mountClient scopes a client id to its tenant.
+//
+// MQTT requires that a second connection with an existing client id
+// disconnects the first, and mochi implements that by keying its client map
+// on the id alone. Without a tenant prefix that rule reaches across the
+// isolation boundary: any authenticated tenant could disconnect another
+// tenant's device by guessing or reusing its client id, and keep it
+// disconnected. The prefix makes "already connected" a question asked
+// within a tenant, which is the only place it means anything.
+//
+// It is deliberately the same shape as [mount]. A client id and a topic are
+// different things, but they are namespaced for the same reason and a
+// reader should recognise the pattern.
+//
+// The prefix never reaches the client. mochi captures the assigned client
+// identifier for a v5 client that sent an empty id before this hook runs,
+// so the CONNACK still carries the unprefixed form.
+func mountClient(id tenant.ID, clientID string) string {
+	return mount(id, clientID)
+}
+
+// unmountClient removes the prefix that [mountClient] added, for the two
+// places a client id leaves mast: an authorization request and a log line
+// meant for a human.
+func unmountClient(id tenant.ID, mounted string) string {
+	return unmount(id, mounted)
 }
 
 // queueName scopes a shared-subscription group to its tenant, so two tenants
