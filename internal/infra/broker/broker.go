@@ -82,7 +82,7 @@ func Start(
 	openCtx, cancel := context.WithTimeout(ctx, storeOpenTimeout)
 	defer cancel()
 
-	b.store, err = store.Open(openCtx, nats.Conn(), cfg.Core.Replicas, cfg.Session.Expiry)
+	b.store, err = openStore(openCtx, cfg, nats)
 	if err != nil {
 		nats.Shutdown()
 
@@ -121,6 +121,24 @@ func Start(
 	}
 
 	return b, nil
+}
+
+// openStore opens the shared buckets, waiting first for the link that makes
+// them reachable.
+//
+// An edge carries no JetStream and reaches the core's over its leaf
+// connection, which is established asynchronously after the server comes
+// up. A bucket opened before then is answered by this node's own
+// JetStream-less server rather than by the core, so the wait is not a
+// courtesy: without it an edge that starts before the core dies outright.
+func openStore(ctx context.Context, cfg config.Config, nats *natsd.Server) (*store.Store, error) {
+	if cfg.Role == config.RoleEdge {
+		if err := nats.WaitForLeaf(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	return store.Open(ctx, nats.Conn(), natsd.JetStreamDomain, cfg.Core.Replicas, cfg.Session.Expiry)
 }
 
 // sources wires the live values the metrics read at scrape time.

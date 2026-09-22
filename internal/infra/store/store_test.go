@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mastmq/mast/internal/infra/natsd"
 	"github.com/mastmq/mast/internal/infra/store"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -19,9 +20,12 @@ func open(t *testing.T) *store.Store {
 		ServerName: "store-test",
 		DontListen: true,
 		JetStream:  true,
-		StoreDir:   t.TempDir(),
-		NoSigs:     true,
-		NoLog:      true,
+		// Matches what natsd configures, so the test addresses the domain
+		// the same way production does.
+		JetStreamDomain: natsd.JetStreamDomain,
+		StoreDir:        t.TempDir(),
+		NoSigs:          true,
+		NoLog:           true,
 	}
 
 	ns, err := natsserver.NewServer(opts)
@@ -44,7 +48,7 @@ func open(t *testing.T) *store.Store {
 
 	t.Cleanup(nc.Close)
 
-	s, err := store.Open(context.Background(), nc, 1, time.Hour)
+	s, err := store.Open(context.Background(), nc, natsd.JetStreamDomain, 1, time.Hour)
 	if err != nil {
 		t.Fatalf("opening store: %v", err)
 	}

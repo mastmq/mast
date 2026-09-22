@@ -81,8 +81,13 @@ type Store struct {
 //
 // replicas is the replication factor for each bucket; it must not exceed the
 // number of JetStream peers or bucket creation fails.
-func Open(ctx context.Context, nc *nats.Conn, replicas int, ttl time.Duration) (*Store, error) {
-	js, err := jetstream.New(nc)
+func Open(ctx context.Context, nc *nats.Conn, domain string, replicas int, ttl time.Duration) (*Store, error) {
+	// Addressed by domain rather than through the default $JS.API prefix.
+	// An edge node runs its own JetStream-less server, which answers that
+	// prefix itself with "jetstream not enabled" instead of forwarding it,
+	// so an edge could never open a bucket at all. $JS.<domain>.API is an
+	// ordinary subject and crosses the leaf connection to the core.
+	js, err := jetstream.NewWithDomain(nc, domain)
 	if err != nil {
 		return nil, fmt.Errorf("store: jetstream: %w", err)
 	}

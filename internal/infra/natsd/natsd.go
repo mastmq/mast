@@ -9,6 +9,7 @@
 package natsd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -123,6 +124,31 @@ func Start(cfg config.Config, log *slog.Logger) (*Server, error) {
 	return s, nil
 }
 
+// WaitForLeaf blocks until this node has an upstream leaf connection, or ctx
+// is done.
+//
+// An edge carries no JetStream of its own and reaches the core's over that
+// link, so anything touching the store before it exists gets "jetstream not
+// enabled" from its own server rather than an answer from the core. Opening
+// the store is fatal by design, so without this an edge that starts before
+// the core is reachable does not degrade — it dies, and in Kubernetes it
+// crashloops until the core happens to win the race.
+func (s *Server) WaitForLeaf(ctx context.Context) error {
+	const poll = 50 * time.Millisecond
+
+	for {
+		if s.ns.NumLeafNodes() > 0 {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("natsd: waiting for leaf connection to the core: %w", ctx.Err())
+		case <-time.After(poll):
+		}
+	}
+}
+
 // Shutdown drains the client connection and stops the server.
 func (s *Server) Shutdown() {
 	s.closing.Store(true)
@@ -153,6 +179,7 @@ func options(cfg config.Config) (*server.Options, error) {
 
 	if opts.JetStream {
 		opts.StoreDir = cfg.Core.StoreDir
+		opts.JetStreamDomain = JetStreamDomain
 	}
 
 	if err := applyClientListener(opts, cfg.NATS.ClientAddr); err != nil {
@@ -266,6 +293,20 @@ func applyEdge(opts *server.Options, cfg config.Config) error {
 // clusterName is fixed: every mast node belongs to the same logical cluster,
 // and tenancy is expressed in subjects and accounts rather than in topology.
 const clusterName = "mast"
+
+// JetStreamDomain names the storage tier so an edge can address it.
+//
+// Without a domain an edge is stuck. Its own embedded server runs with
+// JetStream disabled, and a request to the default $JS.API prefix is
+// answered by that local server with "jetstream not enabled" rather than
+// being forwarded over the leaf connection. Naming the domain gives the
+// core's JetStream an address of its own, $JS.mast.API, which the leaf link
+// carries like any other subject.
+//
+// It is a constant for the same reason clusterName is: both sides have to
+// agree on it, and a knob whose only correct value is the one the other side
+// also chose is not a knob.
+const JetStreamDomain = "mast"
 
 func serverName(cfg config.Config) string {
 	if cfg.NATS.Name != "" {
