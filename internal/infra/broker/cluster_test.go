@@ -1,7 +1,12 @@
 package broker_test
 
 import (
+	"io"
 	"log/slog"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +28,10 @@ type cluster struct {
 	edges []*broker.Broker
 	// addrs are the MQTT listeners, one per edge, in the same order.
 	addrs []string
+	// obs are the metrics endpoints, in the same order. Tests read them
+	// rather than sleeping: the broker already publishes exactly the
+	// counters that say whether the thing under test has happened yet.
+	obs []string
 }
 
 // startCluster brings up one core and two edge nodes in this process.
@@ -47,7 +56,7 @@ func startCluster(t *testing.T) *cluster {
 	coreCfg.Role = config.RoleCore
 	coreCfg.NATS.Name = "core"
 	coreCfg.NATS.MonitorAddr = ""
-	coreCfg.Obs.Addr = ""
+	coreCfg.Obs.Addr = anyPort
 	coreCfg.Core.StoreDir = t.TempDir()
 	coreCfg.Core.LeafAddr = leafAddr
 	coreCfg.MQTT.Addr = "" // a core terminates no MQTT
@@ -57,7 +66,7 @@ func startCluster(t *testing.T) *cluster {
 		t.Fatalf("starting core: %v", err)
 	}
 
-	c := &cluster{core: core, edges: nil, addrs: nil}
+	c := &cluster{core: core, edges: nil, addrs: nil, obs: nil}
 
 	// The edges come down before the core does: an edge whose core has
 	// already gone is an edge logging a lost leaf connection through a test
@@ -80,8 +89,8 @@ func startCluster(t *testing.T) *cluster {
 		cfg.Role = config.RoleEdge
 		cfg.NATS.Name = "edge-" + string(rune('a'+i))
 		cfg.NATS.MonitorAddr = ""
-		// Every edge would otherwise bind the same default metrics port.
-		cfg.Obs.Addr = ""
+		// The kernel picks; the bound address is read back below.
+		cfg.Obs.Addr = anyPort
 		cfg.MQTT.Addr = freeAddr(t)
 		cfg.Edge.CoreURLs = []string{"nats-leaf://" + leafAddr}
 
@@ -92,6 +101,7 @@ func startCluster(t *testing.T) *cluster {
 
 		c.edges = append(c.edges, edge)
 		c.addrs = append(c.addrs, cfg.MQTT.Addr)
+		c.obs = append(c.obs, edge.ObsAddr())
 	}
 
 	return c
@@ -109,6 +119,101 @@ func waitForLeaf(cond func() bool) bool {
 	}
 
 	return cond()
+}
+
+// awaitInterest blocks until a message published on the far edge actually
+// reaches sub.
+//
+// This is the only reliable proof that interest has propagated across the
+// leaf connection. The obvious alternative — waitForLeaf on a constant —
+// returns on its first check and proves nothing, which is what these tests
+// did until one of them failed under the load of a full -race run while
+// passing five times in a row on its own.
+func (c *cluster) awaitInterest(t *testing.T, sub *collector, tenantName string) {
+	t.Helper()
+
+	const probe = "mast-test/interest"
+
+	sub.subscribeQoS(t, probe, 0)
+
+	pub := connect(t, c.addrs[1], "interest-probe-"+tenantName, tenantName)
+
+	reached := waitForLeaf(func() bool {
+		pub.publish(t, probe, "ping")
+
+		for _, m := range sub.messages() {
+			if strings.HasPrefix(m, probe+"=") {
+				return true
+			}
+		}
+
+		return false
+	})
+	if !reached {
+		t.Fatal("interest never propagated between the edges")
+	}
+
+	pub.client.Disconnect(100)
+}
+
+// awaitMetric blocks until a counter or gauge on one edge reaches want.
+//
+// This replaces waiting on wall-clock time for something that happens on
+// another node. A publisher's PUBACK comes from its own ingress node and
+// says nothing about whether the node that owns the absent session has
+// finished queueing, so a test that reconnects straight after publishing
+// is racing a write it cannot see. The broker already counts it.
+func awaitMetric(t *testing.T, obsAddr, sample string, want float64) bool {
+	t.Helper()
+
+	deadline := time.Now().Add(leafSettle)
+	for time.Now().Before(deadline) {
+		if readMetric(t, obsAddr, sample) >= want {
+			return true
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	return readMetric(t, obsAddr, sample) >= want
+}
+
+// readMetric returns one sample's value, or zero when it is absent — a
+// counter that has never been incremented is not exported at all.
+func readMetric(t *testing.T, obsAddr, sample string) float64 {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+obsAddr+"/metrics", nil)
+	if err != nil {
+		return 0
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0
+	}
+
+	for line := range strings.SplitSeq(string(body), "\n") {
+		rest, found := strings.CutPrefix(line, sample)
+		if !found {
+			continue
+		}
+
+		value, err := strconv.ParseFloat(strings.TrimSpace(rest), 64)
+		if err != nil {
+			continue
+		}
+
+		return value
+	}
+
+	return 0
 }
 
 // TestClusterCrossNodeDelivery is the property the README claimed and no
@@ -174,11 +279,9 @@ func TestClusterTakeoverAcrossNodes(t *testing.T) {
 	first := connect(t, c.addrs[0], "rover", "acme")
 	first.subscribe(t, "fleet/rover")
 
-	// Give the claim time to reach the core before the second edge makes
-	// its own, or the notice races the subscription that must hear it.
-	if !waitForLeaf(func() bool { return true }) {
-		t.Fatal("unreachable")
-	}
+	// The claim has to reach the core before the second edge publishes its
+	// own, or the notice arrives before the subscription that must hear it.
+	c.awaitInterest(t, first, "acme")
 
 	second := connect(t, c.addrs[1], "rover", "acme")
 
@@ -228,10 +331,9 @@ func TestClusterSessionMovesBetweenNodes(t *testing.T) {
 	first := persistent(t, c.addrs[0], "wanderer", "acme")
 	first.subscribeQoS(t, "fleet/wanderer/cmd", 1)
 
-	// Let the subscription reach the bucket and the core.
-	if !waitForLeaf(func() bool { return true }) {
-		t.Fatal("unreachable")
-	}
+	// The subscription has to have reached the core before the device goes
+	// away, or the publish below finds no interest and nothing is queued.
+	c.awaitInterest(t, first, "acme")
 
 	first.client.Disconnect(100)
 
@@ -244,10 +346,21 @@ func TestClusterSessionMovesBetweenNodes(t *testing.T) {
 		t.Fatalf("publishing while the session was away: %v", tok.Error())
 	}
 
+	// Wait for the node that owns the session to say it has stored the
+	// message. Reconnecting before that races a write on another node.
+	if !awaitMetric(t, c.obs[0], `mast_offline_queued_total{tenant="acme"} `, 1) {
+		t.Fatal("nothing was queued for the absent session")
+	}
+
 	// It comes back on the other edge.
 	second := persistent(t, c.addrs[1], "wanderer", "acme")
 
-	if !waitForLeaf(func() bool { return len(second.messages()) > 0 }) {
+	// By content, not by count: a probe message from awaitInterest would
+	// satisfy a length check without proving anything about the backlog.
+	delivered := waitForLeaf(func() bool {
+		return slices.Contains(second.messages(), "fleet/wanderer/cmd=go-north")
+	})
+	if !delivered {
 		t.Errorf("the session did not follow the device to the other node; got %v", second.messages())
 	}
 }

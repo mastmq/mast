@@ -37,6 +37,11 @@ type Broker struct {
 	log    *slog.Logger
 }
 
+// ObsAddr reports where metrics, health and pprof are actually served,
+// which is the only way to learn it when the configured address asked for
+// port zero.
+func (b *Broker) ObsAddr() string { return b.obs.Addr() }
+
 // Store exposes the durable state, for tests and for administrative tools.
 func (b *Broker) Store() *store.Store { return b.store }
 
@@ -91,11 +96,7 @@ func Start(
 
 	// The subscription gauge reads through the hook, so the registry is
 	// built before it and handed the accessor.
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(collectors.NewGoCollector())
-	//nolint:exhaustruct_v5 // the collector's defaults are what we want
-	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-
+	registry := newRegistry()
 	metrics := obs.NewMetrics(registry, sources(b, nats))
 
 	b.hook = bridge.New(nats.Conn(), b.store, resolver, policy, bridge.Options{
@@ -108,7 +109,12 @@ func Start(
 		NodeID: nats.ID(),
 	}, log)
 
-	b.obs = obs.Serve(cfg.Obs.Addr, registry, log)
+	b.obs, err = obs.Serve(ctx, cfg.Obs.Addr, registry, log)
+	if err != nil {
+		nats.Shutdown()
+
+		return nil, err
+	}
 
 	b.server, err = mqttd.New(cfg, b.hook, log)
 	if err != nil {
@@ -143,6 +149,17 @@ func openStore(ctx context.Context, cfg config.Config, nats *natsd.Server) (*sto
 	}
 
 	return store.Open(ctx, nats.Conn(), natsd.JetStreamDomain, cfg.Core.Replicas, cfg.Session.Expiry)
+}
+
+// newRegistry is a Prometheus registry with the runtime collectors that
+// every mast process should publish whatever else it is doing.
+func newRegistry() *prometheus.Registry {
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collectors.NewGoCollector())
+	//nolint:exhaustruct_v5 // the collector's defaults are what we want
+	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+
+	return registry
 }
 
 // sources wires the live values the metrics read at scrape time.

@@ -7,6 +7,7 @@ import (
 
 	"github.com/mastmq/mast/internal/domain/tenant"
 	"github.com/mastmq/mast/internal/domain/topic"
+	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mastmq/mochi/v2"
 	"github.com/mastmq/mochi/v2/packets"
@@ -153,6 +154,9 @@ func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string) 
 	}
 
 	if len(queued) > 0 {
+		h.count(func(m *obs.Metrics) {
+			m.OfflineDelivered.WithLabelValues(string(id)).Add(float64(len(queued)))
+		})
 		h.log.Info("offline queue delivered",
 			"client", bareClientID, "tenant", string(id), "messages", len(queued))
 	}
@@ -198,5 +202,6 @@ func (h *Hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) 
 		return
 	}
 
+	h.count(func(m *obs.Metrics) { m.OfflineQueued.WithLabelValues(string(id)).Inc() })
 	h.log.Debug("queued for an absent client", "client", cl.ID, "topic", msg.Topic)
 }

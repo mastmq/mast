@@ -25,6 +25,13 @@ import (
 
 const settle = 2 * time.Second
 
+// anyPort lets the kernel choose. Reserving a port and then releasing it so
+// the broker can bind it leaves a window another test can win, which is
+// exactly what happened once obs.Serve started reporting a failed bind
+// instead of swallowing it: every test had been quietly running without a
+// metrics endpoint.
+const anyPort = "127.0.0.1:0"
+
 // byUsername resolves each connection to the tenant named in its username,
 // which is enough to exercise isolation without an identity system.
 type byUsername struct{}
@@ -45,6 +52,7 @@ func start(t *testing.T, resolver tenant.Resolver) string {
 	cfg := config.Default()
 	cfg.MQTT.Addr = freeAddr(t)
 	cfg.NATS.MonitorAddr = ""
+	cfg.Obs.Addr = anyPort
 	cfg.Core.StoreDir = t.TempDir()
 
 	log := slog.New(slog.DiscardHandler)
@@ -345,6 +353,7 @@ func TestSubscriptionsAreDeduplicated(t *testing.T) {
 	cfg := config.Default()
 	cfg.MQTT.Addr = freeAddr(t)
 	cfg.NATS.MonitorAddr = ""
+	cfg.Obs.Addr = anyPort
 	cfg.Core.StoreDir = t.TempDir()
 
 	log := slog.New(slog.DiscardHandler)
@@ -423,6 +432,7 @@ func TestHTTPAuthEndToEnd(t *testing.T) {
 	cfg := config.Default()
 	cfg.MQTT.Addr = freeAddr(t)
 	cfg.NATS.MonitorAddr = ""
+	cfg.Obs.Addr = anyPort
 	cfg.Core.StoreDir = t.TempDir()
 	cfg.Auth.Mode = config.AuthHTTP
 	cfg.Auth.HTTP.AuthnURL = policy.URL
@@ -510,8 +520,9 @@ func TestMetricsEndpoint(t *testing.T) {
 	cfg := config.Default()
 	cfg.MQTT.Addr = freeAddr(t)
 	cfg.NATS.MonitorAddr = ""
+	cfg.Obs.Addr = anyPort
 	cfg.Core.StoreDir = t.TempDir()
-	cfg.Obs.Addr = freeAddr(t)
+	cfg.Obs.Addr = anyPort
 
 	log := slog.New(slog.DiscardHandler)
 
@@ -531,7 +542,7 @@ func TestMetricsEndpoint(t *testing.T) {
 		t.Fatal("message not delivered, so there is nothing to count")
 	}
 
-	body := scrape(t, "http://"+cfg.Obs.Addr+"/metrics")
+	body := scrape(t, "http://"+node.ObsAddr()+"/metrics")
 
 	for _, want := range []string{
 		`mast_connections_total{tenant="acme"}`,
@@ -546,13 +557,13 @@ func TestMetricsEndpoint(t *testing.T) {
 		}
 	}
 
-	if health := scrape(t, "http://"+cfg.Obs.Addr+"/healthz"); !strings.Contains(health, "ok") {
+	if health := scrape(t, "http://"+node.ObsAddr()+"/healthz"); !strings.Contains(health, "ok") {
 		t.Errorf("/healthz returned %q", health)
 	}
 
 	// pprof earns its place the first time a broker leaks goroutines under
 	// load and cannot be redeployed with a debug build.
-	if idx := scrape(t, "http://"+cfg.Obs.Addr+"/debug/pprof/"); !strings.Contains(idx, "goroutine") {
+	if idx := scrape(t, "http://"+node.ObsAddr()+"/debug/pprof/"); !strings.Contains(idx, "goroutine") {
 		t.Error("/debug/pprof is not served")
 	}
 }
@@ -614,6 +625,7 @@ func TestJWTAuthEndToEnd(t *testing.T) {
 	cfg := config.Default()
 	cfg.MQTT.Addr = freeAddr(t)
 	cfg.NATS.MonitorAddr = ""
+	cfg.Obs.Addr = anyPort
 	cfg.Core.StoreDir = t.TempDir()
 	cfg.Tenant.Default = "fallback"
 	cfg.Auth.Mode = config.AuthJWT
@@ -748,8 +760,9 @@ func TestConnectionMetrics(t *testing.T) {
 	cfg.MQTT.Addr = freeAddr(t)
 	cfg.MQTT.InternalAddr = freeAddr(t)
 	cfg.NATS.MonitorAddr = ""
+	cfg.Obs.Addr = anyPort
 	cfg.Core.StoreDir = t.TempDir()
-	cfg.Obs.Addr = freeAddr(t)
+	cfg.Obs.Addr = anyPort
 	// The internal listener bypasses the resolver and places its clients in
 	// tenant.default, so the two have to agree for both listeners to land in
 	// one tenant. A deployment where they disagree has two tenants without
@@ -768,7 +781,7 @@ func TestConnectionMetrics(t *testing.T) {
 	open := func() int {
 		t.Helper()
 
-		for line := range strings.SplitSeq(scrape(t, "http://"+cfg.Obs.Addr+"/metrics"), "\n") {
+		for line := range strings.SplitSeq(scrape(t, "http://"+node.ObsAddr()+"/metrics"), "\n") {
 			if after, ok := strings.CutPrefix(line, `mast_connections_open{tenant="acme"} `); ok {
 				var n int
 				if _, err := fmt.Sscanf(after, "%d", &n); err == nil {

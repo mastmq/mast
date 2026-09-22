@@ -11,7 +11,9 @@ package obs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"time"
@@ -34,6 +36,9 @@ const (
 type Server struct {
 	http *http.Server
 	log  *slog.Logger
+	// addr is what the listener actually bound, which differs from the
+	// configured address whenever that asked for port zero.
+	addr string
 }
 
 // Metrics are the broker's own counters and gauges.
@@ -48,6 +53,8 @@ type Metrics struct {
 	MessagesIn       *prometheus.CounterVec
 	MessagesOut      *prometheus.CounterVec
 	RetainedReplayed *prometheus.CounterVec
+	OfflineQueued    *prometheus.CounterVec
+	OfflineDelivered *prometheus.CounterVec
 	NATSSubs         prometheus.GaugeFunc
 }
 
@@ -103,6 +110,11 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 		MessagesIn:       factory("messages_in_total", "Messages accepted from clients.", "tenant"),
 		MessagesOut:      factory("messages_out_total", "Messages injected towards subscribers.", "tenant"),
 		RetainedReplayed: factory("retained_replayed_total", "Retained messages replayed on subscribe.", "tenant"),
+		// How much is being held for clients that are not here. A number
+		// that climbs and never falls is devices that never came back,
+		// which is a fleet problem long before it is a storage one.
+		OfflineQueued:    factory("offline_queued_total", "Messages stored for a client that was absent.", "tenant"),
+		OfflineDelivered: factory("offline_delivered_total", "Messages replayed to a client that came back.", "tenant"),
 		NATSSubs:         nil,
 	}
 
@@ -160,9 +172,15 @@ func registerNATSCounts(reg prometheus.Registerer, read func() NATSCounts) {
 }
 
 // Serve starts the observability server. A blank address disables it.
-func Serve(addr string, reg *prometheus.Registry, log *slog.Logger) *Server {
+//
+// The listener is opened before returning, and a failure to open it is an
+// error rather than a log line. Binding in the background meant a port
+// conflict left the process running and reporting ready with nothing on
+// /metrics — the same silence this package was written to end, arriving by
+// a different route.
+func Serve(ctx context.Context, addr string, reg *prometheus.Registry, log *slog.Logger) (*Server, error) {
 	if addr == "" {
-		return nil
+		return nil, nil //nolint:nilnil // no address means no server, which is not a failure
 	}
 
 	mux := http.NewServeMux()
@@ -188,18 +206,28 @@ func Serve(addr string, reg *prometheus.Registry, log *slog.Logger) *Server {
 			Handler:           mux,
 			ReadHeaderTimeout: readHeaderTimeout,
 		},
-		log: log.With("component", "obs"),
+		log:  log.With("component", "obs"),
+		addr: addr,
 	}
 
+	var lc net.ListenConfig
+
+	listener, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("obs: listening on %s: %w", addr, err)
+	}
+
+	srv.addr = listener.Addr().String()
+
 	go func() {
-		if err := srv.http.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.http.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			srv.log.Error("observability server stopped", "error", err)
 		}
 	}()
 
-	srv.log.Info("observability listening", "addr", addr, "paths", "/metrics /healthz /debug/pprof")
+	srv.log.Info("observability listening", "addr", srv.addr, "paths", "/metrics /healthz /debug/pprof")
 
-	return srv
+	return srv, nil
 }
 
 // Close stops the server.
@@ -216,11 +244,11 @@ func (s *Server) Close() {
 	}
 }
 
-// Addr reports the address being served, for tests.
+// Addr reports the address actually being served.
 func (s *Server) Addr() string {
 	if s == nil {
 		return ""
 	}
 
-	return s.http.Addr
+	return s.addr
 }
