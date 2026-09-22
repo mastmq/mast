@@ -140,6 +140,16 @@ The end-to-end tests in `internal/infra/broker` drive a real Paho client against
 
 Upstream has carried it as an open issue since December 2025 with four unmerged pull requests, so the fix lives in [`mastmq/mochi`](https://github.com/mastmq/mochi) instead — see the next section.
 
+### Tests bind port zero
+
+Every test asks for `127.0.0.1:0` and reads back what was bound, through `Broker.ObsAddr()`. Reserving a port with `freeAddr` and releasing it so the broker can take it always leaves a window another test can win — that is a narrowed race, not a fixed one, and it only became visible once `obs.Serve` started failing loudly on a bad bind instead of logging.
+
+### Never settle on a constant
+
+`waitForLeaf(func() bool { return true })` returns on its first check and waits for nothing. Two cluster tests used it as a "let interest propagate" step and passed for weeks on an empty machine, then failed under the load of a full `-race` run. Settle by proving the thing happened: `awaitInterest` round-trips a probe message, and `awaitMetric` reads the counter that says the work is done.
+
+That matters most across nodes. A publisher's PUBACK comes from its own ingress node and says nothing about whether the node owning an absent session has finished writing to the bucket, so a test that reconnects straight after publishing is racing a write it cannot observe.
+
 ## Linting
 
 golangci-lint v2, `default: all`. The disable list is deliberately short and **every entry needs a one-line why**. Suppress per-line with `//nolint:<linter> // <reason>` rather than disabling globally.
