@@ -51,8 +51,29 @@ type Metrics struct {
 	NATSSubs         prometheus.GaugeFunc
 }
 
+// NATSCounts is what the NATS client's asynchronous handlers have observed.
+//
+// It is declared here, and converted by whoever assembles the node, so that
+// obs and natsd do not have to know about each other.
+type NATSCounts struct {
+	AsyncErrors   uint64
+	SlowConsumers uint64
+	Disconnects   uint64
+	Reconnects    uint64
+}
+
+// Sources are values the metrics read when they are scraped, rather than
+// values something elsewhere has to remember to update. A nil field leaves
+// its metrics unregistered.
+type Sources struct {
+	// Subscriptions reports NATS subscriptions held by this node.
+	Subscriptions func() float64
+	// NATS reports the client connection's asynchronous tallies.
+	NATS func() NATSCounts
+}
+
 // NewMetrics registers mast's metrics on a registry.
-func NewMetrics(reg prometheus.Registerer, natsSubs func() float64) *Metrics {
+func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 	factory := func(name, help string, labels ...string) *prometheus.CounterVec {
 		c := prometheus.NewCounterVec(prometheus.CounterOpts{ //nolint:exhaustruct_v5 // defaults are right
 			Namespace: namespace,
@@ -85,16 +106,57 @@ func NewMetrics(reg prometheus.Registerer, natsSubs func() float64) *Metrics {
 		NATSSubs:         nil,
 	}
 
-	if natsSubs != nil {
+	if src.Subscriptions != nil {
 		m.NATSSubs = prometheus.NewGaugeFunc(prometheus.GaugeOpts{ //nolint:exhaustruct_v5 // defaults are right
 			Namespace: namespace,
 			Name:      "nats_subscriptions",
 			Help:      "NATS subscriptions held by this node. Should track distinct filters, not devices.",
-		}, natsSubs)
+		}, src.Subscriptions)
 		reg.MustRegister(m.NATSSubs)
 	}
 
+	registerNATSCounts(reg, src.NATS)
+
 	return m
+}
+
+// registerNATSCounts publishes the fabric's asynchronous tallies.
+//
+// They are counter functions rather than counters the code increments,
+// because the values already exist on the connection and a second copy is a
+// second thing to get wrong.
+//
+// mast_nats_slow_consumers_total is the one to alert on. Any value above
+// zero means this node discarded messages it had already accepted and
+// acknowledged, which no other metric here can show: messages_in_total
+// counts them as accepted and messages_out_total never counts them at all,
+// so the loss appears only as a gap between two numbers nobody is
+// subtracting.
+func registerNATSCounts(reg prometheus.Registerer, read func() NATSCounts) {
+	if read == nil {
+		return
+	}
+
+	counter := func(name, help string, field func(NATSCounts) uint64) {
+		reg.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{ //nolint:exhaustruct_v5 // defaults are right
+			Namespace: namespace,
+			Name:      name,
+			Help:      help,
+		}, func() float64 { return float64(field(read())) }))
+	}
+
+	counter("nats_slow_consumers_total",
+		"Times the NATS client dropped messages because a subscription's pending queue overflowed.",
+		func(c NATSCounts) uint64 { return c.SlowConsumers })
+	counter("nats_async_errors_total",
+		"Asynchronous errors on the NATS client connection, slow consumers included.",
+		func(c NATSCounts) uint64 { return c.AsyncErrors })
+	counter("nats_disconnects_total",
+		"Times this node lost its connection to the embedded NATS server.",
+		func(c NATSCounts) uint64 { return c.Disconnects })
+	counter("nats_reconnects_total",
+		"Times this node re-established that connection.",
+		func(c NATSCounts) uint64 { return c.Reconnects })
 }
 
 // Serve starts the observability server. A blank address disables it.

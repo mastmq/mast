@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/mastmq/mast/internal/infra/config"
@@ -35,6 +36,17 @@ type Server struct {
 	ns  *server.Server
 	nc  *nats.Conn
 	log *slog.Logger
+
+	// closing tells the asynchronous handlers that a disconnect is the
+	// shutdown they were asked for rather than an incident. Without it every
+	// clean stop logs an error about losing the fabric.
+	closing atomic.Bool
+
+	// What the asynchronous handlers have seen. Read through [Server.Counts].
+	asyncErrors   atomic.Uint64
+	slowConsumers atomic.Uint64
+	disconnects   atomic.Uint64
+	reconnects    atomic.Uint64
 }
 
 // Conn returns the in-process client connection. It is safe for concurrent
@@ -77,18 +89,44 @@ func Start(cfg config.Config, log *slog.Logger) (*Server, error) {
 		return nil, ErrNotReady
 	}
 
-	nc, err := nats.Connect("", nats.InProcessServer(ns), nats.Name("mast-bridge"))
+	s := &Server{
+		ns:            ns,
+		nc:            nil,
+		log:           log,
+		closing:       atomic.Bool{},
+		asyncErrors:   atomic.Uint64{},
+		slowConsumers: atomic.Uint64{},
+		disconnects:   atomic.Uint64{},
+		reconnects:    atomic.Uint64{},
+	}
+
+	// The handlers are not optional instrumentation. A nats.Conn reports a
+	// dropped message once, asynchronously, and nowhere else; its default is
+	// to report it to nobody. Connecting without them is how a node discards
+	// traffic while every counter mast keeps still reads as healthy.
+	nc, err := nats.Connect("",
+		nats.InProcessServer(ns),
+		nats.Name("mast-bridge"),
+		nats.ErrorHandler(s.onAsyncError),
+		nats.DisconnectErrHandler(s.onDisconnect),
+		nats.ReconnectHandler(s.onReconnect),
+		nats.ClosedHandler(s.onClosed),
+	)
 	if err != nil {
 		ns.Shutdown()
 
 		return nil, fmt.Errorf("natsd: connecting in-process: %w", err)
 	}
 
-	return &Server{ns: ns, nc: nc, log: log}, nil
+	s.nc = nc
+
+	return s, nil
 }
 
 // Shutdown drains the client connection and stops the server.
 func (s *Server) Shutdown() {
+	s.closing.Store(true)
+
 	if s.nc != nil {
 		if err := s.nc.Drain(); err != nil {
 			s.log.Warn("draining nats connection", "error", err)

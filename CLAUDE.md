@@ -106,7 +106,9 @@ The end-to-end tests in `internal/infra/broker` drive a real Paho client against
 
 **Broker subtests are deliberately not parallel.** They share one node on purpose, because standing up a NATS server per case is not what they are testing. Running them in parallel made `a/#` swallow the `a/+/c` case's publish, and the suite went green on the wrong message. `paralleltest` and `tparallel` are disabled for `_test.go` for exactly this reason — do not "fix" it by adding `t.Parallel()`.
 
-**Known flake: [#9](https://github.com/mastmq/mast/issues/9).** `go test -race ./...` has twice hung in the broker package until timeout, where the same package alone finishes in ~5.5s. Both followed a `golangci-lint` run in the same shell, suggesting CPU starvation of the in-process JetStream servers. Not reproduced since. **If it happens, capture the goroutine dump before anything else** — that is the missing evidence, and the same stall in production is a pod that will not terminate.
+**[#9](https://github.com/mastmq/mast/issues/9) is an upstream deadlock, not a flake.** `go test -race ./...` intermittently hangs in the broker package where the package alone finishes in ~5.5s. The goroutine dump, captured on 2026-09-22, shows a recursive read lock in mochi-mqtt v2.7.9: `Clients.GetByListener` (clients.go:93) holds `RLock` and then calls `Clients.Len` (clients.go:78), which takes `RLock` again. If a writer — `Clients.Delete` from `attachClient` — arrives between the two, Go's `RWMutex` blocks the second `RLock` behind the pending writer, and the first is never released.
+
+The trigger is a client connecting while the server is closing, so it needs no CPU starvation and the earlier starvation hypothesis was wrong. Still present on mochi `main`. In production this is a pod that will not terminate.
 
 ## Linting
 
@@ -148,9 +150,9 @@ This repo is one of six. A behaviour change usually touches more than one.
 | | |
 | --- | --- |
 | [#8](https://github.com/mastmq/mast/issues/8) | sessions do not survive a restart. `store.PutSession`, `Enqueue` and `Drain` are **written but not wired to the bridge** |
-| [#9](https://github.com/mastmq/mast/issues/9) | the intermittent broker-test hang |
+| [#9](https://github.com/mastmq/mast/issues/9) | the broker-test hang, diagnosed: a recursive `RLock` in mochi-mqtt, still unfixed upstream |
 | [#11](https://github.com/mastmq/mast/issues/11) | cross-node QoS 1/2 are best-effort |
-| [#12](https://github.com/mastmq/mast/issues/12) | **no `nats.ErrorHandler` on the bridge connection, so slow-consumer drops are completely silent.** Until this lands you cannot tell whether #11 is actually losing messages |
+| ~~[#12](https://github.com/mastmq/mast/issues/12)~~ | **fixed.** `natsd` registers the asynchronous handlers and publishes `mast_nats_slow_consumers_total`. Any increase means this node discarded messages it had already acknowledged |
 
 ## Conventions
 

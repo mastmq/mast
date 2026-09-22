@@ -96,7 +96,7 @@ func Start(
 	//nolint:exhaustruct_v5 // the collector's defaults are what we want
 	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
-	metrics := obs.NewMetrics(registry, func() float64 { return float64(b.Subscriptions()) })
+	metrics := obs.NewMetrics(registry, sources(b, nats))
 
 	b.hook = bridge.New(nats.Conn(), b.store, resolver, policy, bridge.Options{
 		Metrics:          metrics,
@@ -121,6 +121,27 @@ func Start(
 	}
 
 	return b, nil
+}
+
+// sources wires the live values the metrics read at scrape time.
+//
+// natsd keeps the asynchronous tallies and obs publishes them; neither
+// imports the other, so the conversion happens here, where the node is
+// assembled and both are already in scope.
+func sources(b *Broker, nats *natsd.Server) obs.Sources {
+	return obs.Sources{
+		Subscriptions: func() float64 { return float64(b.Subscriptions()) },
+		NATS: func() obs.NATSCounts {
+			c := nats.Counts()
+
+			return obs.NATSCounts{
+				AsyncErrors:   c.AsyncErrors,
+				SlowConsumers: c.SlowConsumers,
+				Disconnects:   c.Disconnects,
+				Reconnects:    c.Reconnects,
+			}
+		},
+	}
 }
 
 // Close stops the node, MQTT first so that no new message enters the bridge
