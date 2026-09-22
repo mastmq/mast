@@ -92,6 +92,12 @@ type Hook struct {
 	mu      sync.RWMutex
 	tenants map[string]tenant.Identity
 
+	// sessions is this node's claim on each client id it holds, and nodeID
+	// names the node in a notice so a human reading the log knows where a
+	// client went.
+	sessions *sessions
+	nodeID   string
+
 	metrics *obs.Metrics
 
 	// internalListener is the mochi listener id whose connections skip
@@ -110,6 +116,10 @@ type Options struct {
 	InternalListener string
 	// InternalTenant is the tenant connections on that listener join.
 	InternalTenant tenant.ID
+
+	// NodeID names this node in session notices. It is for humans reading
+	// logs; correctness rests on the per-connection owner token.
+	NodeID string
 }
 
 // New builds a bridge over an established NATS connection.
@@ -138,6 +148,8 @@ func New(
 		server:           nil,
 		subs:             nil,
 		tenants:          make(map[string]tenant.Identity),
+		sessions:         newSessions(),
+		nodeID:           opts.NodeID,
 	}
 	h.subs = newRegistry(nc, h.onNATSMessage)
 
@@ -176,8 +188,10 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	// A connection on the internal listener is trusted by virtue of having
 	// reached it. Nothing is asked of it and nothing is asked about it later.
 	if h.isInternal(cl) {
-		cl.ID = mountClient(h.internalTenant, cl.ID)
+		bare := cl.ID
+		cl.ID = mountClient(h.internalTenant, bare)
 		h.onConnected(cl, tenant.Identity{Tenant: h.internalTenant, Superuser: true})
+		h.claimSession(h.internalTenant, bare, cl.ID)
 
 		return true
 	}
@@ -200,11 +214,16 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	// Scope the id to its tenant before anything keys on it. mochi is about
 	// to look up an existing session and add this client to a map, both by
 	// id, and mast's own tenant and subscription maps follow suit.
-	cl.ID = mountClient(identity.Tenant, cl.ID)
+	bare := cl.ID
+	cl.ID = mountClient(identity.Tenant, bare)
 
 	h.log.Debug("client authenticated",
 		"client", cl.ID, "tenant", string(identity.Tenant), "superuser", identity.Superuser)
 	h.onConnected(cl, identity)
+
+	// Announce the claim so a copy of this client on another node stands
+	// down. mochi has already displaced any local copy by this point.
+	h.claimSession(identity.Tenant, bare, cl.ID)
 
 	return true
 }
@@ -753,6 +772,7 @@ func (h *Hook) writeRetained(
 // tenant resolved for it.
 func (h *Hook) forget(clientID string) {
 	h.subs.releaseAll(clientID)
+	h.releaseSession(clientID)
 
 	h.mu.Lock()
 	delete(h.tenants, clientID)

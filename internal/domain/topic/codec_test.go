@@ -326,3 +326,32 @@ func EncodeOrFail(t *testing.T, mqttTopic string) (string, error) {
 
 	return topic.EncodeTopic("acme", mqttTopic)
 }
+
+// FuzzTokenRoundTrip guards the control-plane encoding the same way
+// FuzzRoundTrip guards topics. A client id reaches this from the wire, so
+// "any byte sequence" is the real input domain, not a theoretical one.
+func FuzzTokenRoundTrip(f *testing.F) {
+	for _, seed := range []string{
+		"", "device-1", "a.b", "a/b", "*", ">", "device 1",
+		"tenant.forged.subject", "\x00\xff", "دستگاه", "=3D",
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, raw string) {
+		token := topic.EncodeToken(raw)
+
+		if strings.ContainsAny(token, ". *>\t\r\n") {
+			t.Fatalf("token %q for %q holds a character that would break or widen a subject", token, raw)
+		}
+
+		back, err := topic.DecodeToken(token)
+		if err != nil {
+			t.Fatalf("decoding %q (from %q): %v", token, raw, err)
+		}
+
+		if back != raw {
+			t.Fatalf("round trip changed %q into %q", raw, back)
+		}
+	})
+}

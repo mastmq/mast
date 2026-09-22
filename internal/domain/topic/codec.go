@@ -207,6 +207,30 @@ func DecodeTopic(subject string) (string, string, error) {
 	return tenant, strings.Join(levels, "/"), nil
 }
 
+// EncodeToken escapes an arbitrary string into a single NATS subject token.
+//
+// It exists for subjects that are not topics. A client id, for instance, is
+// chosen by the device and may hold any byte at all, including the '.' that
+// separates subject tokens and the '*' and '>' that are wildcards. Putting
+// one straight into a subject lets a device pick which subject it lands on,
+// which for a control-plane subject means letting it forge control messages.
+//
+// The escaping is the same one [EncodeTopic] applies to each level, so the
+// result is equally safe as a JetStream KV key, and [DecodeToken] reverses
+// it exactly.
+func EncodeToken(s string) string {
+	var sb strings.Builder
+
+	encodeLevel(s, &sb)
+
+	return sb.String()
+}
+
+// DecodeToken reverses [EncodeToken].
+func DecodeToken(token string) (string, error) {
+	return decodeLevel(token)
+}
+
 // encodeLevel appends one escaped MQTT level to sb.
 func encodeLevel(level string, sb *strings.Builder) {
 	if level == "" {

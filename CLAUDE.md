@@ -94,6 +94,16 @@ mast imports `github.com/mastmq/mochi/v2`, not `github.com/mochi-mqtt/server/v2`
 
 Two consequences worth remembering. `go get -u ./...` will not pull mochi-mqtt updates any more, because we no longer depend on that path — watch upstream by hand. And `.golangci.yml`'s `exhaustruct_v5` ignore pattern is `^github\.com/mastmq/mochi/.*`; it has to move with the module path or every mochi struct literal starts reporting.
 
+## The session control plane
+
+`mast.session.<tenant>.<client-id>` is the only control-plane subject, and it is deliberately **outside** the `t.` namespace that carries tenant traffic. Every filter a client can subscribe to is mounted under its tenant and encoded to `t.<tenant>....`, so no client — wildcard or otherwise — can read a notice or forge one. Keep it that way: a control subject reachable from a `#` subscription is a control subject a tenant owns.
+
+Both tokens go through `topic.EncodeToken`, which is the single-token form of the topic codec. A client id comes off the wire and may hold `.`, `*` or `>`; unescaped, a device could choose which subject its notice landed on.
+
+A notice carries the **connection's** owner token, not the node's. The node that publishes is also subscribed, so it has to recognise its own notice, and identifying by node would make two connections on one node indistinguishable. `NodeID` exists only so a log line can say where a client went, and it is the embedded server's id rather than the configured name — the name defaults to the role, so every edge pod would answer to `mast-edge`.
+
+A failed claim logs and continues rather than refusing the connection. Without it a client can end up live in two places, which is the bug this prevents; refusing outright would turn duplicate delivery into an outage.
+
 ## Configuration
 
 koanf, layered: hardcoded defaults → optional TOML → environment → explicitly-set flags.
@@ -160,6 +170,7 @@ This repo is one of six. A behaviour change usually touches more than one.
 | [#8](https://github.com/mastmq/mast/issues/8) | sessions do not survive a restart. `store.PutSession`, `Enqueue` and `Drain` are **written but not wired to the bridge** |
 | ~~[#9](https://github.com/mastmq/mast/issues/9)~~ | **fixed**, by moving to `mastmq/mochi` v2.7.10 |
 | [#11](https://github.com/mastmq/mast/issues/11) | cross-node QoS 1/2 are best-effort |
+| ~~[#13](https://github.com/mastmq/mast/issues/13)~~ | **fixed.** Cross-node takeover, via the `mast.session.*` control plane |
 | ~~[#12](https://github.com/mastmq/mast/issues/12)~~ | **fixed.** `natsd` registers the asynchronous handlers and publishes `mast_nats_slow_consumers_total`. Any increase means this node discarded messages it had already acknowledged |
 
 ## Conventions

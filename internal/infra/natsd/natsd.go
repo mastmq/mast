@@ -54,6 +54,11 @@ type Server struct {
 // use, as every nats.Conn is.
 func (s *Server) Conn() *nats.Conn { return s.nc }
 
+// ID returns the embedded server's unique identity, which distinguishes
+// this process from every other node in the cluster. The configured server
+// name does not: it defaults to the role, so every edge shares one.
+func (s *Server) ID() string { return s.ns.ID() }
+
 // JetStreamEnabled reports whether this node carries JetStream. Edge nodes do
 // not: they reach the core tier's KV buckets over their leaf connection.
 func (s *Server) JetStreamEnabled() bool { return s.ns.JetStreamEnabled() }

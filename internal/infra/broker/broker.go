@@ -102,6 +102,10 @@ func Start(
 		Metrics:          metrics,
 		InternalListener: mqttd.InternalListenerID,
 		InternalTenant:   tenant.ID(cfg.Tenant.Default),
+		// The embedded server's id rather than the configured name: the
+		// name defaults to the role, so every edge pod would answer to
+		// "mast-edge" and a log line naming one would name them all.
+		NodeID: nats.ID(),
 	}, log)
 
 	b.obs = obs.Serve(cfg.Obs.Addr, registry, log)
