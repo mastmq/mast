@@ -10,8 +10,8 @@ import (
 
 	"github.com/mastmq/mast/internal/infra/bridge"
 	"github.com/mastmq/mast/internal/infra/config"
-	mqtt "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/listeners"
+	mqtt "github.com/mastmq/mochi/v2"
+	"github.com/mastmq/mochi/v2/listeners"
 )
 
 // InternalListenerID names the unauthenticated listener. The bridge matches

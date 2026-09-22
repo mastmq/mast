@@ -19,7 +19,7 @@ import (
 	"github.com/mastmq/mast/internal/infra/natsd"
 	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
-	mqtt "github.com/mochi-mqtt/server/v2"
+	mqtt "github.com/mastmq/mochi/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )

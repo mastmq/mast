@@ -86,6 +86,14 @@ Return codes on `OnPublish` are not interchangeable:
 
 `$share/<group>/<filter>` maps onto a NATS queue group. A queue group **serves a local member first** — this is NATS geo-affinity, not a bug. The MQTT guarantee (exactly one group member) holds; the round-robin-across-the-fleet behaviour an MQTT user expects does not. Verified on a real three-node cluster. Documented, not hidden.
 
+## The MQTT library is ours now
+
+mast imports `github.com/mastmq/mochi/v2`, not `github.com/mochi-mqtt/server/v2`. [`mastmq/mochi`](https://github.com/mastmq/mochi) is a detached fork of mochi-mqtt/server, MIT, republished under our own module path because upstream stopped merging: `main` has not moved since 2025-03-01 and 47 pull requests are open, including four that fix the deadlock in #9.
+
+`v2.7.10` is upstream `v2.7.9` plus that one fix. **Keep it that way.** A patch to MQTT behaviour belongs in `mastmq/mochi` with a line in its `FORK.md`, not as a workaround here, and every line we do not have to carry is a line that costs nothing when upstream revives.
+
+Two consequences worth remembering. `go get -u ./...` will not pull mochi-mqtt updates any more, because we no longer depend on that path — watch upstream by hand. And `.golangci.yml`'s `exhaustruct_v5` ignore pattern is `^github\.com/mastmq/mochi/.*`; it has to move with the module path or every mochi struct literal starts reporting.
+
 ## Configuration
 
 koanf, layered: hardcoded defaults → optional TOML → environment → explicitly-set flags.
@@ -106,9 +114,9 @@ The end-to-end tests in `internal/infra/broker` drive a real Paho client against
 
 **Broker subtests are deliberately not parallel.** They share one node on purpose, because standing up a NATS server per case is not what they are testing. Running them in parallel made `a/#` swallow the `a/+/c` case's publish, and the suite went green on the wrong message. `paralleltest` and `tparallel` are disabled for `_test.go` for exactly this reason — do not "fix" it by adding `t.Parallel()`.
 
-**[#9](https://github.com/mastmq/mast/issues/9) is an upstream deadlock, not a flake.** `go test -race ./...` intermittently hangs in the broker package where the package alone finishes in ~5.5s. The goroutine dump, captured on 2026-09-22, shows a recursive read lock in mochi-mqtt v2.7.9: `Clients.GetByListener` (clients.go:93) holds `RLock` and then calls `Clients.Len` (clients.go:78), which takes `RLock` again. If a writer — `Clients.Delete` from `attachClient` — arrives between the two, Go's `RWMutex` blocks the second `RLock` behind the pending writer, and the first is never released.
+**[#9](https://github.com/mastmq/mast/issues/9) was an upstream deadlock, and is fixed.** `go test -race ./...` used to hang intermittently in the broker package. The goroutine dump, captured 2026-09-22, showed a recursive read lock in mochi-mqtt v2.7.9: `Clients.GetByListener` held `RLock` and then called `Clients.Len`, which takes `RLock` again, so a `Clients.Delete` from `attachClient` arriving between the two wedged all three. The trigger was a client connecting while the server closed, which is also why it presented in production as a pod that would not terminate.
 
-The trigger is a client connecting while the server is closing, so it needs no CPU starvation and the earlier starvation hypothesis was wrong. Still present on mochi `main`. In production this is a pod that will not terminate.
+Upstream has carried it as an open issue since December 2025 with four unmerged pull requests, so the fix lives in [`mastmq/mochi`](https://github.com/mastmq/mochi) instead — see the next section.
 
 ## Linting
 
@@ -150,7 +158,7 @@ This repo is one of six. A behaviour change usually touches more than one.
 | | |
 | --- | --- |
 | [#8](https://github.com/mastmq/mast/issues/8) | sessions do not survive a restart. `store.PutSession`, `Enqueue` and `Drain` are **written but not wired to the bridge** |
-| [#9](https://github.com/mastmq/mast/issues/9) | the broker-test hang, diagnosed: a recursive `RLock` in mochi-mqtt, still unfixed upstream |
+| ~~[#9](https://github.com/mastmq/mast/issues/9)~~ | **fixed**, by moving to `mastmq/mochi` v2.7.10 |
 | [#11](https://github.com/mastmq/mast/issues/11) | cross-node QoS 1/2 are best-effort |
 | ~~[#12](https://github.com/mastmq/mast/issues/12)~~ | **fixed.** `natsd` registers the asynchronous handlers and publishes `mast_nats_slow_consumers_total`. Any increase means this node discarded messages it had already acknowledged |
 

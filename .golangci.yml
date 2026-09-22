@@ -21,7 +21,7 @@ linters:
         - '^github\.com/urfave/cli/v3\..*'
         - '^github\.com/knadh/koanf/.*'
         - '^github\.com/nats-io/.*'
-        - '^github\.com/mochi-mqtt/.*'
+        - '^github\.com/mastmq/mochi/.*'
         - '^crypto/tls\..*'
     revive:
       rules:

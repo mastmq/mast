@@ -44,8 +44,8 @@ import (
 	"github.com/mastmq/mast/internal/domain/topic"
 	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
-	mqtt "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/packets"
+	mqtt "github.com/mastmq/mochi/v2"
+	"github.com/mastmq/mochi/v2/packets"
 	"github.com/nats-io/nats.go"
 )
 
