@@ -492,5 +492,12 @@ func (c Config) validateAuth() error {
 		return ErrNoJWTAlgorithms
 	}
 
+	// Checked whenever an HTTP client will exist, which includes jwt mode
+	// with an authz_url, and not in static mode, where the value is inert.
+	usesHTTP := c.Auth.Mode == AuthHTTP || (c.Auth.Mode == AuthJWT && c.Auth.HTTP.AuthzURL != "")
+	if usesHTTP && c.Auth.HTTP.Timeout <= 0 {
+		return fmt.Errorf("%w: got %v", ErrBadAuthTimeout, c.Auth.HTTP.Timeout)
+	}
+
 	return nil
 }

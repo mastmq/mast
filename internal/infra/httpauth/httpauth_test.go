@@ -284,6 +284,42 @@ func TestAllowsCaches(t *testing.T) {
 	}
 }
 
+// TestCacheSeparatesUsernames guards against a cached allow outliving the
+// credential it was given to. Two devices can share a client id inside one
+// tenant — a reflashed device, a copied config — and the second must be
+// asked about in its own right, not handed the first one's answer.
+func TestCacheSeparatesUsernames(t *testing.T) {
+	t.Parallel()
+
+	srv := newServer(t, func(req map[string]any) (int, any) {
+		return http.StatusOK, map[string]any{"allow": req["username"] == "alice"}
+	})
+
+	c, err := httpauth.New(httpauth.Options{
+		AuthnURL: srv.URL, AuthzURL: srv.URL, Timeout: time.Second,
+		CacheTTL: time.Minute, CacheSize: 100,
+	}, discard())
+	if err != nil {
+		t.Fatalf("building client: %v", err)
+	}
+
+	alice := tenant.Access{Tenant: "acme", ClientID: "dev-1", Username: "alice", Topic: "a/b", Write: true}
+	if !c.Allows(context.Background(), alice) {
+		t.Fatal("alice was denied")
+	}
+
+	mallory := alice
+	mallory.Username = "mallory"
+
+	if c.Allows(context.Background(), mallory) {
+		t.Error("a second username on the same client id was served the first one's cached allow")
+	}
+
+	if n := srv.calls.Load(); n != 2 {
+		t.Errorf("policy server called %d times for two distinct usernames, want 2", n)
+	}
+}
+
 func TestCacheExpires(t *testing.T) {
 	t.Parallel()
 
@@ -372,6 +408,15 @@ func TestNewValidates(t *testing.T) {
 	_, err := httpauth.New(httpauth.Options{AuthnURL: "http://x", OnError: "maybe"}, discard())
 	if !errors.Is(err, httpauth.ErrBadFailMode) {
 		t.Errorf("bad on_error error = %v, want %v", err, httpauth.ErrBadFailMode)
+	}
+
+	// Zero is what an unset timeout looks like, and to net/http it means
+	// wait forever.
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		_, err = httpauth.New(httpauth.Options{AuthnURL: "http://x", Timeout: timeout}, discard())
+		if !errors.Is(err, httpauth.ErrBadTimeout) {
+			t.Errorf("timeout %v error = %v, want %v", timeout, err, httpauth.ErrBadTimeout)
+		}
 	}
 }
 

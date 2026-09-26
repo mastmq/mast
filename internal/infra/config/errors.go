@@ -22,4 +22,9 @@ var (
 	// ErrNoJWTAlgorithms guards the classic JWT footgun: accepting whatever
 	// algorithm a token asks for.
 	ErrNoJWTAlgorithms = errors.New("config: auth.mode jwt requires auth.jwt.algorithms")
+
+	// ErrBadAuthTimeout guards against a zero auth.http.timeout, which to
+	// net/http means no timeout: one policy server that stops answering
+	// would hang every CONNECT and every uncached publish indefinitely.
+	ErrBadAuthTimeout = errors.New("config: auth.http.timeout must be positive")
 )

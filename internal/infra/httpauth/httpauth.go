@@ -44,9 +44,11 @@ package httpauth
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -109,7 +111,24 @@ var (
 	ErrNoTenantConfigured = errors.New("httpauth: wire emqx requires a tenant")
 	// ErrNoAuthzURL is returned when an authorizer is built without one.
 	ErrNoAuthzURL = errors.New("httpauth: authz_url is required for an authorizer")
+	// ErrBadTimeout is returned for a timeout that is zero or negative. To
+	// net/http a zero timeout means none at all, and this call sits in front
+	// of every CONNECT and every uncached publish: a policy server that
+	// accepts and never answers would hang each of them forever.
+	ErrBadTimeout = errors.New("httpauth: timeout must be positive")
 )
+
+// maxIdleConnsPerHost replaces net/http's default of two. Every call goes to
+// one or two hosts, and a reconnect storm puts hundreds of them in flight at
+// once; with two idle slots nearly every one of those connections is closed
+// after use and dialled again for the next, which is a TCP and often a TLS
+// handshake per CONNECT against a service that is already the bottleneck.
+const maxIdleConnsPerHost = 128
+
+// maxDrain bounds how much of a reply is read and thrown away so its
+// connection can be reused. A service that answers with something large is
+// cheaper to reconnect to than to read.
+const maxDrain = 64 << 10
 
 // Options configures a [Client].
 type Options struct {
@@ -173,12 +192,38 @@ func New(opts Options, log *slog.Logger) (*Client, error) {
 		return nil, fmt.Errorf("%w: got %q", ErrBadFailMode, opts.OnError)
 	}
 
+	if opts.Timeout <= 0 {
+		return nil, fmt.Errorf("%w: got %v", ErrBadTimeout, opts.Timeout)
+	}
+
 	return &Client{
-		opts:  opts,
-		http:  &http.Client{Timeout: opts.Timeout}, //nolint:exhaustruct_v5 // defaults are correct for the rest
+		opts: opts,
+		http: &http.Client{ //nolint:exhaustruct_v5 // defaults are correct for the rest
+			Timeout:   opts.Timeout,
+			Transport: transport(),
+		},
 		cache: newCache(opts.CacheTTL, opts.CacheSize),
 		log:   log.With("component", "httpauth"),
 	}, nil
+}
+
+// transport is net/http's default transport with room to keep connections
+// to the auth service alive. It clones rather than builds one so proxy,
+// dial and TLS handshake settings stay whatever the standard library
+// considers correct.
+func transport() http.RoundTripper {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// Something replaced the default transport process-wide; honour it
+		// rather than second-guess it.
+		return http.DefaultTransport
+	}
+
+	t := base.Clone()
+	t.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	t.MaxIdleConns = max(t.MaxIdleConns, maxIdleConnsPerHost)
+
+	return t
 }
 
 // NewAuthorizer builds a client that only answers authorization.
@@ -328,13 +373,25 @@ func (c *Client) CacheSize() int { return c.cache.size() }
 
 // cacheKey identifies an authorization question. The separator cannot appear
 // in a client id or a tenant, so two different questions cannot collide.
+//
+// The username is part of the question because the service answers per
+// credential — under the emqx wire it sees nothing else about the caller. A
+// key without it let a second device reusing a client id inside the same
+// tenant inherit the first one's allow for up to a TTL. It goes in as a
+// digest rather than verbatim because a username is often a whole JWT, and a
+// kilobyte per entry would turn a cache sized in megabytes into one sized in
+// hundreds of them; a digest is also fixed-width, so no username can forge
+// the separators around it.
 func cacheKey(a tenant.Access) string {
 	var sb strings.Builder
+
+	user := sha256.Sum256([]byte(a.Username))
 
 	sb.WriteString(string(a.Tenant))
 	sb.WriteByte(0)
 	sb.WriteString(a.ClientID)
 	sb.WriteByte(0)
+	sb.Write(user[:])
 	sb.WriteString(a.Action())
 	sb.WriteByte(0)
 	sb.WriteString(a.Topic)
@@ -367,7 +424,15 @@ func (c *Client) post(ctx context.Context, url string, body, reply any) error {
 		return fmt.Errorf("httpauth: calling %s: %w", url, err)
 	}
 
+	// Drain before closing, on every path. A body closed with bytes still
+	// unread — an error page, or the newline after a JSON reply — takes its
+	// connection with it, and the pool is only worth having if connections
+	// go back into it.
 	defer func() {
+		if _, derr := io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrain)); derr != nil {
+			c.log.Debug("draining response body", "error", derr)
+		}
+
 		if cerr := resp.Body.Close(); cerr != nil {
 			c.log.Debug("closing response body", "error", cerr)
 		}
