@@ -38,6 +38,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mastmq/mast/internal/domain/tenant"
@@ -47,6 +48,7 @@ import (
 	mqtt "github.com/mastmq/mochi/v2"
 	"github.com/mastmq/mochi/v2/packets"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nuid"
 )
 
 // hookID names this hook in mochi's logs.
@@ -58,6 +60,9 @@ const hookID = "mast-bridge"
 const (
 	headerQoS    = "Mast-Qos"
 	headerRetain = "Mast-Retain"
+	// headerID names one publish, so a node that receives it on several
+	// overlapping subscriptions can tell the copies apart from new messages.
+	headerID = "Mast-Id"
 )
 
 // storeTimeout bounds a single call to the durable store. It sits on the
@@ -89,8 +94,20 @@ type Hook struct {
 	subs   *registry
 	store  *store.Store
 
+	// injector is the inline client messages from the fabric are published
+	// through. It is this hook's own rather than mochi's, because mochi's
+	// Publish offers no way to say which NATS subscription a message came in
+	// on, and [Hook.OnSelectSubscribers] needs to know.
+	injector *mqtt.Client
+	seen     *seen
+
 	mu      sync.RWMutex
 	tenants map[string]tenant.Identity
+	// open is every connection the gauge has counted and not yet released,
+	// by connection rather than by client id, so that a disconnect reported
+	// twice — once by a takeover, once by mochi — is released once, and a
+	// new connection with the same id is never mistaken for the old one.
+	open map[*mqtt.Client]tenant.ID
 
 	// sessions is this node's claim on each client id it holds, and nodeID
 	// names the node in a notice so a human reading the log knows where a
@@ -147,7 +164,10 @@ func New(
 		log:              log.With("component", "bridge"),
 		server:           nil,
 		subs:             nil,
+		injector:         nil,
+		seen:             newSeen(),
 		tenants:          make(map[string]tenant.Identity),
+		open:             make(map[*mqtt.Client]tenant.ID),
 		sessions:         newSessions(),
 		nodeID:           opts.NodeID,
 	}
@@ -157,7 +177,12 @@ func New(
 }
 
 // Attach binds the hook to the server it will inject messages into.
-func (h *Hook) Attach(server *mqtt.Server) { h.server = server }
+func (h *Hook) Attach(server *mqtt.Server) {
+	h.server = server
+	// Built exactly as mochi builds its own, so an injected message is
+	// indistinguishable from one sent through [mqtt.Server.Publish].
+	h.injector = server.NewClient(nil, mqtt.LocalListener, mqtt.InlineClientId, true)
+}
 
 // Subscriptions reports the number of live NATS subscriptions this node holds.
 func (h *Hook) Subscriptions() int { return h.subs.count() }
@@ -180,6 +205,7 @@ func (h *Hook) Provides(b byte) bool {
 		mqtt.OnPacketEncode,
 		mqtt.OnQosPublish,
 		mqtt.OnSessionEstablished,
+		mqtt.OnSelectSubscribers,
 	}, b)
 }
 
@@ -194,6 +220,10 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 		cl.ID = mountClient(h.internalTenant, bare)
 		h.onConnected(cl, tenant.Identity{Tenant: h.internalTenant, Superuser: true})
 		h.claimSession(h.internalTenant, bare, cl.ID)
+
+		if pk.Connect.Clean {
+			h.dropSession(h.internalTenant, bare)
+		}
 
 		return true
 	}
@@ -247,7 +277,11 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 //
 // A session mochi inherited locally is left alone. It already carries
 // subscriptions, and its inflight state is richer than anything the bucket
-// holds.
+// holds. Its queue in the bucket is discarded instead: everything in it was
+// written by OnQosPublish at the moment mochi put the same message into
+// that inflight, which mochi is about to resend. Kept, the queue outlived
+// the delivery and replayed it again the next time the device came up on
+// another node.
 func (h *Hook) OnSessionEstablished(cl *mqtt.Client, pk packets.Packet) {
 	if pk.Connect.Clean {
 		return
@@ -258,11 +292,15 @@ func (h *Hook) OnSessionEstablished(cl *mqtt.Client, pk packets.Packet) {
 		return
 	}
 
+	bareID := unmountClient(id, cl.ID)
+
 	if len(cl.State.Subscriptions.GetAll()) > 0 {
+		h.discardOffline(id, bareID)
+
 		return
 	}
 
-	h.restoreSession(cl, id, unmountClient(id, cl.ID))
+	h.restoreSession(cl, id, bareID)
 }
 
 // OnPacketRead mounts every inbound topic and filter under the client's
@@ -359,6 +397,7 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	msg := nats.NewMsg(subject)
 	msg.Data = pk.Payload
 	msg.Header.Set(headerQoS, strconv.Itoa(int(pk.FixedHeader.Qos)))
+	msg.Header.Set(headerID, nuid.Next())
 
 	if pk.FixedHeader.Retain {
 		msg.Header.Set(headerRetain, "1")
@@ -477,6 +516,7 @@ func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 	msg := nats.NewMsg(subject)
 	msg.Data = will.Payload
 	msg.Header.Set(headerQoS, strconv.Itoa(int(will.Qos)))
+	msg.Header.Set(headerID, nuid.Next())
 
 	if err := h.nc.PublishMsg(msg); err != nil {
 		h.log.Error("forwarding will to nats", "subject", subject, "error", err)
@@ -507,6 +547,46 @@ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	}
 
 	h.forget(cl.ID)
+}
+
+// OnSelectSubscribers narrows mochi's local fan-out to the subscribers the
+// NATS copy being injected was meant for.
+//
+// A plain copy must not reach a shared group: whether this node serves the
+// group is decided by the queue copy, which NATS may well have given to
+// another node, and delivering here too puts the message in front of two
+// members of one group. A queue copy must reach nobody but its own group, and
+// only for the filter whose subject it arrived on, because "$share/g/a/#"
+// and "$share/g/a/+" are two groups that each get a copy.
+func (h *Hook) OnSelectSubscribers(subs *mqtt.Subscribers, pk packets.Packet) *mqtt.Subscribers {
+	route := pk.Properties.ServerReference
+	if route == routePlain {
+		clear(subs.Shared)
+		clear(subs.SharedSelected)
+
+		return subs
+	}
+
+	fields := strings.Split(route, routeSep)
+
+	const queueFields = 4
+	if len(fields) != queueFields || fields[0] != "q" {
+		return subs // not injected by the bridge
+	}
+
+	id, queue, subject := tenant.ID(fields[1]), fields[2], fields[3]
+
+	clear(subs.Subscriptions)
+	clear(subs.InlineSubscriptions)
+	clear(subs.SharedSelected)
+
+	for filter := range subs.Shared {
+		if !servesQueue(id, filter, queue, subject) {
+			delete(subs.Shared, filter)
+		}
+	}
+
+	return subs
 }
 
 // tenantOf returns the tenant resolved for a client at CONNECT.
@@ -558,8 +638,25 @@ func (h *Hook) keysFor(id tenant.ID, filter packets.Subscription) []subKey {
 
 // onNATSMessage delivers a message that arrived from the fabric to this node's
 // local subscribers.
+//
+// A node can receive one message several times, once per NATS subscription it
+// matches, and the copies are not interchangeable. Plain copies are
+// duplicates of each other: the first goes through mochi's local fan-out,
+// which already reaches every plain subscriber once, and the rest are
+// dropped. A queue copy is different — NATS picked this node for one shared
+// subscription group — so it goes to that group alone, and
+// [Hook.OnSelectSubscribers] keeps it from everyone else.
 func (h *Hook) onNATSMessage(msg *nats.Msg) {
 	if h.server == nil {
+		return
+	}
+
+	var queue string
+	if msg.Sub != nil {
+		queue = msg.Sub.Queue
+	}
+
+	if queue == "" && !h.seen.first(msg.Header.Get(headerID)) {
 		return
 	}
 
@@ -568,6 +665,21 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 		h.log.Warn("undecodable subject from nats", "subject", msg.Subject, "error", err)
 
 		return
+	}
+
+	mounted := mount(tenant.ID(tenantID), mqttTopic)
+
+	route := routePlain
+
+	if queue != "" {
+		// mochi only asks the hook to choose when a shared subscriber
+		// matches. Without one, the copy would fall through to the plain
+		// subscribers, who have already had it.
+		if len(h.server.Topics.Subscribers(mounted).Shared) == 0 {
+			return
+		}
+
+		route = queueRoute(tenantID, queue, msg.Sub.Subject)
 	}
 
 	// Inject at the QoS the publisher used. mochi then downgrades per
@@ -580,13 +692,55 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 	// subscriber that was already present, which MQTT says gets retain=0.
 	qos := qosOf(msg)
 
-	if err := h.server.Publish(mount(tenant.ID(tenantID), mqttTopic), msg.Data, false, qos); err != nil {
+	err = h.server.InjectPacket(h.injector, packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: qos},
+		TopicName:   mounted,
+		Payload:     msg.Data,
+		// mochi's own Publish does the same: an inline publish is never
+		// acknowledged, but a QoS 1 or 2 packet still needs an id to be
+		// valid.
+		PacketID: uint16(qos),
+		// ServerReference is only valid on CONNACK and DISCONNECT, so mochi
+		// never encodes it on a PUBLISH. That makes it the one field that
+		// can carry the route from here to OnSelectSubscribers without any
+		// chance of reaching a client.
+		Properties: packets.Properties{ServerReference: route},
+	})
+	if err != nil {
 		h.log.Error("injecting message from nats", "subject", msg.Subject, "error", err)
 
 		return
 	}
 
 	h.count(func(m *obs.Metrics) { m.MessagesOut.WithLabelValues(tenantID).Inc() })
+}
+
+// routePlain marks a message that arrived on a plain NATS subscription.
+const routePlain = "p"
+
+// routeSep separates the fields of a queue route. NUL can occur in none of
+// them: not in a tenant, which the codec restricts, and not in a subject.
+const routeSep = "\x00"
+
+// queueRoute marks a message NATS delivered to one shared subscription group.
+func queueRoute(tenantID, queue, subject string) string {
+	return "q" + routeSep + tenantID + routeSep + queue + routeSep + subject
+}
+
+// servesQueue reports whether a mounted shared filter is the one a NATS queue
+// subscription on subject exists for.
+func servesQueue(id tenant.ID, filter, queue, subject string) bool {
+	group, rest, shared := splitShare(filter)
+	if !shared || queueName(id, group) != queue {
+		return false
+	}
+
+	subjects, err := topic.FilterSubjects(string(id), unmount(id, rest))
+	if err != nil {
+		return false
+	}
+
+	return slices.Contains(subjects, subject)
 }
 
 // qosOf reads the QoS a message was published at, defaulting to 0 for
@@ -786,31 +940,55 @@ func (h *Hook) writeRetained(
 	filter packets.Subscription,
 	msg store.Message,
 ) error {
-	qos := min(msg.QoS, filter.Qos)
+	return h.deliverTo(cl, mount(id, msg.Topic), msg.Payload, min(msg.QoS, filter.Qos), true)
+}
+
+// deliverTo sends one message to one client and nobody else.
+//
+// It is the part of mochi's publishToClient that a targeted delivery needs,
+// which mochi does not export. Two parts matter and were missing when this
+// wrote the packet bare: the read ACL, which mochi applies to every message
+// on its way out and a replay must not skip, and the inflight entry, without
+// which a QoS 1 message lost to a dropped connection is simply gone — and for
+// a drained queue it is gone from the bucket too.
+func (h *Hook) deliverTo(cl *mqtt.Client, mountedTopic string, payload []byte, qos byte, retain bool) error {
+	if !h.OnACLCheck(cl, mountedTopic, false) {
+		return packets.ErrNotAuthorized
+	}
 
 	out := packets.Packet{
 		FixedHeader: packets.FixedHeader{
 			Type:   packets.Publish,
-			Qos:    qos,
-			Retain: true,
+			Qos:    min(qos, h.server.Options.Capabilities.MaximumQos),
+			Retain: retain,
 		},
-		TopicName: mount(id, msg.Topic),
-		Payload:   msg.Payload,
+		TopicName: mountedTopic,
+		Payload:   payload,
+		Created:   time.Now().Unix(),
 	}
 
-	if qos > 0 {
+	if out.FixedHeader.Qos > 0 {
+		if cl.State.Inflight.Len() >= int(h.server.Options.Capabilities.MaximumInflight) {
+			return packets.ErrQuotaExceeded
+		}
+
 		packetID, err := cl.NextPacketID()
 		if err != nil {
-			return fmt.Errorf("bridge: packet id for retained message: %w", err)
+			return fmt.Errorf("bridge: packet id: %w", err)
 		}
 
 		// NextPacketID returns uint32 but MQTT packet ids are 16 bit, and
 		// mochi allocates them inside that range.
 		out.PacketID = uint16(packetID & packetIDMask)
+
+		if cl.State.Inflight.Set(out) {
+			atomic.AddInt64(&h.server.Info.Inflight, 1)
+			cl.State.Inflight.DecreaseSendQuota()
+		}
 	}
 
 	if err := cl.WritePacket(out); err != nil {
-		return fmt.Errorf("bridge: writing retained message: %w", err)
+		return fmt.Errorf("bridge: writing to %s: %w", cl.ID, err)
 	}
 
 	return nil
@@ -837,6 +1015,7 @@ func (h *Hook) forget(clientID string) {
 func (h *Hook) onConnected(cl *mqtt.Client, identity tenant.Identity) {
 	h.mu.Lock()
 	h.tenants[cl.ID] = identity
+	h.open[cl] = identity.Tenant
 	h.mu.Unlock()
 
 	h.count(func(m *obs.Metrics) {
@@ -845,15 +1024,20 @@ func (h *Hook) onConnected(cl *mqtt.Client, identity tenant.Identity) {
 	})
 }
 
-// onDisconnected records a connection going away.
+// onDisconnected records a connection going away. It is safe to call more
+// than once for the same connection; only the first call counts.
 func (h *Hook) onDisconnected(cl *mqtt.Client) {
-	identity, known := h.identityOf(cl)
-	if !known {
+	h.mu.Lock()
+	id, counted := h.open[cl]
+	delete(h.open, cl)
+	h.mu.Unlock()
+
+	if !counted {
 		return
 	}
 
 	h.count(func(m *obs.Metrics) {
-		m.ConnectionsOpen.WithLabelValues(string(identity.Tenant)).Dec()
+		m.ConnectionsOpen.WithLabelValues(string(id)).Dec()
 	})
 }
 

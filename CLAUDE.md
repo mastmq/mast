@@ -84,6 +84,8 @@ Return codes on `OnPublish` are not interchangeable:
 
 `cl.Net.Inline` marks the server's own injected messages. The bridge returns early on those or it loops.
 
+**A node receives one message once per NATS subscription it matches**, and it holds one per distinct filter, so overlapping filters (`a/#` beside `a/b/c`) mean several copies. Each used to run mochi's whole local fan-out, which delivered duplicates to everyone and put a message in front of two members of one share group. `onNATSMessage` now drops repeat plain copies by the `Mast-Id` header, and routes a queue copy to its own group only through `OnSelectSubscribers`, carrying the route in `Properties.ServerReference` because mochi never encodes that property on a PUBLISH. mochi calls `OnSelectSubscribers` only when a shared subscriber matches, which is why a queue copy with no local member is dropped before injection. Anything delivered to one client — a retained replay, a drained queue — goes through `deliverTo`, never `server.Publish`, which fans out to the whole node.
+
 `$share/<group>/<filter>` maps onto a NATS queue group. A queue group **serves a local member first** — this is NATS geo-affinity, not a bug. The MQTT guarantee (exactly one group member) holds; the round-robin-across-the-fleet behaviour an MQTT user expects does not. Verified on a real three-node cluster. Documented, not hidden.
 
 ## The MQTT library is ours now

@@ -189,6 +189,12 @@ func (h *Hook) onSessionNotice(msg *nats.Msg) {
 	h.log.Info("session taken over elsewhere, disconnecting local client",
 		"client", clientID, "tenant", string(id), "node", notice.Node)
 
+	// mochi reports the disconnect from the client's own goroutine, which
+	// may run before or after forget below drops the tenant. Released here
+	// as well, the gauge comes down exactly once either way; left to mochi
+	// alone, it climbed by one on most cross-node takeovers.
+	h.onDisconnected(cl)
+
 	if err := h.server.DisconnectClient(cl, packets.ErrSessionTakenOver); err != nil {
 		h.log.Warn("disconnecting a taken-over client", "client", mounted, "error", err)
 	}
@@ -196,6 +202,20 @@ func (h *Hook) onSessionNotice(msg *nats.Msg) {
 	// Ownership has moved, so release everything this node held for it
 	// rather than waiting for a session expiry that may never come.
 	h.forget(mounted)
+
+	// And empty mochi's copy of the session, which it keeps for a
+	// persistent client until expiry. Left alone, a device that went to
+	// another node and came back here would inherit it: subscriptions that
+	// no longer have NATS interest behind them, so it received nothing, and
+	// an inflight backlog the other node may already have delivered.
+	// Emptied, the device arrives here as a stranger and the session is
+	// restored from the bucket like on any other node.
+	//
+	// After forget, deliberately: UnsubscribeClient calls OnUnsubscribed,
+	// which would otherwise persist the now-empty subscription list over
+	// the session the new owner is relying on.
+	h.server.UnsubscribeClient(cl)
+	cl.ClearInflights()
 }
 
 // parseSessionSubject reverses [sessionSubject].

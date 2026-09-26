@@ -147,9 +147,12 @@ func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string) 
 		return
 	}
 
+	// To this client alone. Publishing the backlog into the node instead
+	// handed it to every local subscriber of the same topics, who had
+	// already had it live, and re-queued it for every absent one.
 	for _, msg := range queued {
-		if err := h.server.Publish(mount(id, msg.Topic), msg.Payload, false, msg.QoS); err != nil {
-			h.log.Error("delivering a queued message", "client", cl.ID, "error", err)
+		if err := h.deliverTo(cl, mount(id, msg.Topic), msg.Payload, msg.QoS, false); err != nil {
+			h.log.Warn("delivering a queued message", "client", cl.ID, "topic", msg.Topic, "error", err)
 		}
 	}
 
@@ -159,6 +162,20 @@ func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string) 
 		})
 		h.log.Info("offline queue delivered",
 			"client", bareClientID, "tenant", string(id), "messages", len(queued))
+	}
+}
+
+// discardOffline empties a client's queue without delivering it.
+func (h *Hook) discardOffline(id tenant.ID, bareClientID string) {
+	if h.store == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+
+	if _, err := h.store.Drain(ctx, sessionKey(id, bareClientID)); err != nil {
+		h.log.Warn("discarding offline queue", "tenant", string(id), "client", bareClientID, "error", err)
 	}
 }
 

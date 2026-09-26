@@ -364,3 +364,182 @@ func TestClusterSessionMovesBetweenNodes(t *testing.T) {
 		t.Errorf("the session did not follow the device to the other node; got %v", second.messages())
 	}
 }
+
+// TestClusterSessionReturnsToItsFirstNode covers a device that goes to
+// another node and comes back, which a load balancer does routinely.
+//
+// Taking a session over released this node's NATS subscriptions but left
+// mochi's copy of the session in place. The device coming back inherited it:
+// subscriptions with no NATS interest behind them, so it received nothing,
+// and it looked like a local session, so nothing restored it from the
+// bucket either.
+func TestClusterSessionReturnsToItsFirstNode(t *testing.T) {
+	c := startCluster(t)
+
+	first := persistent(t, c.addrs[0], "boomerang", "acme")
+	first.subscribeQoS(t, "fleet/boomerang/cmd", 1)
+	c.awaitInterest(t, first, "acme")
+	first.client.Disconnect(100)
+
+	away := persistent(t, c.addrs[1], "boomerang", "acme")
+
+	// The claim has to reach the first node before the device goes back,
+	// or it is the return that the first node sees taken over.
+	if !awaitMetric(t, c.obs[1], `mast_connections_open{tenant="acme"} `, 1) {
+		t.Fatal("the device never connected to the second node")
+	}
+
+	time.Sleep(time.Second)
+	away.client.Disconnect(100)
+
+	back := persistent(t, c.addrs[0], "boomerang", "acme")
+	pub := connect(t, c.addrs[1], "dispatcher", "acme")
+
+	delivered := waitForLeaf(func() bool {
+		pub.publish(t, "fleet/boomerang/cmd", "home")
+
+		return slices.Contains(back.messages(), "fleet/boomerang/cmd=home")
+	})
+	if !delivered {
+		t.Errorf("the device back on its first node receives nothing; got %v", back.messages())
+	}
+}
+
+// TestClusterLocalResumeClearsTheQueue covers a message that was queued for
+// an absent device and then delivered by mochi on the same node.
+//
+// OnQosPublish writes the message to the bucket at the moment mochi puts it
+// in the session's inflight. A device resuming on the same node gets it from
+// the inflight, and the bucket copy used to stay behind, so the next time
+// the device came up on another node it received the message again.
+func TestClusterLocalResumeClearsTheQueue(t *testing.T) {
+	c := startCluster(t)
+
+	// Its own tenant, so the counters read below are this test's alone.
+	const tenantName = "globex"
+
+	first := persistent(t, c.addrs[0], "homebody", tenantName)
+	first.subscribeQoS(t, "fleet/homebody/cmd", 1)
+	c.awaitInterest(t, first, tenantName)
+	first.client.Disconnect(100)
+
+	pub := connect(t, c.addrs[1], "dispatcher", tenantName)
+
+	sent := []string{"one", "two"}
+	for _, payload := range sent {
+		tok := pub.client.Publish("fleet/homebody/cmd", 1, false, payload)
+		if !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
+			t.Fatalf("publishing while the session was away: %v", tok.Error())
+		}
+	}
+
+	if !awaitMetric(t, c.obs[0], `mast_offline_queued_total{tenant="`+tenantName+`"} `, float64(len(sent))) {
+		t.Fatal("the messages were not queued for the absent session")
+	}
+
+	again := persistent(t, c.addrs[0], "homebody", tenantName)
+
+	received := waitForLeaf(func() bool {
+		got := again.messages()
+
+		return slices.Contains(got, "fleet/homebody/cmd=one") && slices.Contains(got, "fleet/homebody/cmd=two")
+	})
+	if !received {
+		t.Fatalf("resuming on the same node did not deliver the backlog; got %v", again.messages())
+	}
+
+	again.client.Disconnect(100)
+
+	elsewhere := persistent(t, c.addrs[1], "homebody", tenantName)
+
+	// Long enough for a drain to have happened, if there were anything left
+	// to drain.
+	time.Sleep(settle)
+
+	if got := elsewhere.messages(); len(got) != 0 {
+		t.Errorf("messages already delivered were replayed on the other node: %v", got)
+	}
+}
+
+// TestClusterDrainReachesOnlyTheReturningClient covers the offline backlog
+// being replayed to everybody on the node.
+//
+// The drain published each queued message into the node, which handed it
+// to every local subscriber of the topic — clients that had already had it
+// live — and re-queued it for every absent one.
+func TestClusterDrainReachesOnlyTheReturningClient(t *testing.T) {
+	c := startCluster(t)
+
+	device := persistent(t, c.addrs[0], "traveller", "acme")
+	device.subscribeQoS(t, "fleet/traveller/cmd", 1)
+	c.awaitInterest(t, device, "acme")
+
+	// On the node the device will come back to.
+	monitor := connect(t, c.addrs[1], "monitor", "acme")
+	monitor.subscribe(t, "fleet/#")
+
+	device.client.Disconnect(100)
+
+	pub := connect(t, c.addrs[1], "dispatcher", "acme")
+
+	tok := pub.client.Publish("fleet/traveller/cmd", 1, false, "go")
+	if !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
+		t.Fatalf("publishing while the session was away: %v", tok.Error())
+	}
+
+	if !awaitMetric(t, c.obs[0], `mast_offline_queued_total{tenant="acme"} `, 1) {
+		t.Fatal("nothing was queued for the absent session")
+	}
+
+	back := persistent(t, c.addrs[1], "traveller", "acme")
+	if !waitForLeaf(func() bool { return slices.Contains(back.messages(), "fleet/traveller/cmd=go") }) {
+		t.Fatalf("the backlog did not follow the device; got %v", back.messages())
+	}
+
+	time.Sleep(settle)
+
+	seen := 0
+
+	for _, m := range monitor.messages() {
+		if m == "fleet/traveller/cmd=go" {
+			seen++
+		}
+	}
+
+	if seen != 1 {
+		t.Errorf("the monitor received the message %d times, want 1 (live only): %v", seen, monitor.messages())
+	}
+}
+
+// TestClusterTakeoverKeepsTheGaugeHonest checks the open-connections gauge on
+// the node that loses a live client to another.
+//
+// mochi reports that disconnect from the client's goroutine after the
+// takeover has already forgotten the client's tenant, so the gauge on the
+// losing node used to stay one too high for every takeover.
+func TestClusterTakeoverKeepsTheGaugeHonest(t *testing.T) {
+	c := startCluster(t)
+
+	const sample = `mast_connections_open{tenant="acme"} `
+
+	first := connect(t, c.addrs[0], "rover", "acme")
+	first.subscribe(t, "fleet/rover")
+	c.awaitInterest(t, first, "acme")
+
+	// awaitInterest's own probe publisher lives on the other node and has
+	// gone by now; only the rover is left here.
+	if !awaitMetric(t, c.obs[0], sample, 1) {
+		t.Fatalf("the gauge never counted the first connection")
+	}
+
+	connect(t, c.addrs[1], "rover", "acme")
+
+	if !waitForLeaf(func() bool { return !first.client.IsConnected() }) {
+		t.Fatal("the second connection did not displace the first")
+	}
+
+	settled := waitForLeaf(func() bool { return readMetric(t, c.obs[0], sample) == 0 })
+	if !settled {
+		t.Errorf("the losing node still counts %v open connections, want 0", readMetric(t, c.obs[0], sample))
+	}
+}
