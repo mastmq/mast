@@ -5,10 +5,15 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
 
+	"github.com/knadh/koanf/parsers/toml/v2"
+	kfile "github.com/knadh/koanf/providers/file"
+	"github.com/knadh/koanf/providers/structs"
+	"github.com/knadh/koanf/v2"
 	"github.com/mastmq/mast/internal/infra/config"
 )
 
@@ -153,6 +158,30 @@ func TestValidate(t *testing.T) {
 			func(c *config.Config) { c.Auth.Mode = config.AuthHTTP },
 			config.ErrNoAuthnURL,
 		},
+		{
+			"http auth without a timeout",
+			func(c *config.Config) {
+				c.Auth.Mode = config.AuthHTTP
+				c.Auth.HTTP.AuthnURL = "http://policy"
+				c.Auth.HTTP.Timeout = 0
+			},
+			config.ErrBadAuthTimeout,
+		},
+		{
+			"jwt with an authz url and a negative timeout",
+			func(c *config.Config) {
+				c.Auth.Mode = config.AuthJWT
+				c.Auth.JWT.Algorithms = []string{"HS256"}
+				c.Auth.HTTP.AuthzURL = "http://policy"
+				c.Auth.HTTP.Timeout = -time.Second
+			},
+			config.ErrBadAuthTimeout,
+		},
+		{
+			"static auth ignores the http timeout",
+			func(c *config.Config) { c.Auth.HTTP.Timeout = 0 },
+			nil,
+		},
 	}
 
 	for _, tc := range cases {
@@ -176,5 +205,63 @@ func TestMissingConfigFileIsAnError(t *testing.T) {
 	// on; silently running with defaults would be worse.
 	if _, err := config.Load(filepath.Join(t.TempDir(), "absent.toml")); err == nil {
 		t.Error("Load accepted a config path that does not exist")
+	}
+}
+
+// TestExampleIsExhaustiveDefaults holds configs/config.example.toml to the
+// two promises its header makes. It must set every key the broker reads, or
+// the file stops being the place to discover a setting; and every value must
+// be the built-in default, so an empty file and this one behave the same.
+// Both drifted once already, silently, because nothing loaded the file.
+func TestExampleIsExhaustiveDefaults(t *testing.T) {
+	t.Parallel()
+
+	const example = "../../../configs/config.example.toml"
+
+	file := koanf.New(".")
+	if err := file.Load(kfile.Provider(example), toml.Parser()); err != nil {
+		t.Fatalf("parsing %s: %v", example, err)
+	}
+
+	defaults := koanf.New(".")
+	if err := defaults.Load(structs.Provider(config.Default(), "koanf"), nil); err != nil {
+		t.Fatalf("loading defaults: %v", err)
+	}
+
+	for _, key := range defaults.Keys() {
+		// Headers are a map of arbitrary names with nothing to default, so
+		// the example can only show one commented out.
+		if key == "auth.http.headers" {
+			continue
+		}
+
+		if !file.Exists(key) {
+			t.Errorf("%s does not set %s", example, key)
+		}
+	}
+
+	for _, key := range file.Keys() {
+		if !defaults.Exists(key) {
+			t.Errorf("%s sets %s, which the broker does not read", example, key)
+		}
+	}
+
+	cfg, err := config.Load(example)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	want := config.Default()
+
+	// An empty TOML list decodes as an empty slice where the default is nil.
+	// Both mean "none", so only the difference that matters is compared.
+	for _, list := range []*[]string{&cfg.Core.Routes, &cfg.Edge.CoreURLs, &cfg.Auth.JWT.Algorithms} {
+		if len(*list) == 0 {
+			*list = nil
+		}
+	}
+
+	if !reflect.DeepEqual(cfg, want) {
+		t.Errorf("%s differs from the built-in defaults:\n got %+v\nwant %+v", example, cfg, want)
 	}
 }

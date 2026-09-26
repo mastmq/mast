@@ -2,8 +2,8 @@
 # file behaves exactly like no file at all.
 #
 # Environment variables override the file. Nesting uses a double underscore:
-# MAST__MQTT__ADDR=":8883" sets mqtt.addr. List settings — core.routes and
-# edge.core_urls — are comma-separated:
+# MAST__MQTT__ADDR=":8883" sets mqtt.addr. List settings — core.routes,
+# edge.core_urls and auth.jwt.algorithms — are comma-separated:
 # MAST__EDGE__CORE_URLS="nats-leaf://a:7422,nats-leaf://b:7422"
 
 # all-in-one runs both jobs in one process with no cluster, which is the right
@@ -20,6 +20,11 @@ addr = ":1883"
 ws_addr = ""
 tls_cert = ""
 tls_key = ""
+# A second listener that skips authentication and authorization entirely,
+# for trusted in-cluster services. Empty disables it, and it should stay
+# that way unless nothing outside the cluster can reach the address:
+# whatever connects here is trusted completely.
+internal_addr = ""
 # The main driver of memory at high connection counts. Budget this times the
 # connections you expect per process, not times the whole fleet.
 max_writes_pending = 1024
@@ -55,9 +60,16 @@ default = "default"
 # static: one tenant, everything allowed. Appropriate only where the
 #         deployment itself is the security boundary.
 # http:   ask an HTTP service, posting the MQTT fields as JSON.
+# jwt:    verify a signed token locally. Nothing goes on the network during
+#         a reconnect storm; revocation is only as fast as token expiry.
 mode = "static"
 
 [auth.http]
+# "mast", below, lets the service name the tenant. "emqx" speaks EMQX v5's
+# http backend shape so a service written for EMQX works unchanged; EMQX has
+# no tenant field, so tenant.default applies. See config.emqx-compat.toml.
+wire = "mast"
+
 # Posted on CONNECT:
 #   {"client_id":"..","username":"..","password":"..","remote_addr":"..",
 #    "protocol_version":5,"clean_start":true}
@@ -92,6 +104,40 @@ cache_size = 100000
 
 # [auth.http.headers]
 # Authorization = "Bearer ..."
+
+# Read only in jwt mode. See config.jwt.toml for a worked setup; with
+# auth.http.authz_url set alongside, topic decisions still go to a policy
+# service, because a signature says who a connection is and not what it may
+# do.
+[auth.jwt]
+# The CONNECT field carrying the token. "username" because many clients log
+# passwords and none log usernames.
+source = "username"
+# Discard everything up to the first colon, for "<vendor>:<token>".
+vendor_prefix = false
+# Required in jwt mode, and there is deliberately no default: accepting
+# whatever algorithm a token asks for is how "alg":"none" and RSA-to-HMAC
+# confusion attacks work.
+algorithms = []
+# Exactly one key source in jwt mode. Prefer a file: a secret in a config
+# file tends to end up in version control.
+hmac_secret = ""
+hmac_secret_file = ""
+public_key_file = ""
+# The claim naming the tenant. Empty, or a token without the claim, falls
+# back to tenant.default.
+tenant_claim = ""
+# A boolean claim that bypasses authorization, as EMQX's is_superuser does.
+superuser_claim = ""
+# Checked against the token when set.
+issuer = ""
+audience = ""
+
+[session]
+# How long a disconnected session and its queued QoS 1/2 messages survive.
+# Long enough for a device on a bad link or a rolling deploy, short enough
+# that decommissioned hardware releases its storage.
+expiry = "24h"
 
 [obs]
 addr = "127.0.0.1:9090"  # /metrics and net/http/pprof
