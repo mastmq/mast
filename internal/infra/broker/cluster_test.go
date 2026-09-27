@@ -543,3 +543,42 @@ func TestClusterTakeoverKeepsTheGaugeHonest(t *testing.T) {
 		t.Errorf("the losing node still counts %v open connections, want 0", readMetric(t, c.obs[0], sample))
 	}
 }
+
+// TestCoreServesObservability covers the core role's health, metrics and
+// pprof endpoint.
+//
+// Start returned for a core before it reached obs.Serve, so a core node —
+// the one holding Raft and every bucket — had no /metrics, no /healthz and
+// no pprof, while the chart declared a metrics port for it. Nobody noticed
+// because the core's probes use the NATS monitor, and it took a profiler
+// that could not reach the core during a reconnect storm to find it.
+func TestCoreServesObservability(t *testing.T) {
+	c := startCluster(t)
+
+	addr := c.core.ObsAddr()
+	if addr == "" {
+		t.Fatal("the core serves no observability endpoint")
+	}
+
+	for _, path := range []string{"/healthz", "/metrics"} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s on the core: %v", path, err)
+		}
+
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s on the core: %d", path, resp.StatusCode)
+		}
+	}
+
+	if readMetric(t, addr, "go_goroutines ") == 0 {
+		t.Error("the core's /metrics carries no runtime metrics")
+	}
+}

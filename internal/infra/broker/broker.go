@@ -76,6 +76,21 @@ func Start(
 
 	b := &Broker{nats: nats, hook: nil, server: nil, store: nil, obs: nil, log: log}
 
+	// The subscription gauge reads through the hook, so the registry is
+	// built before it and handed the accessor.
+	registry := newRegistry()
+	metrics := obs.NewMetrics(registry, sources(b, nats))
+
+	// Before the role check, because every role needs it. It used to come
+	// after, so a core — the node holding Raft and every bucket — served no
+	// metrics, no health and no pprof at all.
+	b.obs, err = obs.Serve(ctx, cfg.Obs.Addr, registry, log)
+	if err != nil {
+		nats.Shutdown()
+
+		return nil, err
+	}
+
 	// A core node carries storage and consensus and terminates no MQTT.
 	if cfg.Role == config.RoleCore {
 		return b, nil
@@ -94,11 +109,6 @@ func Start(
 		return nil, err
 	}
 
-	// The subscription gauge reads through the hook, so the registry is
-	// built before it and handed the accessor.
-	registry := newRegistry()
-	metrics := obs.NewMetrics(registry, sources(b, nats))
-
 	b.hook = bridge.New(nats.Conn(), b.store, resolver, policy, bridge.Options{
 		Metrics:          metrics,
 		InternalListener: mqttd.InternalListenerID,
@@ -109,13 +119,6 @@ func Start(
 		NodeID:        nats.ID(),
 		SessionExpiry: cfg.Session.Expiry,
 	}, log)
-
-	b.obs, err = obs.Serve(ctx, cfg.Obs.Addr, registry, log)
-	if err != nil {
-		nats.Shutdown()
-
-		return nil, err
-	}
 
 	b.server, err = mqttd.New(cfg, b.hook, log)
 	if err != nil {
