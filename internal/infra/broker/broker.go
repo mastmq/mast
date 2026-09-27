@@ -8,6 +8,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -20,6 +21,8 @@ import (
 	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mastmq/mochi/v2"
+	natsgo "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
@@ -152,7 +155,36 @@ func openStore(ctx context.Context, cfg config.Config, nats *natsd.Server) (*sto
 		}
 	}
 
-	return store.Open(ctx, nats.Conn(), natsd.JetStreamDomain, cfg.Core.Replicas, cfg.Session.Expiry)
+	// A leaf connection counts as up before the core's JetStream API is
+	// reachable through it — the interest that routes $JS.<domain>.API to
+	// the core arrives after the connection does — and a core may still be
+	// bringing JetStream up. Either way the answer is "jetstream not
+	// enabled" or no responder at all, and both mean "not yet", not "never".
+	// Refusing to start on them made an edge fail under a loaded CI runner
+	// and would crash-loop one through every core restart. A core that
+	// really has no JetStream still fails, once ctx runs out.
+	const retry = 250 * time.Millisecond
+
+	for {
+		st, err := store.Open(ctx, nats.Conn(), natsd.JetStreamDomain, cfg.Core.Replicas, cfg.Session.Expiry)
+		if err == nil || !notReadyYet(err) {
+			return st, err
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(retry):
+		}
+	}
+}
+
+// notReadyYet reports whether a store error means JetStream is not
+// reachable yet, rather than that something is wrong with the request.
+func notReadyYet(err error) bool {
+	return errors.Is(err, jetstream.ErrJetStreamNotEnabled) ||
+		errors.Is(err, jetstream.ErrJetStreamNotEnabledForAccount) ||
+		errors.Is(err, natsgo.ErrNoResponders)
 }
 
 // newRegistry is a Prometheus registry with the runtime collectors that

@@ -582,3 +582,63 @@ func TestCoreServesObservability(t *testing.T) {
 		t.Error("the core's /metrics carries no runtime metrics")
 	}
 }
+
+// TestEdgeStartsBeforeItsCore covers pods starting in any order, which is
+// what Kubernetes does.
+//
+// An edge waited only until its leaf connection existed and then opened
+// the store at once. A core that had accepted the leaf but not finished
+// bringing JetStream up answered "jetstream not enabled", and the edge
+// refused to start — found as a CI failure under load, and in a cluster it
+// is an edge crash-looping through every core restart.
+func TestEdgeStartsBeforeItsCore(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	leafAddr := freeAddr(t)
+
+	edgeCfg := config.Default()
+	edgeCfg.Role = config.RoleEdge
+	edgeCfg.NATS.Name = "early-edge"
+	edgeCfg.NATS.MonitorAddr = ""
+	edgeCfg.Obs.Addr = anyPort
+	edgeCfg.MQTT.Addr = freeAddr(t)
+	edgeCfg.Edge.CoreURLs = []string{"nats-leaf://" + leafAddr}
+
+	type started struct {
+		node *broker.Broker
+		err  error
+	}
+
+	edgeUp := make(chan started, 1)
+
+	go func() {
+		node, err := broker.Start(t.Context(), edgeCfg, byUsername{}, tenant.AllowAll{}, log)
+		edgeUp <- started{node: node, err: err}
+	}()
+
+	// Long enough that the edge is certainly waiting on a core that is not
+	// there, and has retried its leaf connection at least once.
+	time.Sleep(2 * time.Second)
+
+	coreCfg := config.Default()
+	coreCfg.Role = config.RoleCore
+	coreCfg.NATS.Name = "late-core"
+	coreCfg.NATS.MonitorAddr = ""
+	coreCfg.Obs.Addr = anyPort
+	coreCfg.Core.StoreDir = t.TempDir()
+	coreCfg.Core.LeafAddr = leafAddr
+	coreCfg.MQTT.Addr = ""
+
+	core, err := broker.Start(t.Context(), coreCfg, byUsername{}, tenant.AllowAll{}, log)
+	if err != nil {
+		t.Fatalf("starting core: %v", err)
+	}
+
+	got := <-edgeUp
+	if got.err != nil {
+		core.Close()
+		t.Fatalf("an edge started before its core never came up: %v", got.err)
+	}
+
+	got.node.Close()
+	core.Close()
+}
