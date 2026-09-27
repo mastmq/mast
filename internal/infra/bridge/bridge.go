@@ -403,6 +403,10 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		msg.Header.Set(headerRetain, "1")
 	}
 
+	if err := setPropsHeader(msg, messageProps(pk.Properties)); err != nil {
+		h.log.Warn("forwarding publish without its properties", "subject", subject, "error", err)
+	}
+
 	if err := h.nc.PublishMsg(msg); err != nil {
 		h.log.Error("forwarding publish to nats", "subject", subject, "error", err)
 	}
@@ -506,10 +510,15 @@ func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 		return will, nil
 	}
 
+	// mochi's Will keeps only the user properties of the will's own
+	// property set, so those are all there is to carry.
+	props := packets.Properties{User: will.User}
+
 	if will.Retain {
 		h.storeRetained(subject, will.TopicName, packets.Packet{
 			FixedHeader: packets.FixedHeader{Qos: will.Qos, Retain: true},
 			Payload:     will.Payload,
+			Properties:  props,
 		})
 	}
 
@@ -517,6 +526,10 @@ func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 	msg.Data = will.Payload
 	msg.Header.Set(headerQoS, strconv.Itoa(int(will.Qos)))
 	msg.Header.Set(headerID, nuid.Next())
+
+	if err := setPropsHeader(msg, messageProps(props)); err != nil {
+		h.log.Warn("forwarding will without its properties", "subject", subject, "error", err)
+	}
 
 	if err := h.nc.PublishMsg(msg); err != nil {
 		h.log.Error("forwarding will to nats", "subject", subject, "error", err)
@@ -692,6 +705,20 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 	// subscriber that was already present, which MQTT says gets retain=0.
 	qos := qosOf(msg)
 
+	// ServerReference is only valid on CONNACK and DISCONNECT, so mochi
+	// never encodes it on a PUBLISH. That makes it the one field that can
+	// carry the route from here to OnSelectSubscribers without any chance
+	// of reaching a client.
+	props := packets.Properties{ServerReference: route}
+
+	if carried := propsFromHeader(msg); carried != nil {
+		applyProps(&props, carried)
+		// Unlike a stored message, a live one is injected moments after it
+		// was published, so the publisher's interval is still the right
+		// one and mochi counts it from here.
+		props.MessageExpiryInterval = carried.MessageExpiry
+	}
+
 	err = h.server.InjectPacket(h.injector, packets.Packet{
 		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: qos},
 		TopicName:   mounted,
@@ -699,12 +726,8 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 		// mochi's own Publish does the same: an inline publish is never
 		// acknowledged, but a QoS 1 or 2 packet still needs an id to be
 		// valid.
-		PacketID: uint16(qos),
-		// ServerReference is only valid on CONNACK and DISCONNECT, so mochi
-		// never encodes it on a PUBLISH. That makes it the one field that
-		// can carry the route from here to OnSelectSubscribers without any
-		// chance of reaching a client.
-		Properties: packets.Properties{ServerReference: route},
+		PacketID:   uint16(qos),
+		Properties: props,
 	})
 	if err != nil {
 		h.log.Error("injecting message from nats", "subject", msg.Subject, "error", err)
@@ -857,10 +880,12 @@ func (h *Hook) storeRetained(subject, bareTopic string, pk packets.Packet) {
 	defer cancel()
 
 	err := h.store.PutRetained(ctx, subject, store.Message{
-		Topic:   bareTopic,
-		Payload: pk.Payload,
-		QoS:     pk.FixedHeader.Qos,
-		Retain:  true,
+		Topic:      bareTopic,
+		Payload:    pk.Payload,
+		QoS:        pk.FixedHeader.Qos,
+		Retain:     true,
+		Properties: messageProps(pk.Properties),
+		StoredAt:   0, // PutRetained stamps it
 	})
 	if err != nil {
 		h.log.Error("storing retained message", "subject", subject, "error", err)
@@ -940,7 +965,7 @@ func (h *Hook) writeRetained(
 	filter packets.Subscription,
 	msg store.Message,
 ) error {
-	return h.deliverTo(cl, mount(id, msg.Topic), msg.Payload, min(msg.QoS, filter.Qos), true)
+	return h.deliverTo(cl, mount(id, msg.Topic), msg, min(msg.QoS, filter.Qos), true)
 }
 
 // deliverTo sends one message to one client and nobody else.
@@ -951,7 +976,13 @@ func (h *Hook) writeRetained(
 // on its way out and a replay must not skip, and the inflight entry, without
 // which a QoS 1 message lost to a dropped connection is simply gone — and for
 // a drained queue it is gone from the bucket too.
-func (h *Hook) deliverTo(cl *mqtt.Client, mountedTopic string, payload []byte, qos byte, retain bool) error {
+func (h *Hook) deliverTo(cl *mqtt.Client, mountedTopic string, msg store.Message, qos byte, retain bool) error {
+	// The store already drops what it finds expired; this catches a message
+	// that expired between being read and being sent.
+	if msg.Expired(time.Now()) {
+		return nil
+	}
+
 	if !h.OnACLCheck(cl, mountedTopic, false) {
 		return packets.ErrNotAuthorized
 	}
@@ -963,9 +994,12 @@ func (h *Hook) deliverTo(cl *mqtt.Client, mountedTopic string, payload []byte, q
 			Retain: retain,
 		},
 		TopicName: mountedTopic,
-		Payload:   payload,
+		Payload:   msg.Payload,
 		Created:   time.Now().Unix(),
 	}
+
+	applyProps(&out.Properties, msg.Properties)
+	setExpiry(&out, msg)
 
 	if out.FixedHeader.Qos > 0 {
 		if cl.State.Inflight.Len() >= int(h.server.Options.Capabilities.MaximumInflight) {
@@ -992,6 +1026,19 @@ func (h *Hook) deliverTo(cl *mqtt.Client, mountedTopic string, payload []byte, q
 	}
 
 	return nil
+}
+
+// setExpiry dates a stored message from when it was published, not from
+// now, so a subscriber is told how long it has left. mochi turns the
+// absolute Expiry into the interval it sends, and drops an expired inflight
+// entry instead of resending it.
+func setExpiry(out *packets.Packet, msg store.Message) {
+	if msg.Properties == nil || msg.Properties.MessageExpiry == 0 || msg.StoredAt == 0 {
+		return
+	}
+
+	out.Created = msg.StoredAt
+	out.Expiry = msg.StoredAt + int64(msg.Properties.MessageExpiry)
 }
 
 // forget drops every trace of a client: its NATS subscriptions and the

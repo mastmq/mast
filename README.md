@@ -28,6 +28,7 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 - One NATS subscription per distinct filter rather than per device, released when the last subscriber disconnects
 - **Cross-node delivery** — edges join the core as leaf nodes, and a message published on one edge reaches a subscriber on another, with tenant isolation holding across the boundary. The fabric hop is core NATS and therefore at-most-once, so a publisher is acknowledged before the message has crossed it: cross-node QoS 1 and 2 are best-effort, and [delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md) sets out exactly what each QoS promises and where
 
+- **MQTT 5 message properties** — content type, response topic, correlation data, payload format, user properties and message expiry travel with the message across the fabric and through retained messages and offline queues, so MQTT 5 request/response works between nodes. An expired retained or queued message is not delivered
 - **HTTP authentication and authorization** — post the MQTT fields to your own service and let it name the tenant and rule on each topic
 - **Portable sessions** — subscriptions and the offline queue live in the shared key-value buckets, so a device that reconnects to a different node finds its session and whatever QoS 1 or 2 traffic it missed. Verified by a two-node test, not by hand
 - **Cross-node takeover** — a second connection with an existing client id disconnects the first wherever in the cluster it is, which MQTT requires and a single node cannot do alone. Client ids are scoped to their tenant, so one tenant cannot displace another's device by reusing an id
@@ -54,7 +55,7 @@ mast is the combination that does not currently exist off the shelf: MQTT 5 with
 
 You do not need the split until you are big. Up to roughly ten nodes, run every process identical and let them mesh.
 
-**The topic codec is reversible.** `internal/domain/topic` maps MQTT topics onto NATS subjects of the form `t.<tenant>.<level>.<level>...`, percent-escaping anything NATS reserves and writing an empty level as `%`. Every legal MQTT topic round-trips byte-identical, which is the property that makes the mapping safe to bake into stored subjects, authorization rules, and retained-message keys. This is why mast does not reuse the mapping nats-server applies to its own MQTT listener: that one turns a `.` into `//` and gives a leading `/` an empty token, and it is not reversible. A fuzz test guards the round-trip property and runs in CI.
+**The topic codec is reversible.** `internal/domain/topic` maps MQTT topics onto NATS subjects of the form `t.<tenant>.<level>.<level>...`, escaping everything outside `[A-Za-z0-9_-]` as `=` plus two hex digits and writing an empty level as a bare `=`. The escape is `=` rather than `%` because a subject is also used as a JetStream KV key, and a KV key may not contain `%`. Every legal MQTT topic round-trips byte-identical, which is the property that makes the mapping safe to bake into stored subjects, authorization rules, and retained-message keys. This is why mast does not reuse the mapping nats-server applies to its own MQTT listener: that one turns a `.` into `//` and gives a leading `/` an empty token, and it is not reversible. A fuzz test guards the round-trip property and runs in CI.
 
 ## Quick start
 

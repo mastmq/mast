@@ -4,6 +4,7 @@ go 1.27
 
 require (
 	github.com/carlmjohnson/versioninfo v0.22.5
+	github.com/eclipse/paho.golang v0.23.0
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/knadh/koanf/parsers/toml/v2 v2.2.2
@@ -11,7 +12,7 @@ require (
 	github.com/knadh/koanf/providers/file v1.2.1
 	github.com/knadh/koanf/providers/structs v1.0.1
 	github.com/knadh/koanf/v2 v2.3.6
-	github.com/mastmq/mochi/v2 v2.7.12
+	github.com/mastmq/mochi/v2 v2.7.13
 	github.com/nats-io/nats-server/v2 v2.15.0
 	github.com/nats-io/nats.go v1.54.0
 	github.com/nats-io/nuid v1.0.1

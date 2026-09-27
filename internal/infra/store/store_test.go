@@ -225,3 +225,89 @@ func TestOfflineQueueIsBounded(t *testing.T) {
 		t.Errorf("newest message is %d, want %d — the wrong end was dropped", last, byte(sent-1))
 	}
 }
+
+func TestMessageExpiry(t *testing.T) {
+	t.Parallel()
+
+	stored := time.Unix(1_000, 0)
+	msg := store.Message{
+		Topic: "flash/sale", Payload: []byte("now"), QoS: 1, Retain: true,
+		Properties: &store.Properties{MessageExpiry: 10},
+		StoredAt:   stored.Unix(),
+	}
+
+	if msg.Expired(stored.Add(9 * time.Second)) {
+		t.Error("expired a second before its interval was up")
+	}
+
+	if !msg.Expired(stored.Add(10 * time.Second)) {
+		t.Error("still live once its interval was up")
+	}
+
+	// An entry written before StoredAt existed has no clock to count from.
+	// Guessing would either expire everything at once or nothing ever; not
+	// expiring is the one that loses no data.
+	legacy := msg
+	legacy.StoredAt = 0
+
+	if legacy.Expired(stored.Add(time.Hour)) {
+		t.Error("a message with no stored time was expired")
+	}
+}
+
+// TestRetainedReadsOldEntries guards the upgrade: buckets already hold
+// entries written before properties and a stored time existed, and those
+// must still be served rather than skipped or failed.
+func TestRetainedReadsOldEntries(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := open(t)
+
+	if err := s.PutRetained(ctx, "t.acme.old", store.Message{
+		Topic: "old", Payload: []byte("v1"), QoS: 1, Retain: true, Properties: nil, StoredAt: 0,
+	}); err != nil {
+		t.Fatalf("PutRetained: %v", err)
+	}
+
+	got, err := s.MatchRetained(ctx, []string{"t.acme.old"})
+	if err != nil {
+		t.Fatalf("MatchRetained: %v", err)
+	}
+
+	if len(got) != 1 || got[0].Properties != nil || got[0].StoredAt == 0 {
+		t.Errorf("got %+v, want one message with no properties and a stored time", got)
+	}
+}
+
+// TestExpiredRetainedIsNotReturned checks that an expired retained message
+// stays gone across repeated reads. The first read also deletes it, but the
+// store's API cannot tell a deleted key from a skipped one, so that part is
+// not asserted here.
+func TestExpiredRetainedIsNotReturned(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := open(t)
+
+	if err := s.PutRetained(ctx, "t.acme.flash", store.Message{
+		Topic: "flash", Payload: []byte("now"), QoS: 1, Retain: true,
+		Properties: &store.Properties{MessageExpiry: 1},
+		StoredAt:   0,
+	}); err != nil {
+		t.Fatalf("PutRetained: %v", err)
+	}
+
+	time.Sleep(2100 * time.Millisecond)
+
+	for range 2 {
+		got, err := s.MatchRetained(ctx, []string{"t.acme.flash"})
+		if err != nil {
+			t.Fatalf("MatchRetained: %v", err)
+		}
+
+		if len(got) != 0 {
+			t.Fatalf("an expired retained message was returned: %+v", got)
+		}
+	}
+}

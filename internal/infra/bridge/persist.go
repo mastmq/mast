@@ -151,7 +151,7 @@ func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string) 
 	// handed it to every local subscriber of the same topics, who had
 	// already had it live, and re-queued it for every absent one.
 	for _, msg := range queued {
-		if err := h.deliverTo(cl, mount(id, msg.Topic), msg.Payload, msg.QoS, false); err != nil {
+		if err := h.deliverTo(cl, mount(id, msg.Topic), msg, msg.QoS, false); err != nil {
 			h.log.Warn("delivering a queued message", "client", cl.ID, "topic", msg.Topic, "error", err)
 		}
 	}
@@ -205,11 +205,24 @@ func (h *Hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) 
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
 
+	// mochi blanks the topic of a packet it has an outbound alias for,
+	// which it assigns even to a client that has gone away. The alias means
+	// nothing to the connection the message will be replayed on, and a
+	// PUBLISH with neither is a protocol error, so there is nothing sound
+	// to store.
+	if pk.TopicName == "" {
+		h.log.Warn("not queueing a message sent by topic alias", "client", cl.ID)
+
+		return
+	}
+
 	msg := store.Message{
-		Topic:   unmount(id, pk.TopicName),
-		Payload: pk.Payload,
-		QoS:     pk.FixedHeader.Qos,
-		Retain:  false,
+		Topic:      unmount(id, pk.TopicName),
+		Payload:    pk.Payload,
+		QoS:        pk.FixedHeader.Qos,
+		Retain:     false,
+		Properties: messageProps(pk.Properties),
+		StoredAt:   0, // Enqueue stamps it
 	}
 
 	key := sessionKey(id, unmountClient(id, cl.ID))

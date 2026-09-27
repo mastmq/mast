@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -54,6 +55,53 @@ type Message struct {
 	Payload []byte `json:"payload"`
 	QoS     byte   `json:"qos"`
 	Retain  bool   `json:"retain,omitempty"`
+
+	// Properties are the MQTT 5 properties the publisher set, nil for a
+	// message that had none — which is every MQTT 3 message, so the entries
+	// written before this field existed read back unchanged.
+	Properties *Properties `json:"props,omitempty"`
+
+	// StoredAt is when the message was written, in Unix seconds. A message
+	// expiry interval counts from publication, so without it a retained or
+	// queued message could never be known to have expired.
+	StoredAt int64 `json:"at,omitempty"`
+}
+
+// Properties are the MQTT 5 PUBLISH properties that belong to the message
+// rather than to one hop of it.
+//
+// Topic alias and subscription identifier are left out on purpose: both are
+// negotiated per connection, and carrying one to a different client would
+// be wrong rather than merely redundant. The same shape travels in the
+// Mast-Props header on the fabric, so a message on the wire and a message at
+// rest are described by one type.
+type Properties struct {
+	// PayloadFormat is a pointer because 0 ("unspecified bytes") is a value
+	// a publisher can send, distinct from not sending it.
+	PayloadFormat   *byte          `json:"pf,omitempty"`
+	MessageExpiry   uint32         `json:"exp,omitempty"`
+	ContentType     string         `json:"ct,omitempty"`
+	ResponseTopic   string         `json:"rt,omitempty"`
+	CorrelationData []byte         `json:"cd,omitempty"`
+	User            []UserProperty `json:"up,omitempty"`
+}
+
+// UserProperty is one MQTT 5 user property. They are a list, not a map:
+// a key may repeat and the order is part of the message.
+type UserProperty struct {
+	Key   string `json:"k"`
+	Value string `json:"v"`
+}
+
+// Expired reports whether a stored message's expiry interval has passed.
+// A message with no interval, or stored before StoredAt existed, never
+// expires.
+func (m Message) Expired(now time.Time) bool {
+	if m.Properties == nil || m.Properties.MessageExpiry == 0 || m.StoredAt == 0 {
+		return false
+	}
+
+	return now.Unix() >= m.StoredAt+int64(m.Properties.MessageExpiry)
 }
 
 // Subscription is one filter a session holds.
@@ -130,6 +178,8 @@ func (s *Store) PutRetained(ctx context.Context, key string, msg Message) error 
 		return s.DeleteRetained(ctx, key)
 	}
 
+	msg.StoredAt = time.Now().Unix()
+
 	encoded, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("store: encoding retained message: %w", err)
@@ -173,6 +223,8 @@ func (s *Store) MatchRetained(ctx context.Context, filters []string) ([]Message,
 
 	var out []Message
 
+	now := time.Now()
+
 	for key := range keys.Keys() {
 		entry, err := s.retained.Get(ctx, key)
 		if err != nil {
@@ -186,6 +238,16 @@ func (s *Store) MatchRetained(ctx context.Context, filters []string) ([]Message,
 		var msg Message
 		if err := json.Unmarshal(entry.Value(), &msg); err != nil {
 			continue // a value we cannot read is not worth failing a subscribe over
+		}
+
+		// The bucket has no per-key TTL, so an expired message is found
+		// only when something asks for it. Deleting it here is what stops
+		// it being found again; a failed delete costs nothing but a retry
+		// on the next subscribe.
+		if msg.Expired(now) {
+			_ = s.retained.Delete(ctx, key)
+
+			continue
 		}
 
 		out = append(out, msg)
@@ -250,6 +312,8 @@ func (s *Store) DeleteSession(ctx context.Context, key string) error {
 // contention for atomicity, which is the right way round while a client is
 // offline and its traffic is by definition not hot.
 func (s *Store) Enqueue(ctx context.Context, key string, msg Message) error {
+	msg.StoredAt = time.Now().Unix()
+
 	for attempt := range casRetries {
 		queue, revision, err := s.readQueue(ctx, key)
 		if err != nil {
@@ -299,7 +363,9 @@ func (s *Store) Drain(ctx context.Context, key string) ([]Message, error) {
 		return nil, fmt.Errorf("store: clearing queue %s: %w", key, err)
 	}
 
-	return queue, nil
+	now := time.Now()
+
+	return slices.DeleteFunc(queue, func(m Message) bool { return m.Expired(now) }), nil
 }
 
 // readQueue returns a client's queue and the revision it was read at. A

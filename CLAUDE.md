@@ -86,13 +86,15 @@ Return codes on `OnPublish` are not interchangeable:
 
 **A node receives one message once per NATS subscription it matches**, and it holds one per distinct filter, so overlapping filters (`a/#` beside `a/b/c`) mean several copies. Each used to run mochi's whole local fan-out, which delivered duplicates to everyone and put a message in front of two members of one share group. `onNATSMessage` now drops repeat plain copies by the `Mast-Id` header, and routes a queue copy to its own group only through `OnSelectSubscribers`, carrying the route in `Properties.ServerReference` because mochi never encodes that property on a PUBLISH. mochi calls `OnSelectSubscribers` only when a shared subscriber matches, which is why a queue copy with no local member is dropped before injection. Anything delivered to one client — a retained replay, a drained queue — goes through `deliverTo`, never `server.Publish`, which fans out to the whole node.
 
+**MQTT 5 properties ride the `Mast-Props` header** as JSON of `store.Properties`, the same type the buckets store, and only when a message has any, so MQTT 3 traffic pays nothing. Topic alias and subscription identifier are per connection and deliberately not carried. A stored message keeps `StoredAt`, because an expiry interval counts from publication: `deliverTo` dates the packet from then so the subscriber is told what is left, and the store drops (and for retained, deletes) what has expired. The v3 paho client cannot see properties at all, which is why `v5_test.go` uses `paho.golang`.
+
 `$share/<group>/<filter>` maps onto a NATS queue group. A queue group **serves a local member first** — this is NATS geo-affinity, not a bug. The MQTT guarantee (exactly one group member) holds; the round-robin-across-the-fleet behaviour an MQTT user expects does not. Verified on a real three-node cluster. Documented, not hidden.
 
 ## The MQTT library is ours now
 
 mast imports `github.com/mastmq/mochi/v2`, not `github.com/mochi-mqtt/server/v2`. [`mastmq/mochi`](https://github.com/mastmq/mochi) is a detached fork of mochi-mqtt/server, MIT, republished under our own module path because upstream stopped merging: `main` has not moved since 2025-03-01 and 47 pull requests are open, including four that fix the deadlock in #9.
 
-`v2.7.10` is upstream `v2.7.9` plus that one fix. **Keep it that way.** A patch to MQTT behaviour belongs in `mastmq/mochi` with a line in its `FORK.md`, not as a workaround here, and every line we do not have to carry is a line that costs nothing when upstream revives.
+mast is on `v2.7.13`: upstream `v2.7.9` plus the short list in `FORK.md` — the deadlock, the listener fixes, and user properties on a PUBLISH surviving a client's Request Problem Information = 0. **Keep the list short.** A patch to MQTT behaviour belongs in `mastmq/mochi` with a line in its `FORK.md`, not as a workaround here, and every line we do not have to carry is a line that costs nothing when upstream revives.
 
 Two consequences worth remembering. `go get -u ./...` will not pull mochi-mqtt updates any more, because we no longer depend on that path — watch upstream by hand. And `.golangci.yml`'s `exhaustruct_v5` ignore pattern is `^github\.com/mastmq/mochi/.*`; it has to move with the module path or every mochi struct literal starts reporting.
 
