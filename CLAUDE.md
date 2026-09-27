@@ -108,6 +108,10 @@ Three hooks carry it, and the order they run in is the whole trick.
 
 `OnQosPublish` queues. It fires when a QoS 1 or 2 packet enters a client's inflight, which mochi does *before* deciding it cannot write to the connection, so it is the one place an absent client's message can be caught. **The offline check must mirror mochi's own** — `cl.Net.Conn == nil || cl.Closed()` — because a client that sent DISCONNECT with a session to keep is not marked closed, and that is precisely the client whose messages need keeping.
 
+**Only a session that outlives its connection is stored** — v3 not clean, v5 with a non-zero expiry (`outlivesConnection`, mochi's own rule inverted). Every bucket write is a replicated write on the core, and a clean session used to cost one per SUBSCRIBE plus blind deletes on CONNECT and DISCONNECT. `DeleteSession` reads before it deletes for the same reason: a read is served by any replica without consensus, a delete of nothing still writes a tombstone.
+
+**The sessions bucket's TTL counts from the last write**, not from disconnect, so a stored session is rewritten at DISCONNECT and refreshed while connected once it is half an expiry old (`refreshSessions`). Before that, a device holding one connection for longer than `session.expiry` lost its stored session while using it, and came back from its next move between nodes with no subscriptions. A restored session is dated from its stored `UpdatedAt`, so a reconnect storm does not trigger a storm of rewrites.
+
 QoS 0 is deliberately never queued: MQTT allows discarding it for an absent client, and persisting it turns fire-and-forget into storage that outlives the thing it described. A corollary that cost an hour: **queueing follows the subscription's QoS, not the publisher's.** A QoS 0 subscriber gets nothing kept however the publisher sent it, which is why `subscribeQoS` exists in the tests.
 
 ## The session control plane

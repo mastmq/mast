@@ -106,7 +106,8 @@ func Start(
 		// The embedded server's id rather than the configured name: the
 		// name defaults to the role, so every edge pod would answer to
 		// "mast-edge" and a log line naming one would name them all.
-		NodeID: nats.ID(),
+		NodeID:        nats.ID(),
+		SessionExpiry: cfg.Session.Expiry,
 	}, log)
 
 	b.obs, err = obs.Serve(ctx, cfg.Obs.Addr, registry, log)

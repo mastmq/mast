@@ -32,7 +32,7 @@ func sessionKey(id tenant.ID, clientID string) string {
 // inside every filter would be redundant, and a human reading the bucket
 // sees what the device actually asked for.
 func (h *Hook) persistSession(cl *mqtt.Client, id tenant.ID, bareClientID string) {
-	if h.store == nil {
+	if h.store == nil || !outlivesConnection(cl) {
 		return
 	}
 
@@ -58,7 +58,90 @@ func (h *Hook) persistSession(cl *mqtt.Client, id tenant.ID, bareClientID string
 
 	if err := h.store.PutSession(ctx, sessionKey(id, bareClientID), sess); err != nil {
 		h.log.Warn("persisting session", "client", cl.ID, "error", err)
+
+		return
 	}
+
+	h.markPersisted(cl.ID, time.Now())
+}
+
+// markPersisted records when a client's session was last written.
+func (h *Hook) markPersisted(mountedClientID string, at time.Time) {
+	h.mu.Lock()
+	h.persistedAt[mountedClientID] = at
+	h.mu.Unlock()
+}
+
+// refreshSessions keeps connected sessions from ageing out of the store.
+//
+// The sessions bucket expires a key session.expiry after its last write,
+// and a connected client with steady subscriptions writes nothing. Without
+// this, a device connected for longer than the expiry lost its stored
+// session while still using it, and came back from its next move between
+// nodes with no subscriptions. A session is rewritten once it is half an
+// expiry old, so it always has at least half an expiry left; at 300k
+// devices and a 24h expiry that is about seven writes a second across the
+// cluster, spread as the connect times are.
+//
+// Only connected clients are refreshed. A disconnected session was written
+// at DISCONNECT and is meant to expire from there.
+func (h *Hook) refreshSessions() {
+	ticker := time.NewTicker(h.sessionExpiry / 4) //nolint:mnd // a quarter: see below
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-h.stop:
+			return
+		case now := <-ticker.C:
+			h.refreshDue(now)
+		}
+	}
+}
+
+// refreshDue rewrites every connected persistent session last written more
+// than half an expiry ago. The tick runs every quarter expiry, so a session
+// is refreshed between half and three quarters of the way to expiring.
+func (h *Hook) refreshDue(now time.Time) {
+	due := now.Add(-h.sessionExpiry / 2) //nolint:mnd // half: see refreshSessions
+
+	for _, cl := range h.server.Clients.GetAll() {
+		if cl.Net.Inline || cl.Net.Conn == nil || cl.Closed() || !outlivesConnection(cl) {
+			continue
+		}
+
+		if len(cl.State.Subscriptions.GetAll()) == 0 {
+			continue // nothing stored, and nothing worth storing
+		}
+
+		h.mu.RLock()
+		last, known := h.persistedAt[cl.ID]
+		identity, connected := h.tenants[cl.ID]
+		h.mu.RUnlock()
+
+		if !connected || (known && last.After(due)) {
+			continue
+		}
+
+		h.persistSession(cl, identity.Tenant, unmountClient(identity.Tenant, cl.ID))
+	}
+}
+
+// outlivesConnection reports whether a client's session is kept after it
+// disconnects, and so whether there is any point storing it.
+//
+// It is mochi's own rule, inverted: a v5 session lasts while its expiry
+// interval is non-zero, and a v3 session unless it is clean. A session that
+// ends with its connection can never be restored anywhere, so persisting it
+// was a replicated write on every SUBSCRIBE for nothing. A v5 client can
+// shorten its expiry to zero on DISCONNECT; what was stored before that is
+// removed by the drop OnDisconnect already makes.
+func outlivesConnection(cl *mqtt.Client) bool {
+	if cl.Properties.ProtocolVersion == 5 { //nolint:mnd // the MQTT protocol level, not a tunable
+		return cl.Properties.Props.SessionExpiryInterval > 0
+	}
+
+	return !cl.Properties.Clean
 }
 
 // dropSession forgets everything durable about a client, which is what a
@@ -104,6 +187,11 @@ func (h *Hook) restoreSession(cl *mqtt.Client, id tenant.ID, bareClientID string
 
 		return
 	}
+
+	// Dated from the stored copy, not from now: a reconnect storm restores
+	// every session at once, and treating each as unwritten would make the
+	// refresher rewrite all of them on its next tick.
+	h.markPersisted(cl.ID, sess.UpdatedAt)
 
 	keys := make([]subKey, 0, len(sess.Subscriptions))
 

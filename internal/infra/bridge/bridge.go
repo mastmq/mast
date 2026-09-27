@@ -108,6 +108,15 @@ type Hook struct {
 	// twice — once by a takeover, once by mochi — is released once, and a
 	// new connection with the same id is never mistaken for the old one.
 	open map[*mqtt.Client]tenant.ID
+	// persistedAt is when each client's session was last written, so the
+	// refresher rewrites only what is about to age out of the bucket.
+	persistedAt map[string]time.Time
+
+	// sessionExpiry is the sessions bucket's TTL, which the refresher has
+	// to stay ahead of, and stop ends the refresher.
+	sessionExpiry time.Duration
+	stop          chan struct{}
+	stopOnce      sync.Once
 
 	// sessions is this node's claim on each client id it holds, and nodeID
 	// names the node in a notice so a human reading the log knows where a
@@ -137,6 +146,10 @@ type Options struct {
 	// NodeID names this node in session notices. It is for humans reading
 	// logs; correctness rests on the per-connection owner token.
 	NodeID string
+
+	// SessionExpiry is the TTL the store's sessions bucket was opened with.
+	// Zero disables refreshing, which is only right when nothing expires.
+	SessionExpiry time.Duration
 }
 
 // New builds a bridge over an established NATS connection.
@@ -168,6 +181,10 @@ func New(
 		seen:             newSeen(),
 		tenants:          make(map[string]tenant.Identity),
 		open:             make(map[*mqtt.Client]tenant.ID),
+		persistedAt:      make(map[string]time.Time),
+		sessionExpiry:    opts.SessionExpiry,
+		stop:             make(chan struct{}),
+		stopOnce:         sync.Once{},
 		sessions:         newSessions(),
 		nodeID:           opts.NodeID,
 	}
@@ -182,6 +199,17 @@ func (h *Hook) Attach(server *mqtt.Server) {
 	// Built exactly as mochi builds its own, so an injected message is
 	// indistinguishable from one sent through [mqtt.Server.Publish].
 	h.injector = server.NewClient(nil, mqtt.LocalListener, mqtt.InlineClientId, true)
+
+	if h.store != nil && h.sessionExpiry > 0 {
+		go h.refreshSessions()
+	}
+}
+
+// Stop implements [mqtt.Hook]. mochi calls it when the server closes.
+func (h *Hook) Stop() error {
+	h.stopOnce.Do(func() { close(h.stop) })
+
+	return nil
 }
 
 // Subscriptions reports the number of live NATS subscriptions this node holds.
@@ -475,6 +503,15 @@ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 
 	if !expire {
 		h.log.Debug("client away, session retained", "client", cl.ID)
+
+		// Written again now, because session.expiry counts from here: the
+		// bucket's TTL runs from the last write, and without this it ran
+		// from whenever the subscriptions last changed. A client taken over
+		// by another node has already been forgotten, so it is not written
+		// over the session the new owner holds.
+		if id, ok := h.tenantOf(cl); ok {
+			h.persistSession(cl, id, unmountClient(id, cl.ID))
+		}
 
 		return
 	}
@@ -1049,6 +1086,7 @@ func (h *Hook) forget(clientID string) {
 
 	h.mu.Lock()
 	delete(h.tenants, clientID)
+	delete(h.persistedAt, clientID)
 	h.mu.Unlock()
 }
 

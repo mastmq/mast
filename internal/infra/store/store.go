@@ -291,14 +291,35 @@ func (s *Store) GetSession(ctx context.Context, key string) (Session, error) {
 	return sess, nil
 }
 
-// DeleteSession forgets a session, which is what clean_start=true means.
+// DeleteSession forgets a session and its queue, which is what
+// clean_start=true means.
+//
+// It reads before it deletes. A KV delete is not free when there is nothing
+// to delete: it writes a tombstone, and every write is a replicated one on
+// the core. Almost every client that asks for this never had a session, so
+// the read is what normally happens — and a read is served by any replica
+// without consensus. Deleting blind cost a clean client two replicated
+// writes per CONNECT and two more per DISCONNECT, and a storm of 20k clean
+// connections queued them past their deadline while each CONNECT waited.
 func (s *Store) DeleteSession(ctx context.Context, key string) error {
-	if err := s.sessions.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
-		return fmt.Errorf("store: deleting session %s: %w", key, err)
-	}
+	for _, target := range []struct {
+		kv   jetstream.KeyValue
+		what string
+	}{
+		{s.sessions, "session"},
+		{s.offline, "queue"},
+	} {
+		if _, err := target.kv.Get(ctx, key); err != nil {
+			if errors.Is(err, jetstream.ErrKeyNotFound) {
+				continue
+			}
 
-	if err := s.offline.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
-		return fmt.Errorf("store: clearing queue %s: %w", key, err)
+			return fmt.Errorf("store: reading %s %s: %w", target.what, key, err)
+		}
+
+		if err := target.kv.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+			return fmt.Errorf("store: deleting %s %s: %w", target.what, key, err)
+		}
 	}
 
 	return nil
