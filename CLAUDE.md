@@ -55,23 +55,26 @@ These are properties the tests and the docs both depend on. Breaking one is a da
 
 **Authentication always fails closed**, whatever `auth.http.on_error` says. Admitting a connection whose tenant is unknown means inventing an isolation boundary. `on_error` governs authorization only.
 
-**The hot publish path does zero KV operations.** `OnPublish` on a non-retained message touches only `EncodeTopic` and `nc.PublishMsg`. The only KV call sites in the bridge are `PutRetained` and `MatchRetained`. Adding a store call to the non-retained path would change the cost model the whole design rests on — if you think one is needed, raise it rather than adding it.
+**The hot QoS 0 publish path does zero storage operations.** `OnPublish` on a non-retained QoS 0 message touches only `EncodeTopic` and `nc.PublishMsg`. QoS 1 and 2 are the one deliberate exception: they are written to the durable stream before they are acknowledged, because that acknowledgement is a promise core NATS alone cannot keep (#11). Adding a store call to the QoS 0 path would change the cost model the whole design rests on — if you think one is needed, raise it rather than adding it.
 
 **Metric cardinality is per tenant, never per device.** 300k label series will take down Prometheus before they take down the broker.
 
 ## Delivery guarantees — the current truth
 
-There are three hops, and the middle one is the weak one.
+There are three hops. The middle one is where a clustered broker earns or loses its guarantees.
 
 | Hop | Guarantee |
 | --- | --- |
 | device → ingress node | real MQTT QoS 0/1/2 |
-| ingress → owning node (core NATS) | **at-most-once** |
+| ingress → owning node, QoS 0 (core NATS) | **at-most-once**, by contract |
+| ingress → owning node, QoS 1/2 (durable stream) | **at-least-once** to every node with a subscriber |
 | owning node → subscriber | real MQTT QoS 0/1/2 |
 
-The ingress node acks the publisher *before* the message crosses the fabric hop, so cross-node QoS 1 and 2 are best-effort. Within a single node the guarantee is real.
+A QoS 1 or 2 publish is stored on the `mast_qos` stream, replicated, before the ingress PUBACKs or PUBRECs ([#11](https://github.com/mastmq/mast/issues/11), fixed). Every node reads the stream through **one consumer of its own** — per node, never per subscription, which is within the rule above — and the plain core-NATS copy of the same message, marked `Mast-Durable`, is dropped by a node that reads the stream. If the store fails the publish is refused: a failing reason code for MQTT 5, a closed connection for MQTT 3 so it resends.
 
-The fix is designed and not implemented: request-reply on the downlink hop so the owning node acknowledges acceptance before the ingress PUBACKs, at the cost of a round trip. It is [#11](https://github.com/mastmq/mast/issues/11), and the open question is what "the owning node" means under fan-out — NATS request-reply returns the first responder, and the ingress does not know how many nodes hold interest.
+Three things learned by failing, all in `store.ConsumeDurable`. **An ordered consumer does not work**: a node cut off from the core keeps its own NATS connection, so what the core sent it in the gap is lost in transit and an unacknowledged consumer counts it delivered, catching up only when a later message shows the gap. **The consumer acknowledges, and cumulatively**: `AckAll` every 64 messages or 100ms; per-message acks roughly doubled the core's work and let 10k msg/s build a 400ms backlog. **Redeliveries are real**, so the bridge drops repeats by `Mast-Id` through the same `seen` window the plain copies use — the ack wait (3s) has to stay inside that window.
+
+Still best-effort: shared subscriptions across nodes (served by the core-NATS queue copy), a node dying after it has taken a message, and a node cut off for longer than `fabric.durable_max_age`. `TestClusterQoS1SurvivesALeafOutage` is the regression test for #11: it cuts an edge off with `natsd.DropLeaf` and requires exactly twenty of twenty messages.
 
 This is written up in [`mastmq/docs/guides/delivery-guarantees.md`](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md). **If you change delivery semantics, that guide, `docs/ARCHITECTURE.md` and the README status block all have to move together.** Stale claims here have bitten twice already.
 
@@ -199,7 +202,7 @@ This repo is one of six. A behaviour change usually touches more than one.
 | --- | --- |
 | ~~[#8](https://github.com/mastmq/mast/issues/8)~~ | **fixed.** Sessions persist to KV and follow a device between nodes; QoS 1/2 for an absent client queues and replays |
 | ~~[#9](https://github.com/mastmq/mast/issues/9)~~ | **fixed**, by moving to `mastmq/mochi` v2.7.10 |
-| [#11](https://github.com/mastmq/mast/issues/11) | cross-node QoS 1/2 are best-effort |
+| ~~[#11](https://github.com/mastmq/mast/issues/11)~~ | **fixed.** Cross-node QoS 1/2 ride the durable stream; shared groups across nodes are still best-effort |
 | ~~[#13](https://github.com/mastmq/mast/issues/13)~~ | **fixed.** Cross-node takeover, via the `mast.session.*` control plane |
 | ~~[#12](https://github.com/mastmq/mast/issues/12)~~ | **fixed.** `natsd` registers the asynchronous handlers and publishes `mast_nats_slow_consumers_total`. Any increase means this node discarded messages it had already acknowledged |
 

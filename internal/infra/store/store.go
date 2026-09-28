@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -123,6 +124,10 @@ type Store struct {
 	retained jetstream.KeyValue
 	sessions jetstream.KeyValue
 	offline  jetstream.KeyValue
+
+	// js is kept for the durable fabric stream, which is a stream rather
+	// than a bucket and is opened separately by [Store.OpenDurable].
+	js jetstream.JetStream
 }
 
 // Open creates the buckets if they are absent and returns a handle.
@@ -141,6 +146,7 @@ func Open(ctx context.Context, nc *nats.Conn, domain string, replicas int, ttl t
 	}
 
 	s := new(Store)
+	s.js = js
 
 	for _, spec := range []struct {
 		name string
@@ -168,6 +174,315 @@ func Open(ctx context.Context, nc *nats.Conn, domain string, replicas int, ttl t
 	}
 
 	return s, nil
+}
+
+// Durable fabric names. The stream sits outside the "t." namespace for the
+// same reason the session control plane does: every filter a client can
+// subscribe to encodes to "t.<tenant>...", so no client can read it or
+// write to it.
+const (
+	streamDurable = "mast_qos"
+
+	// DurablePrefix replaces the leading "t." of a fabric subject on the
+	// stream, so a stored message still names its tenant and topic.
+	DurablePrefix = "q."
+)
+
+// durableDedupWindow is how long the stream remembers a message id. It only
+// has to cover a publisher's retry of the same store call.
+const durableDedupWindow = 2 * time.Minute
+
+// OpenDurable creates the stream QoS 1 and 2 messages cross the fabric on,
+// if it is absent.
+//
+// This is the answer to cross-node QoS being at-most-once: the ingress node
+// acknowledges a QoS 1 or 2 publish only once it is stored here, and every
+// node reads the stream through one consumer of its own. It is one stream
+// and one consumer per node — never one per subscription or session, which
+// is the design mast exists to avoid.
+//
+// maxAge bounds how long a node may be cut off and still catch up. Nothing
+// acknowledges messages on this stream, so age is what removes them.
+func (s *Store) OpenDurable(ctx context.Context, replicas int, maxAge time.Duration) error {
+	_, err := s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:       streamDurable,
+		Subjects:   []string{DurablePrefix + ">"},
+		Retention:  jetstream.LimitsPolicy,
+		Discard:    jetstream.DiscardOld,
+		Storage:    jetstream.FileStorage,
+		Replicas:   replicas,
+		MaxAge:     maxAge,
+		Duplicates: min(durableDedupWindow, maxAge),
+	})
+	if err != nil {
+		return fmt.Errorf("store: stream %s: %w", streamDurable, err)
+	}
+
+	return nil
+}
+
+// PublishDurable stores one message on the durable stream and returns once
+// it is replicated. id makes a retried store call idempotent.
+func (s *Store) PublishDurable(ctx context.Context, msg *nats.Msg, id string) error {
+	if _, err := s.js.PublishMsg(ctx, msg, jetstream.WithMsgID(id)); err != nil {
+		return fmt.Errorf("store: durable publish to %s: %w", msg.Subject, err)
+	}
+
+	return nil
+}
+
+// DurableHandler receives one message from the durable stream. A message
+// can arrive more than once, so a handler must tolerate that; the bridge
+// tells repeats apart by the Mast-Id header the publisher set.
+type DurableHandler func(subject string, header nats.Header, data []byte)
+
+// ConsumeDurable delivers every message stored on the durable stream from
+// now on, and returns a function that stops it.
+//
+// The consumer acknowledges each message after the handler returns, and
+// JetStream sends again whatever it has not heard back about within
+// durableAckWait. That is what carries a message across a node being cut
+// off: while its leaf connection is down, what the core sends it is lost
+// in transit, and the node's own NATS connection never notices. An ordered
+// consumer was tried first and counts such a message as delivered — it
+// only catches up when a later message shows the gap, so on a quiet topic
+// it never did. Redelivery means a handler may see a message twice, which
+// is why messages carry an id.
+//
+// The consumer is ephemeral, so a node that goes away does not leave one
+// behind, and if a long partition outlives it the node creates another
+// from the last stream sequence it handled.
+func (s *Store) ConsumeDurable(
+	ctx context.Context,
+	handle DurableHandler,
+	onErr func(error),
+) (func(), error) {
+	c := &durableConsumer{
+		store:   s,
+		handle:  handle,
+		onErr:   onErr,
+		mu:      sync.Mutex{},
+		last:    0,
+		stopped: false,
+		current: nil,
+		unacked: nil,
+		pending: 0,
+		done:    make(chan struct{}),
+	}
+
+	if err := c.start(ctx); err != nil {
+		return nil, err
+	}
+
+	go c.flushAcks()
+
+	return c.stop, nil
+}
+
+// Durable consumer tuning. The ack wait is how long a message lost to a
+// dropped leaf waits to be sent again, so it is short; the handler only
+// hands a message to mochi and never blocks. The inactive threshold is how
+// long a node can be unreachable before its consumer is removed, and
+// matches how long the stream keeps a message anyway.
+const (
+	durableAckWait       = 3 * time.Second
+	durableMaxAckPending = 20000
+	durableMaxDeliver    = 20
+	durableInactive      = 5 * time.Minute
+	durableHeartbeat     = time.Second
+	durablePullExpiry    = 10 * time.Second
+	durablePullBatch     = 2000
+
+	// Acknowledgements are cumulative and batched: acknowledging message N
+	// acknowledges everything before it, so one ack every durableAckEvery
+	// messages, or every durableAckFlush when traffic stops, does the work
+	// of one per message. Per-message acks roughly doubled the core's
+	// JetStream work and let a 10k msg/s QoS 1 load build a backlog.
+	durableAckEvery = 64
+	durableAckFlush = 100 * time.Millisecond
+)
+
+// durableConsumer is one node's reading of the durable stream.
+type durableConsumer struct {
+	store  *Store
+	handle DurableHandler
+	onErr  func(error)
+
+	mu      sync.Mutex
+	last    uint64 // stream sequence of the last message handled
+	stopped bool
+	current jetstream.ConsumeContext
+
+	// unacked is the latest handled message not yet acknowledged, and
+	// pending how many were handled since the last acknowledgement.
+	unacked jetstream.Msg
+	pending int
+	done    chan struct{}
+}
+
+func (c *durableConsumer) start(ctx context.Context) error {
+	c.mu.Lock()
+	from := c.last
+	c.mu.Unlock()
+
+	cfg := jetstream.ConsumerConfig{
+		FilterSubject:     DurablePrefix + ">",
+		DeliverPolicy:     jetstream.DeliverNewPolicy,
+		AckPolicy:         jetstream.AckAllPolicy,
+		AckWait:           durableAckWait,
+		MaxAckPending:     durableMaxAckPending,
+		MaxDeliver:        durableMaxDeliver,
+		InactiveThreshold: durableInactive,
+	}
+
+	// Recreated after the old one went away: carry on from what was handled.
+	if from > 0 {
+		cfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
+		cfg.OptStartSeq = from + 1
+	}
+
+	consumer, err := c.store.js.CreateConsumer(ctx, streamDurable, cfg)
+	if err != nil {
+		return fmt.Errorf("store: consumer on %s: %w", streamDurable, err)
+	}
+
+	consuming, err := consumer.Consume(c.receive,
+		jetstream.ConsumeErrHandler(c.failed),
+		jetstream.PullMaxMessages(durablePullBatch),
+		jetstream.PullHeartbeat(durableHeartbeat),
+		jetstream.PullExpiry(durablePullExpiry),
+	)
+	if err != nil {
+		return fmt.Errorf("store: consuming %s: %w", streamDurable, err)
+	}
+
+	c.mu.Lock()
+	c.current = consuming
+	c.mu.Unlock()
+
+	return nil
+}
+
+func (c *durableConsumer) receive(m jetstream.Msg) {
+	c.handle(m.Subject(), m.Headers(), m.Data())
+
+	c.mu.Lock()
+	if meta, err := m.Metadata(); err == nil {
+		c.last = max(c.last, meta.Sequence.Stream)
+	}
+
+	c.unacked = m
+	c.pending++
+	due := c.pending >= durableAckEvery
+	c.mu.Unlock()
+
+	if due {
+		c.ack()
+	}
+}
+
+// ack acknowledges everything handled so far.
+func (c *durableConsumer) ack() {
+	c.mu.Lock()
+	m := c.unacked
+	c.unacked, c.pending = nil, 0
+	c.mu.Unlock()
+
+	if m == nil {
+		return
+	}
+
+	if err := m.Ack(); err != nil {
+		c.onErr(fmt.Errorf("store: acknowledging durable messages: %w", err))
+	}
+}
+
+// flushAcks acknowledges the tail of a burst, which would otherwise wait
+// for durableAckEvery more messages and be sent again in the meantime.
+func (c *durableConsumer) flushAcks() {
+	ticker := time.NewTicker(durableAckFlush)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			c.ack()
+		}
+	}
+}
+
+// failed reports a consume error and, when the consumer itself is gone,
+// makes another.
+func (c *durableConsumer) failed(_ jetstream.ConsumeContext, err error) {
+	c.onErr(err)
+
+	if !errors.Is(err, jetstream.ErrConsumerDeleted) && !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		return
+	}
+
+	c.mu.Lock()
+	stopped, old := c.stopped, c.current
+	c.mu.Unlock()
+
+	if stopped {
+		return
+	}
+
+	if old != nil {
+		old.Stop()
+	}
+
+	go c.recreate()
+}
+
+// recreate keeps trying to replace a consumer that went away, for as long
+// as the stream would still hold what it missed.
+func (c *durableConsumer) recreate() {
+	deadline := time.Now().Add(durableInactive)
+
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		stopped := c.stopped
+		c.mu.Unlock()
+
+		if stopped {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), durablePullExpiry)
+		err := c.start(ctx)
+
+		cancel()
+
+		if err == nil {
+			return
+		}
+
+		c.onErr(err)
+		time.Sleep(durableHeartbeat)
+	}
+}
+
+func (c *durableConsumer) stop() {
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+
+		return
+	}
+
+	c.stopped = true
+	current := c.current
+	c.mu.Unlock()
+
+	close(c.done)
+	c.ack()
+
+	if current != nil {
+		current.Stop()
+	}
 }
 
 // PutRetained stores the last known value for a topic. An empty payload

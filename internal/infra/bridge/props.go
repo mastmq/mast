@@ -102,8 +102,8 @@ func setPropsHeader(msg *nats.Msg, p *store.Properties) error {
 // propsFromHeader reads properties back off a message from the fabric. A
 // header that does not parse is dropped rather than failing the delivery:
 // the payload is what the subscriber is waiting for.
-func propsFromHeader(msg *nats.Msg) *store.Properties {
-	raw := msg.Header.Get(headerProps)
+func propsFromHeader(header nats.Header) *store.Properties {
+	raw := header.Get(headerProps)
 	if raw == "" {
 		return nil
 	}

@@ -139,5 +139,16 @@ audience = ""
 # that decommissioned hardware releases its storage.
 expiry = "24h"
 
+[fabric]
+# Store every QoS 1 and 2 publish on a replicated JetStream stream before
+# acknowledging it, and deliver it to other nodes from there, so a node cut
+# off from the core for a moment catches up instead of losing what was
+# published for its clients. One stream, one consumer per node. Off, QoS 1
+# and 2 cross nodes at-most-once, like QoS 0.
+durable_qos = true
+# How long the stream keeps a message: how long a node can be cut off and
+# still catch up.
+durable_max_age = "5m"
+
 [obs]
 addr = "127.0.0.1:9090"  # /metrics and net/http/pprof

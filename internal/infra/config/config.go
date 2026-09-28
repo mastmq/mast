@@ -28,6 +28,10 @@ const defaultJWTSource = "username"
 // deploy, short enough that decommissioned hardware releases storage.
 const defaultSessionExpiry = 24 * time.Hour
 
+// defaultDurableMaxAge covers a leaf reconnect or a core pod restart with a
+// wide margin, without keeping a day of QoS 1 traffic on the core's disks.
+const defaultDurableMaxAge = 5 * time.Minute
+
 // defaultAuthTimeout bounds a single call to the auth service. It is short
 // on purpose: this call sits in front of every CONNECT.
 const defaultAuthTimeout = 2 * time.Second
@@ -96,6 +100,19 @@ type Config struct {
 	Tenant  Tenant  `json:"tenant"  koanf:"tenant"`
 	Auth    Auth    `json:"auth"    koanf:"auth"`
 	Session Session `json:"session" koanf:"session"`
+	Fabric  Fabric  `json:"fabric"  koanf:"fabric"`
+}
+
+// Fabric configures how messages cross between nodes.
+type Fabric struct {
+	// DurableQoS stores every QoS 1 and 2 publish on a replicated
+	// JetStream stream before it is acknowledged, and delivers it to other
+	// nodes from there. Off, they cross on core NATS and are at-most-once
+	// between nodes, as QoS 0 always is.
+	DurableQoS bool `json:"durable_qos" koanf:"durable_qos"`
+	// DurableMaxAge is how long a stored message is kept: how long a node
+	// can be cut off from the core and still catch up on what it missed.
+	DurableMaxAge time.Duration `json:"durable_max_age" koanf:"durable_max_age"`
 }
 
 // Session configures what mast keeps for a client between connections.
@@ -326,6 +343,10 @@ func Default() Config {
 		Session: Session{
 			Expiry: defaultSessionExpiry,
 		},
+		Fabric: Fabric{
+			DurableQoS:    true,
+			DurableMaxAge: defaultDurableMaxAge,
+		},
 		Auth: defaultAuth(),
 	}
 }
@@ -450,6 +471,10 @@ func transformEnv(key, value string) (string, any) {
 func (c Config) Validate() error {
 	if err := c.validateRole(); err != nil {
 		return err
+	}
+
+	if c.Fabric.DurableQoS && c.Fabric.DurableMaxAge <= 0 {
+		return fmt.Errorf("%w: got %v", ErrBadDurableMaxAge, c.Fabric.DurableMaxAge)
 	}
 
 	return c.validateAuth()

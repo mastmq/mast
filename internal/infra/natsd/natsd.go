@@ -31,6 +31,10 @@ const readyTimeout = 15 * time.Second
 // ErrNotReady is returned when the embedded server does not come up in time.
 var ErrNotReady = errors.New("natsd: server did not become ready")
 
+// ErrNoSuchLeaf is returned by [Server.DropLeaf] when no leaf connection
+// comes from the named server.
+var ErrNoSuchLeaf = errors.New("natsd: no leaf connection from that server")
+
 // Server is a running embedded nats-server together with an in-process client
 // connection to it.
 type Server struct {
@@ -58,6 +62,31 @@ func (s *Server) Conn() *nats.Conn { return s.nc }
 // this process from every other node in the cluster. The configured server
 // name does not: it defaults to the role, so every edge shares one.
 func (s *Server) ID() string { return s.ns.ID() }
+
+// DropLeaf closes the leaf connection from the node with the given server
+// name, which reconnects on its own a moment later.
+//
+// It exists to rehearse the failure the fabric has to survive: a node
+// briefly cut off from the core while messages for its clients keep being
+// published elsewhere. Tests use it; so could an operator drill.
+func (s *Server) DropLeaf(name string) error {
+	leafz, err := s.ns.Leafz(nil)
+	if err != nil {
+		return fmt.Errorf("natsd: listing leaf connections: %w", err)
+	}
+
+	for _, leaf := range leafz.Leafs {
+		if leaf.Name == name {
+			if err := s.ns.DisconnectClientByID(leaf.ID); err != nil {
+				return fmt.Errorf("natsd: dropping leaf %s: %w", name, err)
+			}
+
+			return nil
+		}
+	}
+
+	return fmt.Errorf("%w: %s", ErrNoSuchLeaf, name)
+}
 
 // JetStreamEnabled reports whether this node carries JetStream. Edge nodes do
 // not: they reach the core tier's KV buckets over their leaf connection.

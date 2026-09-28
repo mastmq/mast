@@ -311,3 +311,52 @@ func TestExpiredRetainedIsNotReturned(t *testing.T) {
 		}
 	}
 }
+
+func TestDurableStreamDeliversWhatIsStored(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := open(t)
+
+	if err := s.OpenDurable(ctx, 1, time.Minute); err != nil {
+		t.Fatalf("OpenDurable: %v", err)
+	}
+
+	got := make(chan string, 4)
+
+	stop, err := s.ConsumeDurable(ctx, func(subject string, _ nats.Header, data []byte) {
+		got <- subject + "=" + string(data)
+	}, func(err error) { t.Logf("consume: %v", err) })
+	if err != nil {
+		t.Fatalf("ConsumeDurable: %v", err)
+	}
+
+	t.Cleanup(stop)
+
+	msg := nats.NewMsg(store.DurablePrefix + "acme.orders")
+	msg.Data = []byte("go")
+
+	if err := s.PublishDurable(ctx, msg, "id-1"); err != nil {
+		t.Fatalf("PublishDurable: %v", err)
+	}
+
+	// The same id again is the publisher retrying, and must not deliver twice.
+	if err := s.PublishDurable(ctx, msg, "id-1"); err != nil {
+		t.Fatalf("PublishDurable retry: %v", err)
+	}
+
+	select {
+	case m := <-got:
+		if m != store.DurablePrefix+"acme.orders=go" {
+			t.Errorf("delivered %q", m)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stored message was never delivered")
+	}
+
+	select {
+	case m := <-got:
+		t.Errorf("a retried publish was delivered twice: %q", m)
+	case <-time.After(500 * time.Millisecond):
+	}
+}

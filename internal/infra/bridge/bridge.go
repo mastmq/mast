@@ -118,6 +118,13 @@ type Hook struct {
 	stop          chan struct{}
 	stopOnce      sync.Once
 
+	// durableQoS is whether this node was asked to carry QoS 1 and 2 on the
+	// durable stream, durable whether it is actually reading it, and
+	// stopDurable ends that reading.
+	durableQoS  bool
+	durable     atomic.Bool
+	stopDurable func()
+
 	// sessions is this node's claim on each client id it holds, and nodeID
 	// names the node in a notice so a human reading the log knows where a
 	// client went.
@@ -150,6 +157,10 @@ type Options struct {
 	// SessionExpiry is the TTL the store's sessions bucket was opened with.
 	// Zero disables refreshing, which is only right when nothing expires.
 	SessionExpiry time.Duration
+
+	// DurableQoS carries QoS 1 and 2 across the fabric on the durable
+	// stream, which the store must already have opened.
+	DurableQoS bool
 }
 
 // New builds a bridge over an established NATS connection.
@@ -185,6 +196,9 @@ func New(
 		sessionExpiry:    opts.SessionExpiry,
 		stop:             make(chan struct{}),
 		stopOnce:         sync.Once{},
+		durableQoS:       opts.DurableQoS,
+		durable:          atomic.Bool{},
+		stopDurable:      nil,
 		sessions:         newSessions(),
 		nodeID:           opts.NodeID,
 	}
@@ -203,11 +217,19 @@ func (h *Hook) Attach(server *mqtt.Server) {
 	if h.store != nil && h.sessionExpiry > 0 {
 		go h.refreshSessions()
 	}
+
+	h.startDurable()
 }
 
 // Stop implements [mqtt.Hook]. mochi calls it when the server closes.
 func (h *Hook) Stop() error {
-	h.stopOnce.Do(func() { close(h.stop) })
+	h.stopOnce.Do(func() {
+		close(h.stop)
+
+		if h.stopDurable != nil {
+			h.stopDurable()
+		}
+	})
 
 	return nil
 }
@@ -418,23 +440,31 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		return pk, packets.CodeSuccessIgnore
 	}
 
+	msg := h.fabricMessage(subject, pk)
+
+	// QoS 1 and 2 are stored before anything else happens, the retained
+	// copy included: mochi sends the PUBACK or PUBREC when this returns,
+	// and that acknowledgement is a promise the fabric alone cannot keep.
+	// Core NATS drops a message with nowhere to go, so a node cut off for
+	// a second lost everything published for its clients in that second,
+	// and the publishers had been told it was delivered (#11).
+	if pk.FixedHeader.Qos > 0 && h.durable.Load() {
+		if err := h.publishDurable(msg); err != nil {
+			h.log.Warn("refusing a publish the fabric could not store",
+				"client", cl.ID, "tenant", string(id), "error", err)
+
+			return h.refuse(cl, pk)
+		}
+
+		msg.Header.Set(headerDurable, "1")
+	}
+
 	if pk.FixedHeader.Retain {
 		h.storeRetained(subject, unmount(id, pk.TopicName), pk)
 	}
 
-	msg := nats.NewMsg(subject)
-	msg.Data = pk.Payload
-	msg.Header.Set(headerQoS, strconv.Itoa(int(pk.FixedHeader.Qos)))
-	msg.Header.Set(headerID, nuid.Next())
-
-	if pk.FixedHeader.Retain {
-		msg.Header.Set(headerRetain, "1")
-	}
-
-	if err := setPropsHeader(msg, messageProps(pk.Properties)); err != nil {
-		h.log.Warn("forwarding publish without its properties", "subject", subject, "error", err)
-	}
-
+	// Still published on core NATS: shared groups are served from the
+	// queue copy, and a node not reading the stream relies on the plain one.
 	if err := h.nc.PublishMsg(msg); err != nil {
 		h.log.Error("forwarding publish to nats", "subject", subject, "error", err)
 	}
@@ -568,6 +598,16 @@ func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 		h.log.Warn("forwarding will without its properties", "subject", subject, "error", err)
 	}
 
+	// Nobody is waiting on an acknowledgement for a will, so a failed store
+	// falls back to the plain fabric rather than losing the will outright.
+	if will.Qos > 0 && h.durable.Load() {
+		if err := h.publishDurable(msg); err != nil {
+			h.log.Warn("storing a will on the durable stream", "client", cl.ID, "error", err)
+		} else {
+			msg.Header.Set(headerDurable, "1")
+		}
+	}
+
 	if err := h.nc.PublishMsg(msg); err != nil {
 		h.log.Error("forwarding will to nats", "subject", subject, "error", err)
 	}
@@ -656,6 +696,25 @@ func (h *Hook) identityOf(cl *mqtt.Client) (tenant.Identity, bool) {
 	return identity, ok
 }
 
+// fabricMessage is a client's publish as it travels between nodes: the
+// payload, with what MQTT delivery needs to reproduce it in headers.
+func (h *Hook) fabricMessage(subject string, pk packets.Packet) *nats.Msg {
+	msg := nats.NewMsg(subject)
+	msg.Data = pk.Payload
+	msg.Header.Set(headerQoS, strconv.Itoa(int(pk.FixedHeader.Qos)))
+	msg.Header.Set(headerID, nuid.Next())
+
+	if pk.FixedHeader.Retain {
+		msg.Header.Set(headerRetain, "1")
+	}
+
+	if err := setPropsHeader(msg, messageProps(pk.Properties)); err != nil {
+		h.log.Warn("forwarding publish without its properties", "subject", subject, "error", err)
+	}
+
+	return msg
+}
+
 // keysFor turns one granted MQTT filter into the NATS subscriptions it needs.
 //
 // A shared subscription becomes a queue group, which is the whole feature:
@@ -701,18 +760,34 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 		return
 	}
 
-	var queue string
+	var queue, queueSubject string
 	if msg.Sub != nil {
-		queue = msg.Sub.Queue
+		queue, queueSubject = msg.Sub.Queue, msg.Sub.Subject
 	}
 
-	if queue == "" && !h.seen.first(msg.Header.Get(headerID)) {
-		return
+	if queue == "" {
+		// Stored on the durable stream too, and this node reads it: the
+		// stream delivers, and this copy would be a second one.
+		if msg.Header.Get(headerDurable) != "" && h.durable.Load() {
+			return
+		}
+
+		if !h.seen.first(msg.Header.Get(headerID)) {
+			return
+		}
 	}
 
-	tenantID, mqttTopic, err := topic.DecodeTopic(msg.Subject)
+	h.inject(msg.Subject, msg.Header, msg.Data, queue, queueSubject)
+}
+
+// inject hands a message from the fabric — core NATS or the durable stream
+// — to mochi for this node's local subscribers. queue is empty for a plain
+// copy; for a queue copy it names the group NATS picked this node for, and
+// queueSubject the subscription it arrived on.
+func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, queueSubject string) {
+	tenantID, mqttTopic, err := topic.DecodeTopic(subject)
 	if err != nil {
-		h.log.Warn("undecodable subject from nats", "subject", msg.Subject, "error", err)
+		h.log.Warn("undecodable subject from nats", "subject", subject, "error", err)
 
 		return
 	}
@@ -729,7 +804,7 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 			return
 		}
 
-		route = queueRoute(tenantID, queue, msg.Sub.Subject)
+		route = queueRoute(tenantID, queue, queueSubject)
 	}
 
 	// Inject at the QoS the publisher used. mochi then downgrades per
@@ -740,7 +815,7 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 	// KV bucket by the ingress node and replayed from there on subscribe;
 	// setting it on live delivery would both duplicate that and lie to a
 	// subscriber that was already present, which MQTT says gets retain=0.
-	qos := qosOf(msg)
+	qos := qosOf(header)
 
 	// ServerReference is only valid on CONNACK and DISCONNECT, so mochi
 	// never encodes it on a PUBLISH. That makes it the one field that can
@@ -748,7 +823,7 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 	// of reaching a client.
 	props := packets.Properties{ServerReference: route}
 
-	if carried := propsFromHeader(msg); carried != nil {
+	if carried := propsFromHeader(header); carried != nil {
 		applyProps(&props, carried)
 		// Unlike a stored message, a live one is injected moments after it
 		// was published, so the publisher's interval is still the right
@@ -759,7 +834,7 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 	err = h.server.InjectPacket(h.injector, packets.Packet{
 		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: qos},
 		TopicName:   mounted,
-		Payload:     msg.Data,
+		Payload:     data,
 		// mochi's own Publish does the same: an inline publish is never
 		// acknowledged, but a QoS 1 or 2 packet still needs an id to be
 		// valid.
@@ -767,7 +842,7 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 		Properties: props,
 	})
 	if err != nil {
-		h.log.Error("injecting message from nats", "subject", msg.Subject, "error", err)
+		h.log.Error("injecting message from the fabric", "subject", subject, "error", err)
 
 		return
 	}
@@ -805,8 +880,8 @@ func servesQueue(id tenant.ID, filter, queue, subject string) bool {
 
 // qosOf reads the QoS a message was published at, defaulting to 0 for
 // anything that reached the subject without going through the bridge.
-func qosOf(msg *nats.Msg) byte {
-	raw := msg.Header.Get(headerQoS)
+func qosOf(header nats.Header) byte {
+	raw := header.Get(headerQoS)
 	if raw == "" {
 		return 0
 	}

@@ -14,7 +14,7 @@
   &nbsp;·&nbsp; <a href="https://github.com/mastmq/bench">Benchmarks</a>
 </p>
 
-> **Status: early, but it runs.** A single `mast` process starts an embedded nats-server, terminates MQTT, and moves messages end to end with tenant isolation, wildcards, and shared subscriptions. QoS 0 through 2, retained messages, wills and persistent sessions all work, and a session now follows a device between nodes rather than living in one node's memory. The limit worth knowing before you read further: the hop between nodes is core NATS, so cross-node QoS 1 and 2 are best-effort ([delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md)). See [what works](#what-works).
+> **Status: early, but it runs.** A single `mast` process starts an embedded nats-server, terminates MQTT, and moves messages end to end with tenant isolation, wildcards, and shared subscriptions. QoS 0 through 2, retained messages, wills and persistent sessions all work, and a session now follows a device between nodes rather than living in one node's memory. QoS 1 and 2 hold across nodes too: a QoS 1 or 2 publish is stored on a replicated stream before it is acknowledged. The limit worth knowing before you read further: shared subscriptions spanning nodes are still best-effort ([delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md)). See [what works](#what-works).
 
 ## What works
 
@@ -26,14 +26,14 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 - **Tenant isolation** — two tenants subscribing to the same topic never see each other's traffic
 - **Shared subscriptions** — `$share/<group>/<filter>` maps onto a NATS queue group, and each message reaches exactly one member. Note that a queue group serves a local member first, so work stays on the producer's node rather than spreading round-robin across the group; see [ARCHITECTURE.md](docs/ARCHITECTURE.md) for why and what to do if that matters
 - One NATS subscription per distinct filter rather than per device, released when the last subscriber disconnects
-- **Cross-node delivery** — edges join the core as leaf nodes, and a message published on one edge reaches a subscriber on another, with tenant isolation holding across the boundary. The fabric hop is core NATS and therefore at-most-once, so a publisher is acknowledged before the message has crossed it: cross-node QoS 1 and 2 are best-effort, and [delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md) sets out exactly what each QoS promises and where
+- **Cross-node delivery** — edges join the core as leaf nodes, and a message published on one edge reaches a subscriber on another, with tenant isolation holding across the boundary. QoS 0 crosses on core NATS; QoS 1 and 2 are stored on one replicated JetStream stream before the publisher is acknowledged, and each node reads it through one consumer of its own, so a node cut off from the core for a moment catches up rather than losing what was published for its clients. [Delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md) sets out exactly what each QoS promises and where it still does not
 
 - **MQTT 5 message properties** — content type, response topic, correlation data, payload format, user properties and message expiry travel with the message across the fabric and through retained messages and offline queues, so MQTT 5 request/response works between nodes. An expired retained or queued message is not delivered
 - **HTTP authentication and authorization** — post the MQTT fields to your own service and let it name the tenant and rule on each topic
 - **Portable sessions** — subscriptions and the offline queue live in the shared key-value buckets, so a device that reconnects to a different node finds its session and whatever QoS 1 or 2 traffic it missed. Verified by a two-node test, not by hand
 - **Cross-node takeover** — a second connection with an existing client id disconnects the first wherever in the cluster it is, which MQTT requires and a single node cannot do alone. Client ids are scoped to their tenant, so one tenant cannot displace another's device by reusing an id
 
-Not yet: per-tenant quotas, connection rate limiting, and end-to-end QoS across nodes ([#11](https://github.com/mastmq/mast/issues/11)).
+Not yet: per-tenant quotas, connection rate limiting, and full QoS for shared subscriptions whose members span nodes.
 
 ## Why
 

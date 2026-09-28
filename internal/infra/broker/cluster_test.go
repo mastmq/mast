@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -49,6 +50,9 @@ func startCluster(t *testing.T) *cluster {
 	t.Helper()
 
 	log := slog.New(slog.DiscardHandler)
+	if os.Getenv("MAST_TEST_LOG") != "" {
+		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	}
 
 	leafAddr := freeAddr(t)
 
@@ -641,4 +645,67 @@ func TestEdgeStartsBeforeItsCore(t *testing.T) {
 
 	got.node.Close()
 	core.Close()
+}
+
+// TestClusterQoS1SurvivesALeafOutage is #11: cross-node QoS 1 was
+// at-most-once.
+//
+// The ingress node acknowledged a QoS 1 publish before the message crossed
+// the fabric, and the fabric is core NATS, which drops a message with
+// nowhere to go. A node cut off from the core for a second — a leaf
+// reconnect, a rolling restart of the core, a network blip — lost every
+// QoS 1 message published for its clients in that second, and the
+// publishers had been told they were delivered.
+func TestClusterQoS1SurvivesALeafOutage(t *testing.T) {
+	c := startCluster(t)
+
+	sub := connect(t, c.addrs[1], "field-unit", "acme")
+	sub.subscribeQoS(t, "orders/field-unit", 1)
+	c.awaitInterest(t, sub, "acme")
+
+	pub := connect(t, c.addrs[0], "dispatcher", "acme")
+
+	if err := c.core.NATS().DropLeaf("edge-b"); err != nil {
+		t.Fatalf("cutting edge-b off: %v", err)
+	}
+
+	const sent = 20
+
+	for i := range sent {
+		tok := pub.client.Publish("orders/field-unit", 1, false, strconv.Itoa(i))
+		if !tok.WaitTimeout(10*time.Second) || tok.Error() != nil {
+			t.Fatalf("publish %d was not acknowledged: %v", i, tok.Error())
+		}
+	}
+
+	delivered := func() int {
+		n := 0
+
+		for _, m := range sub.messages() {
+			if strings.HasPrefix(m, "orders/field-unit=") {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	// The leaf reconnects on its own within a second or two, and what was
+	// lost in transit is sent again one ack wait later.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && delivered() < sent {
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if got := delivered(); got < sent {
+		t.Fatalf("%d of %d acknowledged QoS 1 messages reached the subscriber", got, sent)
+	}
+
+	// Past one more ack wait, so a redelivery the node did not recognise as
+	// a repeat would have had time to arrive.
+	time.Sleep(4 * time.Second)
+
+	if got := delivered(); got != sent {
+		t.Errorf("the subscriber received %d messages for %d sent: redeliveries were not de-duplicated", got, sent)
+	}
 }

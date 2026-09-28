@@ -27,4 +27,9 @@ var (
 	// net/http means no timeout: one policy server that stops answering
 	// would hang every CONNECT and every uncached publish indefinitely.
 	ErrBadAuthTimeout = errors.New("config: auth.http.timeout must be positive")
+
+	// ErrBadDurableMaxAge guards against a durable stream that keeps
+	// nothing: with no retention, a node cut off for an instant catches up
+	// on nothing, which is the failure the stream exists to prevent.
+	ErrBadDurableMaxAge = errors.New("config: fabric.durable_max_age must be positive when fabric.durable_qos is on")
 )

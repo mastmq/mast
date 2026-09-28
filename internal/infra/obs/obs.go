@@ -56,6 +56,11 @@ type Metrics struct {
 	OfflineQueued    *prometheus.CounterVec
 	OfflineDelivered *prometheus.CounterVec
 	NATSSubs         prometheus.GaugeFunc
+
+	// DurableFailures counts QoS 1 and 2 publishes the durable stream would
+	// not store. Each one was refused rather than acknowledged, so any
+	// increase is publishers being told to retry.
+	DurableFailures prometheus.Counter
 }
 
 // NATSCounts is what the NATS client's asynchronous handlers have observed.
@@ -116,6 +121,11 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 		OfflineQueued:    factory("offline_queued_total", "Messages stored for a client that was absent.", "tenant"),
 		OfflineDelivered: factory("offline_delivered_total", "Messages replayed to a client that came back.", "tenant"),
 		NATSSubs:         nil,
+		DurableFailures: prometheus.NewCounter(prometheus.CounterOpts{ //nolint:exhaustruct_v5 // defaults are right
+			Namespace: namespace,
+			Name:      "durable_publish_failures_total",
+			Help:      "QoS 1 and 2 publishes refused because the durable stream would not store them.",
+		}),
 	}
 
 	if src.Subscriptions != nil {
@@ -127,6 +137,7 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 		reg.MustRegister(m.NATSSubs)
 	}
 
+	reg.MustRegister(m.DurableFailures)
 	registerNATSCounts(reg, src.NATS)
 
 	return m

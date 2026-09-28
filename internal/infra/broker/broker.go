@@ -121,6 +121,7 @@ func Start(
 		// "mast-edge" and a log line naming one would name them all.
 		NodeID:        nats.ID(),
 		SessionExpiry: cfg.Session.Expiry,
+		DurableQoS:    cfg.Fabric.DurableQoS,
 	}, log)
 
 	b.server, err = mqttd.New(cfg, b.hook, log)
@@ -167,6 +168,10 @@ func openStore(ctx context.Context, cfg config.Config, nats *natsd.Server) (*sto
 
 	for {
 		st, err := store.Open(ctx, nats.Conn(), natsd.JetStreamDomain, cfg.Core.Replicas, cfg.Session.Expiry)
+		if err == nil && cfg.Fabric.DurableQoS {
+			err = st.OpenDurable(ctx, cfg.Core.Replicas, cfg.Fabric.DurableMaxAge)
+		}
+
 		if err == nil || !notReadyYet(err) {
 			return st, err
 		}
