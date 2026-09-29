@@ -239,35 +239,56 @@ type DurableHandler func(subject string, header nats.Header, data []byte)
 // ConsumeDurable delivers every message stored on the durable stream from
 // now on, and returns a function that stops it.
 //
-// The consumer acknowledges each message after the handler returns, and
-// JetStream sends again whatever it has not heard back about within
-// durableAckWait. That is what carries a message across a node being cut
-// off: while its leaf connection is down, what the core sends it is lost
-// in transit, and the node's own NATS connection never notices. An ordered
-// consumer was tried first and counts such a message as delivered — it
-// only catches up when a later message shows the gap, so on a quiet topic
-// it never did. Redelivery means a handler may see a message twice, which
-// is why messages carry an id.
+// What carries a message across a node being cut off is noticing that a
+// delivery went missing. While a leaf connection is down, or before the
+// core has noticed it is, what the core sends the node is lost in transit,
+// and the node's own NATS connection never drops. JetStream numbers every
+// delivery to a consumer, so a delivery that arrives out of turn proves the
+// ones before it were lost, and the node replaces the consumer with one
+// that starts after the last message it did handle.
 //
-// The consumer is ephemeral, so a node that goes away does not leave one
-// behind, and if a long partition outlives it the node creates another
-// from the last stream sequence it handled.
+// Two designs failed on the way. An ordered consumer does the same gap
+// check but acknowledges nothing, so a delivery lost at the tail of a burst
+// is never shown up by a later one; here JetStream sends it again after
+// durableAckWait, and that redelivery is itself out of turn. And relying on
+// redelivery alone does not work under acknowledge-all: acknowledging the
+// first message to arrive after a loss acknowledges the lost ones with it,
+// so under steady traffic nothing was ever sent again. Nothing past a gap
+// is handled or acknowledged for that reason.
+//
+// A handler may still see a message twice, after an acknowledgement goes
+// missing, which is why messages carry an id.
+//
+// The consumer is ephemeral, so a node that goes away without stopping does
+// not leave one behind for longer than durableInactive.
 func (s *Store) ConsumeDurable(
 	ctx context.Context,
 	handle DurableHandler,
 	onErr func(error),
 ) (func(), error) {
+	// Everything already on the stream counts as handled: a node reads what
+	// is published from now on, as the plain fabric always did. Starting at
+	// an explicit sequence rather than "new" gives the very first gap a
+	// floor to restart from.
+	stream, err := s.js.Stream(ctx, streamDurable)
+	if err != nil {
+		return nil, fmt.Errorf("store: stream %s: %w", streamDurable, err)
+	}
+
 	c := &durableConsumer{
-		store:   s,
-		handle:  handle,
-		onErr:   onErr,
-		mu:      sync.Mutex{},
-		last:    0,
-		stopped: false,
-		current: nil,
-		unacked: nil,
-		pending: 0,
-		done:    make(chan struct{}),
+		store:      s,
+		handle:     handle,
+		onErr:      onErr,
+		mu:         sync.Mutex{},
+		floor:      stream.CachedInfo().State.LastSeq,
+		name:       "",
+		delivered:  0,
+		restarting: false,
+		stopped:    false,
+		current:    nil,
+		unacked:    nil,
+		pending:    0,
+		done:       make(chan struct{}),
 	}
 
 	if err := c.start(ctx); err != nil {
@@ -279,8 +300,11 @@ func (s *Store) ConsumeDurable(
 	return c.stop, nil
 }
 
-// Durable consumer tuning. The ack wait is how long a message lost to a
-// dropped leaf waits to be sent again, so it is short; the handler only
+// errDeliveryLost reports a gap in the deliveries to this node's consumer.
+var errDeliveryLost = errors.New("store: durable deliveries lost in transit, replaying")
+
+// Durable consumer tuning. The ack wait is how long a delivery lost at the
+// tail of a burst waits to be sent again, so it is short; the handler only
 // hands a message to mochi and never blocks. The inactive threshold is how
 // long a node can be unreachable before its consumer is removed, and
 // matches how long the stream keeps a message anyway.
@@ -308,10 +332,24 @@ type durableConsumer struct {
 	handle DurableHandler
 	onErr  func(error)
 
-	mu      sync.Mutex
-	last    uint64 // stream sequence of the last message handled
-	stopped bool
-	current jetstream.ConsumeContext
+	mu sync.Mutex
+
+	// floor is the stream sequence through which every message has been
+	// handled, and where a replacement consumer starts. It only advances on
+	// a delivery that arrived in turn, which is what makes that true.
+	floor uint64
+
+	// name is the consumer being read and delivered the number of the last
+	// delivery from it that was handled. A message from any other consumer
+	// is a leftover of one that was replaced, and is ignored.
+	name      string
+	delivered uint64
+
+	// restarting is set while a consumer is being replaced, so a second
+	// gap or error does not start a second replacement.
+	restarting bool
+	stopped    bool
+	current    jetstream.ConsumeContext
 
 	// unacked is the latest handled message not yet acknowledged, and
 	// pending how many were handled since the last acknowledgement.
@@ -320,31 +358,30 @@ type durableConsumer struct {
 	done    chan struct{}
 }
 
+// start creates a consumer that begins just after floor and reads it.
 func (c *durableConsumer) start(ctx context.Context) error {
 	c.mu.Lock()
-	from := c.last
+	from := c.floor + 1
 	c.mu.Unlock()
 
-	cfg := jetstream.ConsumerConfig{
+	consumer, err := c.store.js.CreateConsumer(ctx, streamDurable, jetstream.ConsumerConfig{
 		FilterSubject:     DurablePrefix + ">",
-		DeliverPolicy:     jetstream.DeliverNewPolicy,
+		DeliverPolicy:     jetstream.DeliverByStartSequencePolicy,
+		OptStartSeq:       from,
 		AckPolicy:         jetstream.AckAllPolicy,
 		AckWait:           durableAckWait,
 		MaxAckPending:     durableMaxAckPending,
 		MaxDeliver:        durableMaxDeliver,
 		InactiveThreshold: durableInactive,
-	}
-
-	// Recreated after the old one went away: carry on from what was handled.
-	if from > 0 {
-		cfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
-		cfg.OptStartSeq = from + 1
-	}
-
-	consumer, err := c.store.js.CreateConsumer(ctx, streamDurable, cfg)
+	})
 	if err != nil {
 		return fmt.Errorf("store: consumer on %s: %w", streamDurable, err)
 	}
+
+	c.mu.Lock()
+	c.name, c.delivered = consumer.CachedInfo().Name, 0
+	c.unacked, c.pending = nil, 0
+	c.mu.Unlock()
 
 	consuming, err := consumer.Consume(c.receive,
 		jetstream.ConsumeErrHandler(c.failed),
@@ -358,19 +395,56 @@ func (c *durableConsumer) start(ctx context.Context) error {
 
 	c.mu.Lock()
 	c.current = consuming
+	stopped := c.stopped
 	c.mu.Unlock()
+
+	// Stopped while this was being created: stop has already run, and
+	// would not have seen it.
+	if stopped {
+		consuming.Stop()
+	}
 
 	return nil
 }
 
 func (c *durableConsumer) receive(m jetstream.Msg) {
+	meta, err := m.Metadata()
+	if err != nil {
+		c.onErr(fmt.Errorf("store: durable message without metadata: %w", err))
+
+		return
+	}
+
+	c.mu.Lock()
+	if c.restarting || meta.Consumer != c.name {
+		c.mu.Unlock()
+
+		return
+	}
+
+	if meta.Sequence.Consumer != c.delivered+1 {
+		lost := fmt.Errorf("%w: delivery %d after %d", errDeliveryLost, meta.Sequence.Consumer, c.delivered)
+		c.mu.Unlock()
+		c.replace(lost)
+
+		return
+	}
+	c.mu.Unlock()
+
 	c.handle(m.Subject(), m.Headers(), m.Data())
 
 	c.mu.Lock()
-	if meta, err := m.Metadata(); err == nil {
-		c.last = max(c.last, meta.Sequence.Stream)
+	// A redelivery after a late acknowledgement is in turn but behind the
+	// floor, which must not move back.
+	c.floor = max(c.floor, meta.Sequence.Stream)
+
+	if meta.Consumer != c.name {
+		c.mu.Unlock()
+
+		return
 	}
 
+	c.delivered = meta.Sequence.Consumer
 	c.unacked = m
 	c.pending++
 	due := c.pending >= durableAckEvery
@@ -414,41 +488,59 @@ func (c *durableConsumer) flushAcks() {
 }
 
 // failed reports a consume error and, when the consumer itself is gone,
-// makes another.
+// replaces it.
 func (c *durableConsumer) failed(_ jetstream.ConsumeContext, err error) {
-	c.onErr(err)
+	if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) {
+		c.replace(err)
 
-	if !errors.Is(err, jetstream.ErrConsumerDeleted) && !errors.Is(err, jetstream.ErrConsumerNotFound) {
 		return
 	}
 
+	c.onErr(err)
+}
+
+// replace stops reading the current consumer and starts another at the
+// floor, unless that is already under way.
+func (c *durableConsumer) replace(reason error) {
 	c.mu.Lock()
-	stopped, old := c.stopped, c.current
+	if c.stopped || c.restarting {
+		c.mu.Unlock()
+
+		return
+	}
+
+	c.restarting = true
+	old, oldName := c.current, c.name
+	c.current, c.unacked, c.pending = nil, nil, 0
 	c.mu.Unlock()
 
-	if stopped {
-		return
-	}
+	c.onErr(reason)
 
+	go c.restart(old, oldName)
+}
+
+// restart replaces a consumer, and keeps trying for as long as the node
+// runs. Giving up is not an option that fails safe: the bridge goes on
+// dropping the plain copies of stored messages, so a node reading nothing
+// would deliver no QoS 1 or 2 from other nodes at all.
+func (c *durableConsumer) restart(old jetstream.ConsumeContext, oldName string) {
 	if old != nil {
 		old.Stop()
 	}
 
-	go c.recreate()
-}
+	// Removed now rather than left to durableInactive, so that the core
+	// does not hold two consumers for this node. If the core is out of
+	// reach this fails, and the inactive threshold is the fallback.
+	ctx, cancel := context.WithTimeout(context.Background(), durableHeartbeat)
+	_ = c.store.js.DeleteConsumer(ctx, streamDurable, oldName)
 
-// recreate keeps trying to replace a consumer that went away, for as long
-// as the stream would still hold what it missed.
-func (c *durableConsumer) recreate() {
-	deadline := time.Now().Add(durableInactive)
+	cancel()
 
-	for time.Now().Before(deadline) {
-		c.mu.Lock()
-		stopped := c.stopped
-		c.mu.Unlock()
-
-		if stopped {
+	for {
+		select {
+		case <-c.done:
 			return
+		default:
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), durablePullExpiry)
@@ -457,11 +549,20 @@ func (c *durableConsumer) recreate() {
 		cancel()
 
 		if err == nil {
+			c.mu.Lock()
+			c.restarting = false
+			c.mu.Unlock()
+
 			return
 		}
 
 		c.onErr(err)
-		time.Sleep(durableHeartbeat)
+
+		select {
+		case <-c.done:
+			return
+		case <-time.After(durableHeartbeat):
+		}
 	}
 }
 
