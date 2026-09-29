@@ -6,11 +6,18 @@ updates:
     schedule:
       interval: weekly
     groups:
-      # One PR for the long tail rather than a dozen. A direct dependency
-      # still gets its own, because those are the ones worth reading.
+      # One PR for the long tail rather than a dozen. The broker's own
+      # substrate still gets its own, because those are the ones worth
+      # reading. They are excluded by name: Go has no dev dependencies, so
+      # `dependency-type: production` matches every module, and a group
+      # cannot tell direct from indirect.
       indirect:
         dependency-type: production
         patterns: ["*"]
+        exclude-patterns:
+          - "github.com/nats-io/nats-server/*"
+          - "github.com/nats-io/nats.go"
+          - "github.com/mastmq/mochi/*"
         update-types: ["minor", "patch"]
 
   - package-ecosystem: github-actions
