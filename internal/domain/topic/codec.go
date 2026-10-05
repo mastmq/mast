@@ -183,28 +183,47 @@ func FilterSubjects(tenant, filter string) ([]string, error) {
 // DecodeTopic reverses [EncodeTopic], recovering the tenant and the original
 // MQTT topic name from a subject.
 func DecodeTopic(subject string) (string, string, error) {
-	tokens := strings.Split(subject, ".")
-	if len(tokens) < headerTokens+1 || tokens[0] != Prefix {
+	rest, ok := strings.CutPrefix(subject, Prefix+".")
+	if !ok {
 		return "", "", fmt.Errorf("%w: %q", ErrBadSubject, subject)
 	}
 
-	tenant := tokens[1]
+	tenant, levels, ok := strings.Cut(rest, ".")
+	if !ok {
+		return "", "", fmt.Errorf("%w: %q", ErrBadSubject, subject)
+	}
+
 	if err := checkTenant(tenant); err != nil {
 		return "", "", err
 	}
 
-	levels := make([]string, 0, len(tokens)-headerTokens)
+	// Nearly every subject is plain ASCII with nothing to unescape, and for
+	// those decoding is swapping the separator. A subject with no escape
+	// character also has no empty level, since that is spelled "=", so the
+	// swap is exact. Splitting into tokens and joining them again cost three
+	// allocations per delivery for the same answer.
+	if strings.IndexByte(levels, escapeChar) < 0 {
+		return tenant, strings.ReplaceAll(levels, ".", "/"), nil
+	}
 
-	for _, token := range tokens[headerTokens:] {
+	var sb strings.Builder
+
+	sb.Grow(len(levels))
+
+	for i, token := range strings.Split(levels, ".") {
 		level, err := decodeLevel(token)
 		if err != nil {
 			return "", "", fmt.Errorf("%w: in %q", err, subject)
 		}
 
-		levels = append(levels, level)
+		if i > 0 {
+			sb.WriteByte('/')
+		}
+
+		sb.WriteString(level)
 	}
 
-	return tenant, strings.Join(levels, "/"), nil
+	return tenant, sb.String(), nil
 }
 
 // EncodeToken escapes an arbitrary string into a single NATS subject token.
