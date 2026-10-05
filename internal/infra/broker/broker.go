@@ -184,9 +184,27 @@ func openStore(ctx context.Context, cfg config.Config, nats *natsd.Server) (*sto
 	}
 }
 
+// jsStreamCreateFailed is JetStream's general "stream creation failed"
+// code, which it also returns when two requests create the same stream at
+// once: the loser sees the winner's half-written metadata as "no such file
+// or directory". Two edges joining a fresh core together did exactly that,
+// and one died on its first bucket.
+const jsStreamCreateFailed jetstream.ErrorCode = 10069
+
 // notReadyYet reports whether a store error means JetStream is not
-// reachable yet, rather than that something is wrong with the request.
+// reachable yet, or is still busy creating what was asked for, rather than
+// that something is wrong with the request.
+//
+// A creation failure is retried on the same footing as "not enabled": the
+// next attempt finds the stream the other node finished creating, and a
+// stream that genuinely cannot be created keeps failing until ctx runs out,
+// which is how the other two cases already end.
 func notReadyYet(err error) bool {
+	var apiErr *jetstream.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode == jsStreamCreateFailed {
+		return true
+	}
+
 	return errors.Is(err, jetstream.ErrJetStreamNotEnabled) ||
 		errors.Is(err, jetstream.ErrJetStreamNotEnabledForAccount) ||
 		errors.Is(err, natsgo.ErrNoResponders)
