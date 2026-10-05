@@ -125,6 +125,8 @@ Both tokens go through `topic.EncodeToken`, which is the single-token form of th
 
 A notice carries the **connection's** owner token, not the node's. The node that publishes is also subscribed, so it has to recognise its own notice, and identifying by node would make two connections on one node indistinguishable. `NodeID` exists only so a log line can say where a client went, and it is the embedded server's id rather than the configured name — the name defaults to the role, so every edge pod would answer to `mast-edge`.
 
+**A node holds one subscription to the control plane, `mast.session.>`, not one per client.** The per-client version was the obvious shape and cost a goroutine, a SUB round trip and a cluster-wide interest update per CONNECT, held for as long as the session lived — an edge with 25k sleeping persistent sessions held 25k subscriptions for them. Now every notice in the cluster reaches every node and a map lookup on the subject decides whether it matters, before the JSON is even decoded. `BenchmarkConnect` reports `nats-subs/client`; it must stay at zero.
+
 A failed claim logs and continues rather than refusing the connection. Without it a client can end up live in two places, which is the bug this prevents; refusing outright would turn duplicate delivery into an outage.
 
 ## Configuration
@@ -140,8 +142,11 @@ Env vars are prefixed `MAST__` and nest with a double underscore: `MAST__MQTT__A
 ```console
 $ just test       # go test -race with coverage
 $ just fuzz 60s   # the topic codec round trip
+$ just bench      # the hot paths; BenchmarkConnect must report 0 nats-subs/client
 $ just lint
 ```
+
+The benchmarks are how a performance claim is checked, and the numbers in a commit message come from them. `BenchmarkPublishQoS0` drives a real client through a real node and is dominated by loopback syscalls, so it catches a regression in allocations rather than in nanoseconds; the micro-benchmarks in `topic` and `bridge` are where a change to the hot path shows.
 
 The end-to-end tests in `internal/infra/broker` drive a real Paho client against a real node with a real embedded NATS server. `parity_test.go` is the MQTT conformance surface — QoS 0–2, retained, wills, persistent sessions.
 

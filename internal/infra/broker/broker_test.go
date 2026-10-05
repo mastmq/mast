@@ -67,20 +67,20 @@ func start(t *testing.T, resolver tenant.Resolver) string {
 	return cfg.MQTT.Addr
 }
 
-func freeAddr(t *testing.T) string {
-	t.Helper()
+func freeAddr(tb testing.TB) string {
+	tb.Helper()
 
 	var lc net.ListenConfig
 
 	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("reserving port: %v", err)
+		tb.Fatalf("reserving port: %v", err)
 	}
 
 	addr := l.Addr().String()
 
 	if err := l.Close(); err != nil {
-		t.Fatalf("releasing port: %v", err)
+		tb.Fatalf("releasing port: %v", err)
 	}
 
 	return addr

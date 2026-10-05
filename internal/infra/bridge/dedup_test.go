@@ -3,15 +3,15 @@ package bridge
 import (
 	"testing"
 	"time"
+
+	"github.com/nats-io/nuid"
 )
 
 func TestSeenForgetsAfterTwoWindows(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(0, 0)
-	s := newSeen()
-	s.rotated = now
-	s.now = func() time.Time { return now }
+	s := newSeenAt(func() time.Time { return now })
 
 	if !s.first("m1") {
 		t.Fatal("a new id was reported as seen")
@@ -47,5 +47,23 @@ func TestSeenNeverDropsAnUnnamedMessage(t *testing.T) {
 		if !s.first("") {
 			t.Fatal("a message without an id was dropped as a duplicate")
 		}
+	}
+}
+
+func TestSeenSpreadsConsecutiveIDsAcrossShards(t *testing.T) {
+	t.Parallel()
+
+	// One publisher's ids differ only in their counter, which is what a
+	// burst from one device looks like. All of them on one shard would make
+	// the sharding decorative.
+	ids := nuid.New()
+	hit := make(map[int]int)
+
+	for range 1000 {
+		hit[shardOf(ids.Next())]++
+	}
+
+	if len(hit) < seenShards/2 {
+		t.Fatalf("1000 consecutive ids landed on only %d of %d shards", len(hit), seenShards)
 	}
 }

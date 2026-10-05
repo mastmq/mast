@@ -48,7 +48,6 @@ import (
 	mqtt "github.com/mastmq/mochi/v2"
 	"github.com/mastmq/mochi/v2/packets"
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nuid"
 )
 
 // hookID names this hook in mochi's logs.
@@ -100,9 +99,18 @@ type Hook struct {
 	// on, and [Hook.OnSelectSubscribers] needs to know.
 	injector *mqtt.Client
 	seen     *seen
+	// ids generates the Mast-Id of every message this node publishes.
+	ids sync.Pool
 
-	mu      sync.RWMutex
-	tenants map[string]tenant.Identity
+	// tenants is what authentication established about each client id, as
+	// [tenant.Identity]. It is read on every inbound packet, every ACL check
+	// and every outbound PUBLISH from every connection's goroutine at once,
+	// and written once per CONNECT, which is the shape sync.Map serves
+	// without a lock: under an RWMutex the readers alone contended on its
+	// counter and the lookup cost four times what the map did.
+	tenants sync.Map
+
+	mu sync.Mutex
 	// open is every connection the gauge has counted and not yet released,
 	// by connection rather than by client id, so that a disconnect reported
 	// twice — once by a takeover, once by mochi — is released once, and a
@@ -182,7 +190,7 @@ func New(
 		internalListener: opts.InternalListener,
 		internalTenant:   opts.InternalTenant,
 		HookBase:         mqtt.HookBase{},
-		mu:               sync.RWMutex{},
+		mu:               sync.Mutex{},
 		nc:               nc,
 		store:            st,
 		resolver:         resolver,
@@ -192,7 +200,8 @@ func New(
 		subs:             nil,
 		injector:         nil,
 		seen:             newSeen(),
-		tenants:          make(map[string]tenant.Identity),
+		ids:              newIDs(),
+		tenants:          sync.Map{},
 		open:             make(map[*mqtt.Client]tenant.ID),
 		persistedAt:      make(map[string]time.Time),
 		sessionExpiry:    opts.SessionExpiry,
@@ -602,7 +611,7 @@ func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 	msg := nats.NewMsg(subject)
 	msg.Data = will.Payload
 	msg.Header.Set(headerQoS, strconv.Itoa(int(will.Qos)))
-	msg.Header.Set(headerID, nuid.Next())
+	msg.Header.Set(headerID, h.newMessageID())
 
 	if err := setPropsHeader(msg, messageProps(props)); err != nil {
 		h.log.Warn("forwarding will without its properties", "subject", subject, "error", err)
@@ -698,12 +707,14 @@ func (h *Hook) tenantOf(cl *mqtt.Client) (tenant.ID, bool) {
 
 // identityOf returns what authentication established about a client.
 func (h *Hook) identityOf(cl *mqtt.Client) (tenant.Identity, bool) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	v, ok := h.tenants.Load(cl.ID)
+	if !ok {
+		return tenant.Identity{}, false //nolint:exhaustruct_v5 // the zero value, for a missing client
+	}
 
-	identity, ok := h.tenants[cl.ID]
+	identity, _ := v.(tenant.Identity)
 
-	return identity, ok
+	return identity, true
 }
 
 // fabricMessage is a client's publish as it travels between nodes: the
@@ -712,7 +723,7 @@ func (h *Hook) fabricMessage(subject string, pk packets.Packet) *nats.Msg {
 	msg := nats.NewMsg(subject)
 	msg.Data = pk.Payload
 	msg.Header.Set(headerQoS, strconv.Itoa(int(pk.FixedHeader.Qos)))
-	msg.Header.Set(headerID, nuid.Next())
+	msg.Header.Set(headerID, h.newMessageID())
 
 	if pk.FixedHeader.Retain {
 		msg.Header.Set(headerRetain, "1")
@@ -1169,8 +1180,9 @@ func (h *Hook) forget(clientID string) {
 	h.subs.releaseAll(clientID)
 	h.releaseSession(clientID)
 
+	h.tenants.Delete(clientID)
+
 	h.mu.Lock()
-	delete(h.tenants, clientID)
 	delete(h.persistedAt, clientID)
 	h.mu.Unlock()
 }
@@ -1183,8 +1195,9 @@ func (h *Hook) forget(clientID string) {
 // connections on it reported none, and the gauge was blind to the one
 // listener a load test is most likely to use.
 func (h *Hook) onConnected(cl *mqtt.Client, identity tenant.Identity) {
+	h.tenants.Store(cl.ID, identity)
+
 	h.mu.Lock()
-	h.tenants[cl.ID] = identity
 	h.open[cl] = identity.Tenant
 	h.mu.Unlock()
 

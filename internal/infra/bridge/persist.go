@@ -114,12 +114,16 @@ func (h *Hook) refreshDue(now time.Time) {
 			continue // nothing stored, and nothing worth storing
 		}
 
-		h.mu.RLock()
-		last, known := h.persistedAt[cl.ID]
-		identity, connected := h.tenants[cl.ID]
-		h.mu.RUnlock()
+		identity, connected := h.identityOf(cl)
+		if !connected {
+			continue
+		}
 
-		if !connected || (known && last.After(due)) {
+		h.mu.Lock()
+		last, known := h.persistedAt[cl.ID]
+		h.mu.Unlock()
+
+		if known && last.After(due) {
 			continue
 		}
 
