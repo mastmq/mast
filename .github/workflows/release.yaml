@@ -1,0 +1,56 @@
+---
+name: release
+
+# Binaries for machines that are not running containers. The Ansible
+# collection in mastmq/ansible downloads these by name, so the archive and
+# checksum names below are an interface: change them there too.
+on:
+  push:
+    tags: ["v*"]
+  # For attaching binaries to a release that was tagged before this workflow
+  # existed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: an existing tag, such as v0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+
+      # Built as the Dockerfile builds: CGO off so the binary runs on any
+      # glibc or musl, build info left embedded so `mast --version` reports
+      # the commit without ldflags.
+      - name: build
+        run: |
+          version="${TAG#v}"
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            name="mast_${version}_linux_${arch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "build/$name/mast" ./cmd/mast
+            cp LICENSE README.md "build/$name/"
+            tar -C "build/$name" -czf "dist/$name.tar.gz" mast LICENSE README.md
+          done
+          (cd dist && sha256sum ./*.tar.gz | sed 's| \./| |' > "mast_${version}_checksums.txt")
+          cat "dist/mast_${version}_checksums.txt"
+
+      # A tag pushed without a release gets a draft, so the notes are still
+      # written by a person before anything is announced.
+      - name: upload
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --draft --generate-notes
+          gh release upload "$TAG" dist/* --clobber

@@ -11,6 +11,7 @@
   &nbsp;·&nbsp; <a href="https://github.com/mastmq/mast">Broker</a>
   &nbsp;·&nbsp; <a href="https://github.com/mastmq/docs">Docs</a>
   &nbsp;·&nbsp; <a href="https://github.com/mastmq/charts">Helm charts</a>
+  &nbsp;·&nbsp; <a href="https://github.com/mastmq/ansible">Ansible</a>
   &nbsp;·&nbsp; <a href="https://github.com/mastmq/bench">Benchmarks</a>
 </p>
 

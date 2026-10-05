@@ -177,6 +177,7 @@ Two traps that cost real time:
 | --- | --- |
 | `test.yaml` | lint, test + codecov, `govulncheck`, **fuzz on every push**, then build |
 | `docker.yaml` | multi-tag ghcr image. PRs build but do not publish |
+| `release.yaml` | linux amd64/arm64 tarballs and a checksum file on the GitHub release, for `mastmq/ansible`. The file names are that collection's interface |
 | `codeql.yml` | weekly security scan |
 
 `govulncheck` runs on every push, not only on dependency bumps — a dependency can become vulnerable without a line of our code changing. It fails only on *reachable* vulnerabilities; treating unreachable ones as failure is how a red pipeline stops meaning anything.
@@ -190,7 +191,7 @@ This repo is one of six. A behaviour change usually touches more than one.
 | Change | Also update |
 | --- | --- |
 | delivery semantics | `docs/ARCHITECTURE.md`, `mastdocs/guides/delivery-guarantees.md`, README status block, website |
-| a config field | `configs/config.example.toml`, the Helm chart in `mastmq/charts`, the chart README |
+| a config field | `configs/config.example.toml`, the Helm chart in `mastmq/charts`, the chart README, the Ansible role in `mastmq/ansible` |
 | what works / what does not | the README status blockquote **and** the "Not yet" line — they have gone stale together twice |
 | a design decision | `docs/ARCHITECTURE.md` gets the *why*; the README gets the summary |
 
