@@ -125,11 +125,13 @@ type Hook struct {
 	durable     atomic.Bool
 	stopDurable func()
 
-	// sessions is this node's claim on each client id it holds, and nodeID
+	// sessions is this node's claim on each client id it holds, noticeSub
+	// the one subscription that hears every other node's claims, and nodeID
 	// names the node in a notice so a human reading the log knows where a
 	// client went.
-	sessions *sessions
-	nodeID   string
+	sessions  *sessions
+	noticeSub *nats.Subscription
+	nodeID    string
 
 	metrics *obs.Metrics
 
@@ -200,6 +202,7 @@ func New(
 		durable:          atomic.Bool{},
 		stopDurable:      nil,
 		sessions:         newSessions(),
+		noticeSub:        nil,
 		nodeID:           opts.NodeID,
 	}
 	h.subs = newRegistry(nc, h.onNATSMessage)
@@ -213,6 +216,8 @@ func (h *Hook) Attach(server *mqtt.Server) {
 	// Built exactly as mochi builds its own, so an injected message is
 	// indistinguishable from one sent through [mqtt.Server.Publish].
 	h.injector = server.NewClient(nil, mqtt.LocalListener, mqtt.InlineClientId, true)
+
+	h.listenForNotices()
 
 	if h.store != nil && h.sessionExpiry > 0 {
 		go h.refreshSessions()
@@ -228,6 +233,11 @@ func (h *Hook) Stop() error {
 
 		if h.stopDurable != nil {
 			h.stopDurable()
+		}
+
+		if h.noticeSub != nil {
+			// The connection is closing with the server regardless.
+			_ = h.noticeSub.Unsubscribe()
 		}
 	})
 

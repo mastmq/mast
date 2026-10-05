@@ -39,20 +39,47 @@ type sessionNotice struct {
 	Node  string `json:"node"`
 }
 
-// session is this node's claim on one client id.
-type session struct {
-	sub   *nats.Subscription
-	owner string
-}
-
-// sessions tracks the claims this node holds, keyed by mounted client id.
+// sessions tracks the claims this node holds: the owner token of each
+// mounted client id.
+//
+// One subscription hears every notice in the cluster, rather than one per
+// claim. A claim used to open its own NATS subscription on the client's
+// subject, which was the natural shape and the expensive one: nats.go runs
+// a goroutine per subscription, each SUBSCRIBE and UNSUBSCRIBE is a round
+// trip to the core and an interest update across the cluster, and a
+// persistent session keeps its claim for as long as it lives, so an edge
+// holding 25k devices held 25k subscriptions and goroutines for them even
+// while they were asleep. A connection storm was a subscription storm. The
+// wildcard puts every notice in front of every node instead, which is one
+// small message per CONNECT anywhere in the cluster, and a map lookup
+// decides whether it concerns this one.
 type sessions struct {
 	mu   sync.Mutex
-	held map[string]session
+	held map[string]string
 }
 
 func newSessions() *sessions {
-	return &sessions{mu: sync.Mutex{}, held: make(map[string]session)}
+	return &sessions{mu: sync.Mutex{}, held: make(map[string]string)}
+}
+
+// noticeSubject is the node's one subscription to the control plane.
+const noticeSubject = sessionRoot + ".>"
+
+// listenForNotices opens the node's subscription to the control plane.
+//
+// Failing is not fatal, for the same reason a failed claim never was:
+// without it a client can end up live in two places, which is the bug this
+// prevents, but refusing every connection would turn duplicate delivery
+// into an outage.
+func (h *Hook) listenForNotices() {
+	sub, err := h.nc.Subscribe(noticeSubject, h.onSessionNotice)
+	if err != nil {
+		h.log.Error("listening for session notices: cross-node takeover is disabled on this node", "error", err)
+
+		return
+	}
+
+	h.noticeSub = sub
 }
 
 // sessionSubject is where notices for one client id are published.
@@ -79,37 +106,19 @@ func newOwner() string {
 	return hex.EncodeToString(b)
 }
 
-// claimSession announces that this connection now owns the client id, and
-// listens for anyone else claiming it later.
+// claimSession announces that this connection now owns the client id.
 //
-// Subscribe before publishing: the order makes this node receive its own
-// notice, which is the cheapest proof the subscription is live, and the
-// owner token tells it to ignore it.
+// Recorded before it is published, so the node's own notice finds the claim
+// and recognises the owner token rather than taking the session over from
+// itself. mochi has already displaced any local client with this id, so a
+// claim still held for it belongs to that dead connection and is simply
+// overwritten.
 func (h *Hook) claimSession(id tenant.ID, bareClientID, mountedClientID string) {
-	subject := sessionSubject(id, bareClientID)
 	owner := newOwner()
 
-	sub, err := h.nc.Subscribe(subject, h.onSessionNotice)
-	if err != nil {
-		// Not fatal. Without the claim a client can end up connected in two
-		// places, which is the bug this exists to prevent, but refusing the
-		// connection outright would turn a duplicate-delivery problem into
-		// an outage.
-		h.log.Error("claiming session", "client", mountedClientID, "error", err)
-
-		return
-	}
-
 	h.sessions.mu.Lock()
-	previous, replaced := h.sessions.held[mountedClientID]
-	h.sessions.held[mountedClientID] = session{sub: sub, owner: owner}
+	h.sessions.held[mountedClientID] = owner
 	h.sessions.mu.Unlock()
-
-	// mochi has already displaced any local client with this id, so a claim
-	// we were still holding belongs to that dead connection.
-	if replaced {
-		h.unsubscribeSession(previous.sub, mountedClientID)
-	}
 
 	notice, err := json.Marshal(sessionNotice{Owner: owner, Node: h.nodeID})
 	if err != nil {
@@ -118,7 +127,7 @@ func (h *Hook) claimSession(id tenant.ID, bareClientID, mountedClientID string) 
 		return
 	}
 
-	if err := h.nc.Publish(subject, notice); err != nil {
+	if err := h.nc.Publish(sessionSubject(id, bareClientID), notice); err != nil {
 		h.log.Error("announcing session", "client", mountedClientID, "error", err)
 	}
 }
@@ -126,19 +135,18 @@ func (h *Hook) claimSession(id tenant.ID, bareClientID, mountedClientID string) 
 // releaseSession drops this node's claim.
 func (h *Hook) releaseSession(mountedClientID string) {
 	h.sessions.mu.Lock()
-	held, ok := h.sessions.held[mountedClientID]
 	delete(h.sessions.held, mountedClientID)
 	h.sessions.mu.Unlock()
-
-	if ok {
-		h.unsubscribeSession(held.sub, mountedClientID)
-	}
 }
 
-func (h *Hook) unsubscribeSession(sub *nats.Subscription, mountedClientID string) {
-	if err := sub.Unsubscribe(); err != nil {
-		h.log.Debug("releasing session claim", "client", mountedClientID, "error", err)
-	}
+// holdsSession reports the owner token this node holds for a client, if any.
+func (h *Hook) holdsSession(mountedClientID string) (string, bool) {
+	h.sessions.mu.Lock()
+	defer h.sessions.mu.Unlock()
+
+	owner, ok := h.sessions.held[mountedClientID]
+
+	return owner, ok
 }
 
 // onSessionNotice disconnects a local client whose session has been claimed
@@ -154,13 +162,6 @@ func (h *Hook) onSessionNotice(msg *nats.Msg) {
 		return
 	}
 
-	var notice sessionNotice
-	if err := json.Unmarshal(msg.Data, &notice); err != nil {
-		h.log.Warn("undecodable session notice", "subject", msg.Subject, "error", err)
-
-		return
-	}
-
 	id, clientID, err := parseSessionSubject(msg.Subject)
 	if err != nil {
 		h.log.Warn("undecodable session subject", "subject", msg.Subject, "error", err)
@@ -168,14 +169,25 @@ func (h *Hook) onSessionNotice(msg *nats.Msg) {
 		return
 	}
 
+	// Every CONNECT in the cluster lands here, and nearly all of them are
+	// for clients this node has never heard of, so that is decided on the
+	// subject alone before the notice is decoded.
 	mounted := mountClient(id, clientID)
 
-	h.sessions.mu.Lock()
-	held, ok := h.sessions.held[mounted]
-	h.sessions.mu.Unlock()
+	owner, ok := h.holdsSession(mounted)
+	if !ok {
+		return
+	}
 
-	// Our own notice, or one for a client we do not hold.
-	if !ok || held.owner == notice.Owner {
+	var notice sessionNotice
+	if err := json.Unmarshal(msg.Data, &notice); err != nil {
+		h.log.Warn("undecodable session notice", "subject", msg.Subject, "error", err)
+
+		return
+	}
+
+	// Our own notice.
+	if owner == notice.Owner {
 		return
 	}
 
