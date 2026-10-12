@@ -13,7 +13,7 @@ require (
 	github.com/knadh/koanf/providers/structs v1.0.1
 	github.com/knadh/koanf/v2 v2.3.7
 	github.com/mastmq/mochi/v2 v2.7.13
-	github.com/nats-io/nats-server/v2 v2.15.0
+	github.com/nats-io/nats-server/v2 v2.15.1
 	github.com/nats-io/nats.go v1.54.0
 	github.com/nats-io/nuid v1.0.1
 	github.com/prometheus/client_golang v1.24.1
