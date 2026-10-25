@@ -148,6 +148,23 @@ func outlivesConnection(cl *mqtt.Client) bool {
 	return !cl.Properties.Clean
 }
 
+// queuesForAbsence reports whether a QoS 1 or 2 message handed to cl has to
+// be written to the offline queue.
+//
+// The absence test is the predicate mochi uses a few lines later to decide
+// it cannot write to this client. Closed() alone is not it: a client that
+// sent DISCONNECT with a session to keep is not marked closed, and that is
+// exactly the client whose messages need keeping.
+//
+// The session test is what the absence test misses. A clean-session
+// subscriber that disconnects while traffic is still arriving is absent for
+// as long as mochi takes to remove it, and every message in that window was
+// a replicated write into a queue nothing would ever drain — 38 of them in
+// one QoS 2 fan-out run, from clients that were all clean.
+func queuesForAbsence(cl *mqtt.Client) bool {
+	return (cl.Net.Conn == nil || cl.Closed()) && outlivesConnection(cl)
+}
+
 // dropSession forgets everything durable about a client, which is what a
 // clean start and an expired session both mean.
 func (h *Hook) dropSession(id tenant.ID, bareClientID string) {
@@ -281,11 +298,7 @@ func (h *Hook) discardOffline(id tenant.ID, bareClientID string) {
 // client, and persisting it would turn a fire-and-forget message into
 // storage that outlives the thing it described.
 func (h *Hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) {
-	// The same predicate mochi uses a few lines later to decide it cannot
-	// write to this client. Closed() alone is not it: a client that sent
-	// DISCONNECT with a session to keep is not marked closed, and that is
-	// exactly the client whose messages need keeping.
-	if h.store == nil || (cl.Net.Conn != nil && !cl.Closed()) {
+	if h.store == nil || !queuesForAbsence(cl) {
 		return
 	}
 
