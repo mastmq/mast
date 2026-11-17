@@ -52,3 +52,47 @@ func TestQueuesForAbsenceOnlyKeepsSessionsThatOutliveTheConnection(t *testing.T)
 		})
 	}
 }
+
+// TestStoredFilterKeepsTheShare covers a persistent shared subscriber that
+// moves to another node. The stored filter dropped the share prefix with the
+// tenant, so the restored subscription was a plain one and received every
+// message its group was meant to divide.
+func TestStoredFilterKeepsTheShare(t *testing.T) {
+	for filter, want := range map[string]string{
+		"a/b":                   "a/b",
+		"a/#":                   "a/#",
+		"$share/workers/jobs/+": "$share/workers/jobs/+",
+		"$SHARE/g/x":            "$share/g/x", // mochi matches the prefix in any case
+		"/lead/":                "/lead/",
+	} {
+		mounted := mountFilter("acme", filter)
+
+		stored := storedFilter("acme", mounted)
+		if stored != want {
+			t.Errorf("stored %q as %q, want %q", filter, stored, want)
+		}
+
+		if back := mountFilter("acme", stored); back != mounted {
+			t.Errorf("%q restored as %q, want %q", filter, back, mounted)
+		}
+	}
+}
+
+// TestRouteRoundTrip pins the route the bridge hands itself through a
+// packet field mochi never encodes.
+func TestRouteRoundTrip(t *testing.T) {
+	for _, r := range []route{
+		{id: "abc", tenant: "", queue: "", subject: ""},
+		{id: "", tenant: "", queue: "", subject: ""},
+		{id: "abc", tenant: "acme", queue: "acme.workers", subject: "t.acme.jobs.*"},
+	} {
+		got, ok := parseRoute(r.String())
+		if !ok || got != r {
+			t.Errorf("route %+v came back as %+v (ok=%v)", r, got, ok)
+		}
+	}
+
+	if _, ok := parseRoute(""); ok {
+		t.Error("an empty server reference parsed as a route")
+	}
+}

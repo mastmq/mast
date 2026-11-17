@@ -102,6 +102,8 @@ func (h *Hook) onDurable(subject string, header nats.Header, data []byte) {
 		return
 	}
 
+	h.count(func(m *obs.Metrics) { m.DurableRead.WithLabelValues("bridge").Inc() })
+
 	// Redelivered after an acknowledgement went missing, and already handed
 	// to mochi the first time.
 	if !h.seen.first(header.Get(headerID)) {

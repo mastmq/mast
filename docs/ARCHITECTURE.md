@@ -8,7 +8,9 @@ JetStream consumers are Raft state machines. A NATS server holds on the order of
 
 Core NATS has the opposite profile. It handles tens of millions of subjects, builds interest only for subjects that have subscribers, propagates interest only to servers that need it, and costs roughly 1GB of memory per million subscriptions. Live delivery therefore rides core NATS, always, and never a JetStream consumer.
 
-The rule that falls out: **persistent state scales as keys, not as consensus groups.** Sessions, retained messages, and bounded offline queues go in a small number of JetStream KV buckets — three buckets, not 600k consumers. An offline device's queue is read on reconnect with a direct get; no consumer is created, ever.
+The rule that falls out: **persistent state scales as keys, not as consensus groups.** Sessions and retained messages go in two JetStream KV buckets, and bounded offline queues in one stream with a subject per session — a handful of streams, not 600k consumers. An offline device's queue, and a new subscriber's retained messages, are read with batched direct gets; no consumer is created, ever. Retained replay once listed keys through a KV watch, which is an ordered consumer per SUBSCRIBE, and a storm of 1,500 subscribers took two minutes and timed out on 576 of them; the direct get serves the same storm in under nine seconds.
+
+A queue was first one KV entry holding the whole list, rewritten under its revision per message. Each append cost the size of the queue, payloads became base64 inside JSON, and a hundred ordinary messages could outgrow a NATS message, after which every append for that device failed. A subject per session with `MaxMsgsPerSubject` makes an append one small write and leaves discarding the oldest to the server.
 
 ## Why roles instead of two binaries
 
@@ -31,6 +33,16 @@ Edge processes embed nats-server as a **leaf node** rather than joining the rout
 
 Embedding also gives the bridge an in-process connection over `net.Pipe` instead of a loopback socket, and lets two devices on the same pod exchange a message without it leaving the process.
 
+## Who owns storage
+
+Only a node carrying JetStream — a core, or an all-in-one node — creates or configures a bucket or stream. An edge binds to what exists and waits until it does. Edges used to create them with their own `core.replicas`, which nothing sets on an edge and which defaults to 1, so every cluster deployed by the chart ran its sessions, retained messages and QoS stream unreplicated whatever the cores were configured with. Each core checks the replica counts once a minute, so an edge of an older version cannot leave the cluster that way during an upgrade.
+
+## Absent sessions are the core's job
+
+An absent persistent session collects its QoS 1 and 2 messages on the core tier, not on the edge it last used. Each core runs a queuer: one watch on the sessions bucket tells it who is away and what they subscribed to, and one consumer per core on the QoS stream tells it every message. It writes each match to the session's queue under a name every writer derives from the publish's id, so the cores and the edge, all writing the same message, store it once. That is one more reader of the whole QoS stream per core — the cost the next section already names, measured at roughly doubling the cores' CPU under QoS 1 load — and it is what lets a session outlive its edge, which is the tier that restarts on every deploy. Before it, a rolling restart of the edges dropped every message published to a sleeping device.
+
+The queuer handles messages in order but does not wait for one message's writes before reading the next; the stream is acknowledged only after every write started so far is stored. Waiting per message bounded it at one replicated round trip per message, and a burst of 100,000 left it twenty seconds behind, long enough for devices to wake before their messages were queued.
+
 ## Tenancy
 
 Tenancy is enforced in two places. The subject namespace is `t.<tenant>.<...>`, and the `OnACLCheck` hook validates every publish and subscribe against the tenant resolved at authentication — never against anything the client sent on the wire.
@@ -45,7 +57,9 @@ Per-tenant quotas, metering and rate limits live at the connection lifecycle in 
 
 Request-reply on the downlink hop was the first design, and it was dropped because it cannot answer fan-out: NATS returns the first responder, and the ingress has no way to know how many nodes hold interest. Storing first sidesteps the question — the ingress needs one acknowledgement, from the stream, however many nodes will read it. The costs are a replicated write on every QoS 1 or 2 publish, which is why QoS 0 is untouched, and every node reading all QoS 1 and 2 traffic whether or not it has a subscriber for it. At the 300k-device target that second cost is the one to watch; if it bites, the answer is filtering the per-node consumer, not a consumer per filter.
 
-What is still weaker than MQTT users assume: a shared subscription spanning nodes is served by a NATS queue group on core NATS, so its cross-node hop is still at-most-once; and a node that dies holding a message it has taken but not delivered loses it. Both are in the delivery guarantees guide.
+What is still weaker than MQTT users assume: a shared subscription spanning nodes is served by a NATS queue group on core NATS, so its cross-node hop is still at-most-once; a node that dies holding a message it has taken but not delivered loses it; and a device connected to an edge that is killed outright is not queued for until it reconnects elsewhere, because its session is still recorded as held. All three are in the delivery guarantees guide.
+
+A per-node consumer is ephemeral and lives on one core. When that core dies, the client is told only that heartbeats stopped, and it went on pulling from a consumer that no longer existed: a core killed under load silently stopped every reader whose consumer it held, edges' bridges included. A missed heartbeat now replaces the consumer from the last message handled.
 
 **Shared subscriptions are exactly-once but not round-robin.** `$share` maps onto a NATS queue group, and a queue group serves a local member first: a leaf node routes to its own members if it has any and only goes upstream when it has none. Verified on a real three-node cluster — with one worker on each of two edge nodes, all twenty jobs went to the worker on whichever node the producer was connected to, and none were duplicated. The MQTT guarantee holds, because each message is still delivered exactly once to exactly one group member. The distribution is not what an MQTT user expects from `$share`, which is usually read as round-robin across the whole group.
 

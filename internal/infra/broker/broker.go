@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/mastmq/mast/internal/domain/tenant"
@@ -19,6 +20,7 @@ import (
 	"github.com/mastmq/mast/internal/infra/mqttd"
 	"github.com/mastmq/mast/internal/infra/natsd"
 	"github.com/mastmq/mast/internal/infra/obs"
+	"github.com/mastmq/mast/internal/infra/offline"
 	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mastmq/mochi/v2"
 	natsgo "github.com/nats-io/nats.go"
@@ -38,6 +40,18 @@ type Broker struct {
 	store  *store.Store
 	obs    *obs.Server
 	log    *slog.Logger
+
+	// life ends the background work a node owns past Start: the queuer, and
+	// on a core the loop that keeps trying to start it.
+	life     context.Context //nolint:containedctx // the node's own lifetime, cancelled by Close
+	shutdown context.CancelFunc
+	wg       sync.WaitGroup
+
+	queueMu sync.Mutex
+	queuer  *offline.Queuer
+	// queueStore is the store a core opens for its queuer. A core has no
+	// bridge, so it is not b.store, which tests read from edges.
+	queueStore *store.Store
 }
 
 // ObsAddr reports where metrics, health and pprof are actually served,
@@ -77,7 +91,13 @@ func Start(
 		return nil, err
 	}
 
-	b := &Broker{nats: nats, hook: nil, server: nil, store: nil, obs: nil, log: log}
+	life, shutdown := context.WithCancel(context.WithoutCancel(ctx))
+
+	b := &Broker{
+		nats: nats, hook: nil, server: nil, store: nil, obs: nil, log: log,
+		life: life, shutdown: shutdown, wg: sync.WaitGroup{},
+		queueMu: sync.Mutex{}, queuer: nil, queueStore: nil,
+	}
 
 	// The subscription gauge reads through the hook, so the registry is
 	// built before it and handed the accessor.
@@ -89,53 +109,26 @@ func Start(
 	// metrics, no health and no pprof at all.
 	b.obs, err = obs.Serve(ctx, cfg.Obs.Addr, registry, log)
 	if err != nil {
-		nats.Shutdown()
+		b.abort()
 
 		return nil, err
 	}
 
-	// A core node carries storage and consensus and terminates no MQTT.
+	// A core node carries storage and consensus and terminates no MQTT. It
+	// does queue for absent sessions, in the background: a core cannot
+	// open a stream until enough of its peers are up to elect a leader, and
+	// a core that waited for that inside Start would never finish starting
+	// the peers it is waiting for.
 	if cfg.Role == config.RoleCore {
+		b.wg.Go(func() { b.runCore(b.life, cfg, metrics) })
+
 		return b, nil
 	}
 
-	// Opening the store is fatal rather than degraded. A broker that
-	// silently drops retained messages and offline queues looks like it is
-	// working, which is worse than refusing to start.
-	openCtx, cancel := context.WithTimeout(ctx, storeOpenTimeout)
-	defer cancel()
-
-	b.store, err = openStore(openCtx, cfg, nats)
-	if err != nil {
-		nats.Shutdown()
+	if err := b.startMQTTSide(ctx, cfg, resolver, policy, metrics); err != nil {
+		b.abort()
 
 		return nil, err
-	}
-
-	b.hook = bridge.New(nats.Conn(), b.store, resolver, policy, bridge.Options{
-		Metrics:          metrics,
-		InternalListener: mqttd.InternalListenerID,
-		InternalTenant:   tenant.ID(cfg.Tenant.Default),
-		// The embedded server's id rather than the configured name: the
-		// name defaults to the role, so every edge pod would answer to
-		// "mast-edge" and a log line naming one would name them all.
-		NodeID:        nats.ID(),
-		SessionExpiry: cfg.Session.Expiry,
-		DurableQoS:    cfg.Fabric.DurableQoS,
-	}, log)
-
-	b.server, err = mqttd.New(cfg, b.hook, log)
-	if err != nil {
-		nats.Shutdown()
-
-		return nil, err
-	}
-
-	// Serve starts the listener goroutines and returns; it does not block.
-	if err := b.server.Serve(); err != nil {
-		nats.Shutdown()
-
-		return nil, fmt.Errorf("broker: serving mqtt: %w", err)
 	}
 
 	return b, nil
@@ -167,12 +160,18 @@ func openStore(ctx context.Context, cfg config.Config, nats *natsd.Server) (*sto
 	const retry = 250 * time.Millisecond
 
 	for {
-		st, err := store.Open(ctx, nats.Conn(), natsd.JetStreamDomain, cfg.Core.Replicas, cfg.Session.Expiry)
-		if err == nil && cfg.Fabric.DurableQoS {
-			err = st.OpenDurable(ctx, cfg.Core.Replicas, cfg.Fabric.DurableMaxAge)
-		}
+		// Each attempt gets its own deadline. Until a core tier has elected
+		// a meta leader nothing answers a JetStream request at all, so an
+		// attempt does not fail, it waits — and one that waited for the
+		// whole of ctx turned a ten-second election into a thirty-second
+		// start, every time.
+		attempt, cancel := context.WithTimeout(ctx, openAttempt)
+		st, err := open(attempt, cfg, nats)
 
-		if err == nil || !notReadyYet(err) {
+		cancel()
+
+		unanswered := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+		if err == nil || (!notReadyYet(err) && !unanswered) {
 			return st, err
 		}
 
@@ -182,6 +181,26 @@ func openStore(ctx context.Context, cfg config.Config, nats *natsd.Server) (*sto
 		case <-time.After(retry):
 		}
 	}
+}
+
+// open provisions the store on a node that carries JetStream, and binds to
+// what the core provisioned on one that does not.
+func open(ctx context.Context, cfg config.Config, nats *natsd.Server) (*store.Store, error) {
+	if cfg.Role == config.RoleEdge {
+		st, err := store.Bind(ctx, nats.Conn(), natsd.JetStreamDomain)
+		if err == nil && cfg.Fabric.DurableQoS {
+			err = st.BindDurable(ctx)
+		}
+
+		return st, err
+	}
+
+	st, err := store.Open(ctx, nats.Conn(), natsd.JetStreamDomain, cfg.Core.Replicas, cfg.Session.Expiry)
+	if err == nil && cfg.Fabric.DurableQoS {
+		err = st.OpenDurable(ctx, cfg.Core.Replicas, cfg.Fabric.DurableMaxAge)
+	}
+
+	return st, err
 }
 
 // jsStreamCreateFailed is JetStream's general "stream creation failed"
@@ -205,7 +224,8 @@ func notReadyYet(err error) bool {
 		return true
 	}
 
-	return errors.Is(err, jetstream.ErrJetStreamNotEnabled) ||
+	return errors.Is(err, store.ErrNotProvisioned) ||
+		errors.Is(err, jetstream.ErrJetStreamNotEnabled) ||
 		errors.Is(err, jetstream.ErrJetStreamNotEnabledForAccount) ||
 		errors.Is(err, natsgo.ErrNoResponders)
 }
@@ -242,6 +262,14 @@ func sources(b *Broker, nats *natsd.Server) obs.Sources {
 	}
 }
 
+// QueuerReady reports whether this node is queueing for absent sessions.
+func (b *Broker) QueuerReady() bool {
+	b.queueMu.Lock()
+	defer b.queueMu.Unlock()
+
+	return b.queuer != nil
+}
+
 // Close stops the node, MQTT first so that no new message enters the bridge
 // after the fabric beneath it has gone.
 func (b *Broker) Close() {
@@ -253,5 +281,203 @@ func (b *Broker) Close() {
 		}
 	}
 
+	b.shutdown()
+	b.wg.Wait()
+	b.stopQueuer()
+
+	if b.store != nil {
+		b.store.Close()
+	}
+
+	b.queueMu.Lock()
+	if b.queueStore != nil {
+		b.queueStore.Close()
+	}
+	b.queueMu.Unlock()
+
 	b.nats.Shutdown()
+}
+
+// openAttempt bounds one attempt to open the store, inside the overall
+// storeOpenTimeout.
+const openAttempt = 5 * time.Second
+
+// coreRetry is how long a core waits between attempts to provision.
+const coreRetry = time.Second
+
+// runCore is a core's own work past serving NATS: it provisions the store,
+// queues for absent sessions, and keeps the store configured as asked.
+//
+// It runs in the background and retries for as long as the core runs. Until
+// it has succeeded the edges wait, since they no longer create anything
+// themselves, and an away session is queued for only by its last edge.
+func (b *Broker) runCore(life context.Context, cfg config.Config, metrics *obs.Metrics) {
+	st := b.provision(life, cfg, metrics)
+	if st == nil {
+		return
+	}
+
+	ticker := time.NewTicker(reconcileEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-life.Done():
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(life, storeOpenTimeout)
+			fixed, err := st.Reconcile(ctx, cfg.Core.Replicas)
+
+			cancel()
+
+			if err != nil {
+				b.log.Warn("checking the store's replicas", "error", err)
+			}
+
+			if len(fixed) > 0 {
+				b.log.Warn("restored the configured replicas on streams another node had changed",
+					"streams", fixed, "replicas", cfg.Core.Replicas)
+			}
+		}
+	}
+}
+
+// reconcileEvery is how often a core checks the store's replica counts.
+const reconcileEvery = time.Minute
+
+// provision opens the store and starts the queuer, retrying until both
+// work or the core stops. It returns nil only when the core is stopping.
+func (b *Broker) provision(life context.Context, cfg config.Config, metrics *obs.Metrics) *store.Store {
+	for {
+		openCtx, cancel := context.WithTimeout(life, storeOpenTimeout)
+		st, err := openStore(openCtx, cfg, b.nats)
+
+		cancel()
+
+		if err == nil && cfg.Fabric.DurableQoS {
+			if err = b.startQueuer(st, cfg, metrics); err != nil {
+				st.Close()
+			}
+		}
+
+		if err == nil {
+			b.queueMu.Lock()
+			b.queueStore = st
+			b.queueMu.Unlock()
+
+			return st
+		}
+
+		b.log.Warn("the core has not provisioned the store yet; edges wait for it", "error", err)
+
+		select {
+		case <-life.Done():
+			return nil
+		case <-time.After(coreRetry):
+		}
+	}
+}
+
+// startQueuer begins queueing for absent sessions from st.
+func (b *Broker) startQueuer(st *store.Store, cfg config.Config, metrics *obs.Metrics) error {
+	q, err := offline.Start(b.life, st, cfg.Session.Expiry, metrics, b.log)
+	if err != nil {
+		return fmt.Errorf("broker: starting the queuer: %w", err)
+	}
+
+	b.queueMu.Lock()
+	b.queuer = q
+	b.queueMu.Unlock()
+
+	return nil
+}
+
+func (b *Broker) stopQueuer() {
+	b.queueMu.Lock()
+	q := b.queuer
+	b.queuer = nil
+	b.queueMu.Unlock()
+
+	if q != nil {
+		q.Stop()
+	}
+}
+
+// startMQTTSide opens the store and serves MQTT over it: everything a node
+// that is not a core does.
+func (b *Broker) startMQTTSide(
+	ctx context.Context,
+	cfg config.Config,
+	resolver tenant.Resolver,
+	policy tenant.Policy,
+	metrics *obs.Metrics,
+) error {
+	// Opening the store is fatal rather than degraded. A broker that
+	// silently drops retained messages and offline queues looks like it is
+	// working, which is worse than refusing to start.
+	openCtx, cancel := context.WithTimeout(ctx, storeOpenTimeout)
+	defer cancel()
+
+	st, err := openStore(openCtx, cfg, b.nats)
+	if err != nil {
+		return err
+	}
+
+	b.store = st
+
+	// An all-in-one node is its own core, and so its own queuer.
+	if cfg.Role == config.RoleAllInOne && cfg.Fabric.DurableQoS {
+		if err := b.startQueuer(b.store, cfg, metrics); err != nil {
+			return err
+		}
+	}
+
+	return b.serveMQTT(cfg, resolver, policy, metrics)
+}
+
+// abort undoes a Start that failed part of the way through.
+func (b *Broker) abort() {
+	b.stopQueuer()
+	b.shutdown()
+
+	if b.store != nil {
+		b.store.Close()
+	}
+
+	b.nats.Shutdown()
+}
+
+// serveMQTT builds the bridge and the MQTT listeners over an open store, and
+// starts serving.
+func (b *Broker) serveMQTT(
+	cfg config.Config,
+	resolver tenant.Resolver,
+	policy tenant.Policy,
+	metrics *obs.Metrics,
+) error {
+	b.hook = bridge.New(b.nats.Conn(), b.store, resolver, policy, bridge.Options{
+		Metrics:          metrics,
+		InternalListener: mqttd.InternalListenerID,
+		InternalTenant:   tenant.ID(cfg.Tenant.Default),
+		// The embedded server's id rather than the configured name: the
+		// name defaults to the role, so every edge pod would answer to
+		// "mast-edge" and a log line naming one would name them all.
+		NodeID:        b.nats.ID(),
+		SessionExpiry: cfg.Session.Expiry,
+		DurableQoS:    cfg.Fabric.DurableQoS,
+	}, b.log)
+
+	server, err := mqttd.New(cfg, b.hook, b.log)
+	if err != nil {
+		return err
+	}
+
+	b.server = server
+
+	// Serve starts the listener goroutines and returns; it does not block.
+	if err := b.server.Serve(); err != nil {
+		return fmt.Errorf("broker: serving mqtt: %w", err)
+	}
+
+	return nil
 }

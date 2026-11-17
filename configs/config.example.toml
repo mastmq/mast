@@ -32,8 +32,9 @@ connect_timeout = "10s"
 
 [nats]
 name = ""
-# Empty means the embedded server is reachable in-process only. Set it if you
-# want the nats CLI against this node.
+# Empty means the embedded server is reachable in-process only — on a core,
+# loopback on a random port, since a core cannot form routes without a client
+# listener. Set it if you want the nats CLI against this node.
 client_addr = ""
 # Keep this on. Without it you have no visibility into your own data plane.
 monitor_addr = "127.0.0.1:8222"
@@ -43,7 +44,7 @@ routes = []
 listen_addr = ""
 leaf_addr = ""
 store_dir = "./data"  # must be a persistent volume in the core role
-replicas = 1          # use 3 for a real core tier
+replicas = 1          # use 3 for a real core tier; read only by cores, edges bind to what they made
 
 [edge]
 core_urls = []        # required in the edge role

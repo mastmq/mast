@@ -364,6 +364,7 @@ func (h *Hook) OnSessionEstablished(cl *mqtt.Client, pk packets.Packet) {
 	bareID := unmountClient(id, cl.ID)
 
 	if len(cl.State.Subscriptions.GetAll()) > 0 {
+		h.persistSession(cl, id, bareID)
 		h.discardOffline(id, bareID)
 
 		return
@@ -553,13 +554,13 @@ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 	if !expire {
 		h.log.Debug("client away, session retained", "client", cl.ID)
 
-		// Written again now, because session.expiry counts from here: the
-		// bucket's TTL runs from the last write, and without this it ran
-		// from whenever the subscriptions last changed. A client taken over
-		// by another node has already been forgotten, so it is not written
-		// over the session the new owner holds.
+		// Written again now, as away: that is what tells the queuer to
+		// keep this client's messages, and session.expiry counts from here,
+		// since the bucket's TTL runs from the last write. A client taken
+		// over by another node has already been forgotten, so it is not
+		// written over the session the new owner holds.
 		if id, ok := h.tenantOf(cl); ok {
-			h.persistSession(cl, id, unmountClient(id, cl.ID))
+			h.markAway(cl, id, unmountClient(id, cl.ID))
 		}
 
 		return
@@ -668,29 +669,24 @@ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 // only for the filter whose subject it arrived on, because "$share/g/a/#"
 // and "$share/g/a/+" are two groups that each get a copy.
 func (h *Hook) OnSelectSubscribers(subs *mqtt.Subscribers, pk packets.Packet) *mqtt.Subscribers {
-	route := pk.Properties.ServerReference
-	if route == routePlain {
+	r, ok := parseRoute(pk.Properties.ServerReference)
+	if !ok {
+		return subs // not injected by the bridge
+	}
+
+	if r.queue == "" {
 		clear(subs.Shared)
 		clear(subs.SharedSelected)
 
 		return subs
 	}
 
-	fields := strings.Split(route, routeSep)
-
-	const queueFields = 4
-	if len(fields) != queueFields || fields[0] != "q" {
-		return subs // not injected by the bridge
-	}
-
-	id, queue, subject := tenant.ID(fields[1]), fields[2], fields[3]
-
 	clear(subs.Subscriptions)
 	clear(subs.InlineSubscriptions)
 	clear(subs.SharedSelected)
 
 	for filter := range subs.Shared {
-		if !servesQueue(id, filter, queue, subject) {
+		if !servesQueue(r.tenant, filter, r.queue, r.subject) {
 			delete(subs.Shared, filter)
 		}
 	}
@@ -815,8 +811,6 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 
 	mounted := mount(tenant.ID(tenantID), mqttTopic)
 
-	route := routePlain
-
 	if queue != "" {
 		// mochi only asks the hook to choose when a shared subscriber
 		// matches. Without one, the copy would fall through to the plain
@@ -824,9 +818,9 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 		if len(h.server.Topics.Subscribers(mounted).Shared) == 0 {
 			return
 		}
-
-		route = queueRoute(tenantID, queue, queueSubject)
 	}
+
+	route := route{id: header.Get(headerID), tenant: tenant.ID(tenantID), queue: queue, subject: queueSubject}.String()
 
 	// Inject at the QoS the publisher used. mochi then downgrades per
 	// subscription to the minimum of that and what each subscriber
@@ -840,8 +834,8 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 
 	// ServerReference is only valid on CONNACK and DISCONNECT, so mochi
 	// never encodes it on a PUBLISH. That makes it the one field that can
-	// carry the route from here to OnSelectSubscribers without any chance
-	// of reaching a client.
+	// carry the route from here to OnSelectSubscribers and OnQosPublish
+	// without any chance of reaching a client.
 	props := packets.Properties{ServerReference: route}
 
 	if carried := propsFromHeader(header); carried != nil {
@@ -871,16 +865,55 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 	h.count(func(m *obs.Metrics) { m.MessagesOut.WithLabelValues(tenantID).Inc() })
 }
 
-// routePlain marks a message that arrived on a plain NATS subscription.
-const routePlain = "p"
+// route is what the bridge tells its own later hooks about a message it
+// injected: which publish it is, and for a queue copy which shared group
+// NATS picked this node for and on which subscription.
+//
+// The id travels so that [Hook.OnQosPublish] can queue a message under the
+// same name the queuer on the core uses for it, which is what lets the
+// stream store the two writes once.
+type route struct {
+	id      string
+	tenant  tenant.ID
+	queue   string
+	subject string
+}
 
-// routeSep separates the fields of a queue route. NUL can occur in none of
-// them: not in a tenant, which the codec restricts, and not in a subject.
+// routeSep separates a route's fields. NUL can occur in none of them: not
+// in an id, which the bridge generates, not in a tenant, which the codec
+// restricts, and not in a subject.
 const routeSep = "\x00"
 
-// queueRoute marks a message NATS delivered to one shared subscription group.
-func queueRoute(tenantID, queue, subject string) string {
-	return "q" + routeSep + tenantID + routeSep + queue + routeSep + subject
+// Route kinds: a copy from a plain subscription, or one NATS delivered to a
+// single shared subscription group.
+const (
+	routePlain = "p"
+	routeQueue = "q"
+)
+
+func (r route) String() string {
+	if r.queue == "" {
+		return routePlain + routeSep + r.id
+	}
+
+	return routeQueue + routeSep + r.id + routeSep + string(r.tenant) + routeSep + r.queue + routeSep + r.subject
+}
+
+// parseRoute reads a route back. ok is false for a packet the bridge did
+// not inject.
+func parseRoute(raw string) (route, bool) {
+	fields := strings.Split(raw, routeSep)
+
+	const plainFields, queueFields = 2, 5
+
+	switch {
+	case len(fields) == plainFields && fields[0] == routePlain:
+		return route{id: fields[1], tenant: "", queue: "", subject: ""}, true
+	case len(fields) == queueFields && fields[0] == routeQueue:
+		return route{id: fields[1], tenant: tenant.ID(fields[2]), queue: fields[3], subject: fields[4]}, true
+	default:
+		return route{}, false //nolint:exhaustruct_v5 // nothing to return
+	}
 }
 
 // servesQueue reports whether a mounted shared filter is the one a NATS queue

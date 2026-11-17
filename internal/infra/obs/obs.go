@@ -61,6 +61,16 @@ type Metrics struct {
 	// not store. Each one was refused rather than acknowledged, so any
 	// increase is publishers being told to retry.
 	DurableFailures prometheus.Counter
+
+	// DurableRead counts messages read off the durable stream, by reader:
+	// the bridge delivering to local subscribers, the queuer keeping them
+	// for absent ones. Every reader on every node should climb at the same
+	// rate as the stream; one that stops has lost its consumer.
+	DurableRead *prometheus.CounterVec
+
+	// QueuerAway is how many sessions this node's queuer is keeping
+	// messages for. It should match on every core.
+	QueuerAway prometheus.Gauge
 }
 
 // NATSCounts is what the NATS client's asynchronous handlers have observed.
@@ -126,6 +136,12 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 			Name:      "durable_publish_failures_total",
 			Help:      "QoS 1 and 2 publishes refused because the durable stream would not store them.",
 		}),
+		DurableRead: factory("durable_read_total", "Messages read off the durable stream.", "reader"),
+		QueuerAway: prometheus.NewGauge(prometheus.GaugeOpts{ //nolint:exhaustruct_v5 // defaults are right
+			Namespace: namespace,
+			Name:      "queuer_away_sessions",
+			Help:      "Sessions this node's queuer keeps messages for, because no connection holds them.",
+		}),
 	}
 
 	if src.Subscriptions != nil {
@@ -137,7 +153,7 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 		reg.MustRegister(m.NATSSubs)
 	}
 
-	reg.MustRegister(m.DurableFailures)
+	reg.MustRegister(m.DurableFailures, m.QueuerAway)
 	registerNATSCounts(reg, src.NATS)
 
 	return m

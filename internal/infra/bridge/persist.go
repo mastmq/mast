@@ -25,8 +25,9 @@ func sessionKey(id tenant.ID, clientID string) string {
 	return topic.EncodeToken(string(id)) + "." + topic.EncodeToken(clientID)
 }
 
-// persistSession records what a client is subscribed to, so another node
-// can pick the session up.
+// persistSession records what a connected client is subscribed to, so
+// another node can pick the session up, and that a connection holds it, so
+// nothing queues for it.
 //
 // Filters are stored unmounted. The tenant is already a field, repeating it
 // inside every filter would be redundant, and a human reading the bucket
@@ -36,33 +37,88 @@ func (h *Hook) persistSession(cl *mqtt.Client, id tenant.ID, bareClientID string
 		return
 	}
 
-	subs := cl.State.Subscriptions.GetAll()
-
-	filters := make([]store.Subscription, 0, len(subs))
-	for mounted, sub := range subs {
-		filters = append(filters, store.Subscription{
-			Filter: bare(id, mounted),
-			QoS:    sub.Qos,
-		})
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
 
-	sess := store.Session{
-		ClientID:      bareClientID,
-		Tenant:        string(id),
-		Subscriptions: filters,
-		UpdatedAt:     time.Time{}, // PutSession stamps it
-	}
-
-	if err := h.store.PutSession(ctx, sessionKey(id, bareClientID), sess); err != nil {
+	record := h.sessionRecord(cl, id, bareClientID, true)
+	if err := h.store.PutSession(ctx, sessionKey(id, bareClientID), record); err != nil {
 		h.log.Warn("persisting session", "client", cl.ID, "error", err)
 
 		return
 	}
 
 	h.markPersisted(cl.ID, time.Now())
+}
+
+// markAway records that a lasting session's connection has gone, which is
+// what tells the queuer to start keeping its messages.
+//
+// Nothing is written if this connection no longer holds the session: mochi
+// may report the old connection's disconnect after a new one on this node
+// has taken over, and the store refuses the write if a connection elsewhere
+// has.
+func (h *Hook) markAway(cl *mqtt.Client, id tenant.ID, bareClientID string) {
+	if h.store == nil || !outlivesConnection(cl) {
+		return
+	}
+
+	if current, ok := h.server.Clients.Get(cl.ID); ok && current != cl {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+
+	written, err := h.store.MarkAway(ctx, sessionKey(id, bareClientID), h.sessionRecord(cl, id, bareClientID, false))
+	if err != nil {
+		h.log.Warn("recording session as away", "client", cl.ID, "error", err)
+
+		return
+	}
+
+	if !written {
+		h.log.Debug("session already held by another connection", "client", cl.ID)
+	}
+}
+
+// sessionRecord is what the sessions bucket holds for a client.
+func (h *Hook) sessionRecord(cl *mqtt.Client, id tenant.ID, bareClientID string, present bool) store.Session {
+	subs := cl.State.Subscriptions.GetAll()
+
+	filters := make([]store.Subscription, 0, len(subs))
+	for mounted, sub := range subs {
+		filters = append(filters, store.Subscription{
+			Filter: storedFilter(id, mounted),
+			QoS:    sub.Qos,
+		})
+	}
+
+	owner, _ := h.holdsSession(cl.ID)
+
+	return store.Session{
+		ClientID:      bareClientID,
+		Tenant:        string(id),
+		Subscriptions: filters,
+		UpdatedAt:     time.Time{}, // the store stamps it
+		Present:       present,
+		Owner:         owner,
+	}
+}
+
+// storedFilter is a mounted filter as the sessions bucket keeps it: without
+// the tenant, but with any share prefix.
+//
+// It used to be stored through bare, which drops the share prefix along
+// with the tenant, so a persistent shared subscriber restored on another
+// node came back as a plain subscriber and received every message the group
+// was meant to divide.
+func storedFilter(id tenant.ID, mounted string) string {
+	group, rest, shared := splitShare(mounted)
+	if !shared {
+		return unmount(id, mounted)
+	}
+
+	return sharePrefix + group + "/" + unmount(id, rest)
 }
 
 // markPersisted records when a client's session was last written.
@@ -239,21 +295,46 @@ func (h *Hook) restoreSession(cl *mqtt.Client, id tenant.ID, bareClientID string
 	h.log.Info("session restored",
 		"client", bareClientID, "tenant", string(id), "filters", len(sess.Subscriptions))
 
-	h.drainOffline(cl, id, bareClientID)
+	// Recorded as held before the backlog is read, so that the queuer stops
+	// keeping messages for a client that now receives them live. A message
+	// it queues in the moment before it hears is delivered twice, which
+	// at-least-once allows; one it skipped would be lost, which it does not.
+	h.persistSession(cl, id, bareClientID)
+
+	through, drained := h.drainOffline(cl, id, bareClientID, 0)
+
+	go h.drainLater(cl, id, bareClientID, through, drained)
+
+	// A device may resume a session and ask for this connection to be its
+	// last: MQTT 5 with a zero expiry. It has its backlog; the record goes,
+	// or the queuer would keep messages for a session that no longer exists.
+	if !outlivesConnection(cl) {
+		h.dropSession(id, bareClientID)
+	}
 }
 
 // drainOffline delivers what arrived while the client was away.
-func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string) {
+//
+// The queue is trimmed only after delivery, and only through what was read.
+// A node dying between the two delivers the backlog again on the next
+// connection rather than losing it, and a message queued while this ran
+// stays for the next drain.
+//
+// It reads only past after, the sequence an earlier drain reached, and
+// returns the sequence this one reached and whether it could read at all.
+func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string, after uint64) (uint64, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
 
 	h.log.Debug("draining offline queue", "client", cl.ID)
 
-	queued, err := h.store.Drain(ctx, sessionKey(id, bareClientID))
+	key := sessionKey(id, bareClientID)
+
+	queued, through, err := h.store.ReadQueue(ctx, key, after)
 	if err != nil {
 		h.log.Warn("draining offline queue", "client", cl.ID, "error", err)
 
-		return
+		return after, false
 	}
 
 	// To this client alone. Publishing the backlog into the node instead
@@ -265,6 +346,19 @@ func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string) 
 		}
 	}
 
+	// A deadline of its own: in a wake storm every device's trim is a
+	// replicated write at once, and one sharing the read's deadline mostly
+	// ran out of it. A trim that still fails costs storage until the stream
+	// ages it out, not a repeat, since later reads start past it.
+	if through > after {
+		trimCtx, cancelTrim := context.WithTimeout(context.Background(), storeTimeout)
+		if err := h.store.TrimQueue(trimCtx, key, through); err != nil {
+			h.log.Debug("trimming offline queue", "client", cl.ID, "error", err)
+		}
+
+		cancelTrim()
+	}
+
 	if len(queued) > 0 {
 		h.count(func(m *obs.Metrics) {
 			m.OfflineDelivered.WithLabelValues(string(id)).Add(float64(len(queued)))
@@ -272,7 +366,78 @@ func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string) 
 		h.log.Info("offline queue delivered",
 			"client", bareClientID, "tenant", string(id), "messages", len(queued))
 	}
+
+	return through, true
 }
+
+// drainLater reads the queue again after the first drain: until it works,
+// if the first could not read it, and then twice more for stragglers.
+//
+// Retrying a failed read is the first half. Giving up after one failure left
+// the backlog in the stream with nothing to fetch it: the session is marked
+// held, so nobody asks again until the device's next reconnect, which for a
+// device that stays connected may be days.
+//
+// The straggler checks are the second. A queuer that was still writing for
+// this session — retrying through a core's leader election, say — can land
+// a message after the drain read the queue. The device did not get it live,
+// because it was published while the device was away, and without another
+// look it waits for the next reconnect. One message in a hundred thousand
+// did exactly that with a core killed under load. A check is a read any
+// replica serves and almost always finds nothing.
+func (h *Hook) drainLater(cl *mqtt.Client, id tenant.ID, bareClientID string, through uint64, drained bool) {
+	pause := time.Second
+
+	for range drainRetries {
+		if drained {
+			break
+		}
+
+		if !h.waitConnected(cl, pause) {
+			return
+		}
+
+		through, drained = h.drainOffline(cl, id, bareClientID, through)
+		pause *= 2
+	}
+
+	if !drained {
+		h.log.Error("gave up delivering an offline backlog; it waits for the next reconnect", "client", cl.ID)
+
+		return
+	}
+
+	for _, after := range stragglerChecks {
+		if !h.waitConnected(cl, after) {
+			return
+		}
+
+		through, _ = h.drainOffline(cl, id, bareClientID, through)
+	}
+}
+
+// waitConnected waits d and reports whether cl is still this node's
+// connection for its client id. One that has gone drains for itself next
+// time.
+func (h *Hook) waitConnected(cl *mqtt.Client, d time.Duration) bool {
+	select {
+	case <-h.stop:
+		return false
+	case <-time.After(d):
+	}
+
+	current, ok := h.server.Clients.Get(cl.ID)
+
+	return ok && current == cl && !cl.Closed()
+}
+
+// drainRetries bounds the retrying of a failed drain: with the pause
+// doubling from a second, about a minute.
+const drainRetries = 6
+
+// stragglerChecks are the pauses before each extra look at the queue after
+// a drain. The last is past the queuer's own write deadline.
+var stragglerChecks = []time.Duration{5 * time.Second, 30 * time.Second} //nolint:gochecknoglobals // a constant list
 
 // discardOffline empties a client's queue without delivering it.
 func (h *Hook) discardOffline(id tenant.ID, bareClientID string) {
@@ -283,7 +448,7 @@ func (h *Hook) discardOffline(id tenant.ID, bareClientID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
 
-	if _, err := h.store.Drain(ctx, sessionKey(id, bareClientID)); err != nil {
+	if err := h.store.DiscardQueue(ctx, sessionKey(id, bareClientID)); err != nil {
 		h.log.Warn("discarding offline queue", "tenant", string(id), "client", bareClientID, "error", err)
 	}
 }
@@ -291,8 +456,14 @@ func (h *Hook) discardOffline(id tenant.ID, bareClientID string) {
 // OnQosPublish is called when a QoS 1 or 2 message is handed to a
 // subscriber. When that subscriber is not currently connected the message
 // is going into mochi's in-memory inflight and nowhere else, so it is
-// written to the bucket as well and replayed on reconnect — possibly by a
+// written to the queue as well and replayed on reconnect — possibly by a
 // different node, which is the whole point.
+//
+// The queuer on the core writes the same messages, and is what keeps a
+// session's queue once this node is gone. This write covers the moment
+// before the queuer has heard the session is away, and a broker running
+// without the durable stream, where there is no queuer at all. Both name
+// the message the same way, so the stream keeps one copy.
 //
 // QoS 0 is deliberately absent. MQTT lets a broker discard it for an absent
 // client, and persisting it would turn a fire-and-forget message into
@@ -331,7 +502,13 @@ func (h *Hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) 
 	}
 
 	key := sessionKey(id, unmountClient(id, cl.ID))
-	if err := h.store.Enqueue(ctx, key, msg); err != nil {
+
+	var messageID string
+	if r, ok := parseRoute(pk.Properties.ServerReference); ok {
+		messageID = r.id
+	}
+
+	if _, err := h.store.Enqueue(ctx, store.Queued{Key: key, Msg: msg, ID: store.QueueID(messageID, key)}); err != nil {
 		h.log.Warn("queueing for an absent client", "client", cl.ID, "error", err)
 
 		return

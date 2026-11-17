@@ -21,7 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,18 +33,10 @@ import (
 const (
 	bucketRetained = "mast_retained"
 	bucketSessions = "mast_sessions"
-	bucketOffline  = "mast_offline"
 )
 
-// maxOfflineMessages bounds how much is kept for one absent client.
-//
-// The bound is the point: without it a single disconnected device subscribed
-// to a chatty topic would grow until the bucket did. MQTT lets a broker
-// discard, and discarding the oldest is the least surprising choice.
-const maxOfflineMessages = 100
-
-// casRetries bounds optimistic-concurrency retries when two nodes append to
-// the same client's queue at once.
+// casRetries bounds optimistic-concurrency retries when two nodes write the
+// same session record at once.
 const casRetries = 5
 
 // ErrNotFound is returned when a key does not exist.
@@ -117,36 +109,179 @@ type Session struct {
 	Tenant        string         `json:"tenant"`
 	Subscriptions []Subscription `json:"subscriptions"`
 	UpdatedAt     time.Time      `json:"updated_at"`
+
+	// Present is whether a connection holds the session right now. The
+	// queuer reads it to know whom to keep messages for, which is why it is
+	// written on every reconnect and not only when subscriptions change:
+	// otherwise a device that came back would go on being queued for,
+	// and receive everything twice on its next return. A record written
+	// before the field existed reads as absent, which is the safe side.
+	Present bool `json:"present,omitempty"`
+	// Owner is the connection that last wrote the record, as the owner
+	// token of its session claim. A node noticing a disconnect late must not
+	// mark away a session another node's connection already holds.
+	Owner string `json:"owner,omitempty"`
 }
 
 // Store is the durable state of a mast cluster.
 type Store struct {
 	retained jetstream.KeyValue
 	sessions jetstream.KeyValue
-	offline  jetstream.KeyValue
+
+	// offline is the stream absent clients' queues live on, one subject per
+	// session. legacyOffline is the bucket they lived in before, read and
+	// emptied on the way out so an upgrade does not drop what was waiting;
+	// nil once no such bucket exists.
+	offline       jetstream.Stream
+	legacyOffline jetstream.KeyValue
 
 	// js is kept for the durable fabric stream, which is a stream rather
 	// than a bucket and is opened separately by [Store.OpenDurable].
 	js jetstream.JetStream
+
+	// direct reads many messages with one request, the only kind of bulk
+	// read that creates no consumer. apiPrefix is where it sends them.
+	direct    *directReader
+	apiPrefix string
 }
 
-// Open creates the buckets if they are absent and returns a handle.
-//
-// replicas is the replication factor for each bucket; it must not exceed the
-// number of JetStream peers or bucket creation fails.
-func Open(ctx context.Context, nc *nats.Conn, domain string, replicas int, ttl time.Duration) (*Store, error) {
+// ErrNotProvisioned is returned by [Bind] while the streams it binds to do
+// not exist yet: the core tier has not created them.
+var ErrNotProvisioned = errors.New("store: not provisioned by the core yet")
+
+// newStore is a handle with nothing opened yet.
+func newStore(nc *nats.Conn, domain string) (*Store, error) {
 	// Addressed by domain rather than through the default $JS.API prefix.
 	// An edge node runs its own JetStream-less server, which answers that
 	// prefix itself with "jetstream not enabled" instead of forwarding it,
 	// so an edge could never open a bucket at all. $JS.<domain>.API is an
 	// ordinary subject and crosses the leaf connection to the core.
-	js, err := jetstream.NewWithDomain(nc, domain)
+	js, err := jetstream.NewWithDomain(nc, domain,
+		jetstream.WithPublishAsyncTimeout(publishAckWait),
+		jetstream.WithPublishAsyncMaxPending(publishAsyncMaxPending))
 	if err != nil {
 		return nil, fmt.Errorf("store: jetstream: %w", err)
 	}
 
 	s := new(Store)
 	s.js = js
+	s.apiPrefix = "$JS." + domain + ".API."
+	s.direct = newDirectReader(nc)
+
+	return s, nil
+}
+
+// Bind opens the buckets and streams the core tier created, and changes
+// nothing about them. It is what an edge does.
+//
+// An edge used to create them, and so to configure them — with its own
+// core.replicas, which nothing sets on an edge and which defaults to 1. A
+// cluster whose cores asked for three replicas therefore ran every bucket
+// with one, and any edge starting up put them back to one if anything had
+// changed that. Only a node that carries JetStream knows how many peers
+// there are; an edge waits for one to have done it.
+func Bind(ctx context.Context, nc *nats.Conn, domain string) (*Store, error) {
+	s, err := newStore(nc, domain)
+	if err != nil {
+		return nil, err
+	}
+
+	for name, into := range map[string]*jetstream.KeyValue{
+		bucketRetained: &s.retained,
+		bucketSessions: &s.sessions,
+	} {
+		kv, err := s.js.KeyValue(ctx, name)
+		if errors.Is(err, jetstream.ErrBucketNotFound) {
+			return nil, fmt.Errorf("%w: bucket %s", ErrNotProvisioned, name)
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("store: bucket %s: %w", name, err)
+		}
+
+		*into = kv
+	}
+
+	stream, err := s.js.Stream(ctx, streamOffline)
+	if errors.Is(err, jetstream.ErrStreamNotFound) {
+		return nil, fmt.Errorf("%w: stream %s", ErrNotProvisioned, streamOffline)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("store: stream %s: %w", streamOffline, err)
+	}
+
+	s.offline = stream
+
+	if err := s.bindLegacy(ctx); err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
+// BindDurable checks that the durable stream exists, without changing it.
+func (s *Store) BindDurable(ctx context.Context) error {
+	if _, err := s.js.Stream(ctx, streamDurable); err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return fmt.Errorf("%w: stream %s", ErrNotProvisioned, streamDurable)
+		}
+
+		return fmt.Errorf("store: stream %s: %w", streamDurable, err)
+	}
+
+	return nil
+}
+
+// Reconcile puts back the replica count of anything another node changed.
+// It returns the names it corrected.
+//
+// Edges no longer configure streams, but an edge of an older version still
+// does when it starts, and a rolling upgrade has some of those. A core that
+// checks now and then is what makes the cluster end up where it was asked
+// to be rather than where the last old edge left it.
+func (s *Store) Reconcile(ctx context.Context, replicas int) ([]string, error) {
+	var fixed []string
+
+	for _, name := range []string{
+		kvStreamPrefix + bucketRetained, kvStreamPrefix + bucketSessions, streamOffline, streamDurable,
+	} {
+		stream, err := s.js.Stream(ctx, name)
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			continue // the durable stream, when durable QoS is off
+		}
+
+		if err != nil {
+			return fixed, fmt.Errorf("store: stream %s: %w", name, err)
+		}
+
+		cfg := stream.CachedInfo().Config
+		if cfg.Replicas == replicas {
+			continue
+		}
+
+		cfg.Replicas = replicas
+		if _, err := s.js.UpdateStream(ctx, cfg); err != nil {
+			return fixed, fmt.Errorf("store: restoring %d replicas on %s: %w", replicas, name, err)
+		}
+
+		fixed = append(fixed, name)
+	}
+
+	return fixed, nil
+}
+
+// Open creates the buckets and streams if they are absent, sets their
+// configuration if they are not, and returns a handle. Only a node carrying
+// JetStream calls it; an edge calls [Bind].
+//
+// replicas is the replication factor for each bucket; it must not exceed the
+// number of JetStream peers or bucket creation fails.
+func Open(ctx context.Context, nc *nats.Conn, domain string, replicas int, ttl time.Duration) (*Store, error) {
+	s, err := newStore(nc, domain)
+	if err != nil {
+		return nil, err
+	}
 
 	for _, spec := range []struct {
 		name string
@@ -155,12 +290,11 @@ func Open(ctx context.Context, nc *nats.Conn, domain string, replicas int, ttl t
 	}{
 		// Retained messages have no expiry: that is what retention means.
 		{bucketRetained, 0, &s.retained},
-		// Sessions and queues expire, so an abandoned device does not hold
-		// storage forever.
+		// Sessions expire, so an abandoned device does not hold storage
+		// forever.
 		{bucketSessions, ttl, &s.sessions},
-		{bucketOffline, ttl, &s.offline},
 	} {
-		kv, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
+		kv, err := s.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
 			Bucket:   spec.name,
 			TTL:      spec.ttl,
 			Replicas: replicas,
@@ -173,8 +307,15 @@ func Open(ctx context.Context, nc *nats.Conn, domain string, replicas int, ttl t
 		*spec.into = kv
 	}
 
+	if err := s.openOffline(ctx, replicas, ttl); err != nil {
+		return nil, err
+	}
+
 	return s, nil
 }
+
+// Close releases what the store holds on the connection.
+func (s *Store) Close() { s.direct.close() }
 
 // Durable fabric names. The stream sits outside the "t." namespace for the
 // same reason the session control plane does: every filter a client can
@@ -231,6 +372,11 @@ func (s *Store) PublishDurable(ctx context.Context, msg *nats.Msg, id string) er
 	return nil
 }
 
+// publishAsyncMaxPending bounds queue writes in flight from one node. A
+// pipelined queuer fanning one message out to thousands of away sessions
+// has that many in flight at once, past nats.go's default of 4000.
+const publishAsyncMaxPending = 1 << 15
+
 // DurableHandler receives one message from the durable stream. A message
 // can arrive more than once, so a handler must tolerate that; the bridge
 // tells repeats apart by the Mast-Id header the publisher set.
@@ -266,6 +412,20 @@ func (s *Store) ConsumeDurable(
 	handle DurableHandler,
 	onErr func(error),
 ) (func(), error) {
+	return s.ConsumeDurableFlushed(ctx, handle, nil, onErr)
+}
+
+// ConsumeDurableFlushed is [Store.ConsumeDurable] for a handler that
+// finishes its work after it returns. flush is called before every
+// acknowledgement and must not return until everything handled so far is
+// done, because an acknowledgement tells the stream never to send those
+// messages to this node again.
+func (s *Store) ConsumeDurableFlushed(
+	ctx context.Context,
+	handle DurableHandler,
+	flush func(),
+	onErr func(error),
+) (func(), error) {
 	// Everything already on the stream counts as handled: a node reads what
 	// is published from now on, as the plain fabric always did. Starting at
 	// an explicit sequence rather than "new" gives the very first gap a
@@ -278,6 +438,7 @@ func (s *Store) ConsumeDurable(
 	c := &durableConsumer{
 		store:      s,
 		handle:     handle,
+		flush:      flush,
 		onErr:      onErr,
 		mu:         sync.Mutex{},
 		floor:      stream.CachedInfo().State.LastSeq,
@@ -330,6 +491,7 @@ const (
 type durableConsumer struct {
 	store  *Store
 	handle DurableHandler
+	flush  func()
 	onErr  func(error)
 
 	mu sync.Mutex
@@ -466,6 +628,12 @@ func (c *durableConsumer) ack() {
 		return
 	}
 
+	// After taking m, so the flush covers it: m was handled before it was
+	// recorded as the latest.
+	if c.flush != nil {
+		c.flush()
+	}
+
 	if err := m.Ack(); err != nil {
 		c.onErr(fmt.Errorf("store: acknowledging durable messages: %w", err))
 	}
@@ -489,8 +657,20 @@ func (c *durableConsumer) flushAcks() {
 
 // failed reports a consume error and, when the consumer itself is gone,
 // replaces it.
+//
+// A missed heartbeat and a pull nobody answers are replaced too, and that is
+// the part learned by failing. The consumer is ephemeral and lives on one
+// core; when that core dies, the client is told only that heartbeats
+// stopped, and it goes on pulling from a consumer that is not there. Logged
+// and left, a core killed under load stopped every reader whose consumer it
+// held — the queuers on the other cores included — and they read nothing
+// more for as long as the node ran, while the bridge went on dropping the
+// plain copies those readers were meant to replace. A replacement starts
+// from the floor, so whatever the dead consumer had not handed over is
+// delivered again, and readers already tolerate repeats.
 func (c *durableConsumer) failed(_ jetstream.ConsumeContext, err error) {
-	if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) {
+	if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) ||
+		errors.Is(err, jetstream.ErrNoHeartbeat) || errors.Is(err, nats.ErrNoResponders) {
 		c.replace(err)
 
 		return
@@ -620,57 +800,68 @@ func (s *Store) DeleteRetained(ctx context.Context, key string) error {
 // MatchRetained returns every retained message whose key matches one of the
 // given subject filters.
 //
-// The filters are subject patterns from the topic codec, so this is a KV
-// wildcard scan rather than a lookup against a second index — the reason the
-// codec produces KV-safe keys in the first place.
+// The filters are subject patterns from the topic codec, so this is a scan
+// of the bucket's own subjects rather than a lookup against a second index —
+// the reason the codec produces KV-safe keys in the first place.
+//
+// It reads with batched direct gets. The obvious call, ListKeysFiltered,
+// is a watch, and a watch is an ordered consumer: every SUBSCRIBE asking
+// for retained messages created one on the core and then fetched each key
+// with a round trip of its own. A reconnect storm of 25k subscribers was
+// 25k consumer creations, which is the cost this whole design exists to
+// avoid. A direct get is served by any replica and creates nothing. The
+// bucket keeps one revision per key, so walking its subjects in order
+// yields exactly the current value of each, and a delete marker in place of
+// any that were cleared.
 func (s *Store) MatchRetained(ctx context.Context, filters []string) ([]Message, error) {
-	if len(filters) == 0 {
-		return nil, nil
-	}
-
-	keys, err := s.retained.ListKeysFiltered(ctx, filters...)
-	if err != nil {
-		if errors.Is(err, jetstream.ErrNoKeysFound) {
-			return nil, nil
-		}
-
-		return nil, fmt.Errorf("store: listing retained: %w", err)
-	}
-
 	var out []Message
 
 	now := time.Now()
+	prefix := kvSubjectPrefix + bucketRetained + "."
 
-	for key := range keys.Keys() {
-		entry, err := s.retained.Get(ctx, key)
+	for _, filter := range filters {
+		err := s.direct.each(ctx, s.apiPrefix, kvStreamPrefix+bucketRetained, prefix+filter, 0,
+			func(m *nats.Msg, _ uint64) bool {
+				if op := m.Header.Get(kvOperationHeader); op == kvOpDelete || op == kvOpPurge {
+					return true
+				}
+
+				var msg Message
+				if err := json.Unmarshal(m.Data, &msg); err != nil {
+					return true // a value we cannot read is not worth failing a subscribe over
+				}
+
+				// The bucket has no per-key TTL, so an expired message is
+				// found only when something asks for it. Deleting it here is
+				// what stops it being found again; a failed delete costs
+				// nothing but a retry on the next subscribe.
+				if msg.Expired(now) {
+					_ = s.retained.Delete(ctx, strings.TrimPrefix(m.Header.Get(nats.JSSubject), prefix))
+
+					return true
+				}
+
+				out = append(out, msg)
+
+				return true
+			})
 		if err != nil {
-			if errors.Is(err, jetstream.ErrKeyNotFound) {
-				continue // deleted between listing and reading
-			}
-
-			return nil, fmt.Errorf("store: reading retained %s: %w", key, err)
+			return nil, fmt.Errorf("store: reading retained: %w", err)
 		}
-
-		var msg Message
-		if err := json.Unmarshal(entry.Value(), &msg); err != nil {
-			continue // a value we cannot read is not worth failing a subscribe over
-		}
-
-		// The bucket has no per-key TTL, so an expired message is found
-		// only when something asks for it. Deleting it here is what stops
-		// it being found again; a failed delete costs nothing but a retry
-		// on the next subscribe.
-		if msg.Expired(now) {
-			_ = s.retained.Delete(ctx, key)
-
-			continue
-		}
-
-		out = append(out, msg)
 	}
 
 	return out, nil
 }
+
+// The bucket's stream is an implementation detail of JetStream KV, but a
+// stable one: every client library names it this way.
+const (
+	kvStreamPrefix    = "KV_"
+	kvSubjectPrefix   = "$KV."
+	kvOperationHeader = "KV-Operation"
+	kvOpDelete        = "DEL"
+	kvOpPurge         = "PURGE"
+)
 
 // PutSession records a session's state.
 func (s *Store) PutSession(ctx context.Context, key string, sess Session) error {
@@ -707,6 +898,76 @@ func (s *Store) GetSession(ctx context.Context, key string) (Session, error) {
 	return sess, nil
 }
 
+// MarkAway records that a session's connection has gone, unless another
+// connection has written it since.
+//
+// A node can notice a disconnect late — a dead TCP connection is found by
+// keepalive — by which time the device may be on another node. Written
+// blind, its record of the session as away would stand over the new
+// owner's, and the queuer would keep messages for a client that is
+// receiving them live. It is a read and a revision-checked write, and
+// written reports whether it happened.
+func (s *Store) MarkAway(ctx context.Context, key string, sess Session) (bool, error) {
+	sess.Present = false
+	sess.UpdatedAt = time.Now().UTC()
+
+	encoded, err := json.Marshal(sess)
+	if err != nil {
+		return false, fmt.Errorf("store: encoding session: %w", err)
+	}
+
+	for range casRetries {
+		entry, err := s.sessions.Get(ctx, key)
+
+		switch {
+		case errors.Is(err, jetstream.ErrKeyNotFound):
+			_, err = s.sessions.Create(ctx, key, encoded)
+		case err != nil:
+			return false, fmt.Errorf("store: reading session %s: %w", key, err)
+		default:
+			var current Session
+			if json.Unmarshal(entry.Value(), &current) == nil && current.Owner != "" && current.Owner != sess.Owner {
+				return false, nil
+			}
+
+			_, err = s.sessions.Update(ctx, key, encoded, entry.Revision())
+		}
+
+		if err == nil {
+			return true, nil
+		}
+	}
+
+	return false, fmt.Errorf("store: marking session %s away: %w", key, errContended)
+}
+
+// errContended reports a revision-checked write that kept losing.
+var errContended = errors.New("store: write kept losing to concurrent writers")
+
+// DecodeSession reads one record from the sessions bucket.
+func DecodeSession(value []byte) (Session, error) {
+	var sess Session
+	if err := json.Unmarshal(value, &sess); err != nil {
+		return Session{}, fmt.Errorf("store: decoding session: %w", err)
+	}
+
+	return sess, nil
+}
+
+// WatchSessions follows every change to the sessions bucket. It is one
+// ordered consumer for the whole node, which is how the queuer learns who
+// is away without asking per message.
+//
+//nolint:ireturn // nats.go offers the watcher only as an interface
+func (s *Store) WatchSessions(ctx context.Context) (jetstream.KeyWatcher, error) {
+	w, err := s.sessions.WatchAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("store: watching sessions: %w", err)
+	}
+
+	return w, nil
+}
+
 // DeleteSession forgets a session and its queue, which is what
 // clean_start=true means.
 //
@@ -718,113 +979,13 @@ func (s *Store) GetSession(ctx context.Context, key string) (Session, error) {
 // writes per CONNECT and two more per DISCONNECT, and a storm of 20k clean
 // connections queued them past their deadline while each CONNECT waited.
 func (s *Store) DeleteSession(ctx context.Context, key string) error {
-	for _, target := range []struct {
-		kv   jetstream.KeyValue
-		what string
-	}{
-		{s.sessions, "session"},
-		{s.offline, "queue"},
-	} {
-		if _, err := target.kv.Get(ctx, key); err != nil {
-			if errors.Is(err, jetstream.ErrKeyNotFound) {
-				continue
-			}
-
-			return fmt.Errorf("store: reading %s %s: %w", target.what, key, err)
+	if _, err := s.sessions.Get(ctx, key); err == nil {
+		if err := s.sessions.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+			return fmt.Errorf("store: deleting session %s: %w", key, err)
 		}
-
-		if err := target.kv.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
-			return fmt.Errorf("store: deleting %s %s: %w", target.what, key, err)
-		}
+	} else if !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return fmt.Errorf("store: reading session %s: %w", key, err)
 	}
 
-	return nil
-}
-
-// Enqueue appends a message to an absent client's queue, dropping the oldest
-// once the queue is full.
-//
-// The whole queue is one KV entry updated under its revision, so two nodes
-// appending at once cannot lose a message; one of them retries. That trades
-// contention for atomicity, which is the right way round while a client is
-// offline and its traffic is by definition not hot.
-func (s *Store) Enqueue(ctx context.Context, key string, msg Message) error {
-	msg.StoredAt = time.Now().Unix()
-
-	for attempt := range casRetries {
-		queue, revision, err := s.readQueue(ctx, key)
-		if err != nil {
-			return err
-		}
-
-		queue = append(queue, msg)
-		if len(queue) > maxOfflineMessages {
-			queue = queue[len(queue)-maxOfflineMessages:]
-		}
-
-		encoded, err := json.Marshal(queue)
-		if err != nil {
-			return fmt.Errorf("store: encoding queue: %w", err)
-		}
-
-		if revision == 0 {
-			_, err = s.offline.Create(ctx, key, encoded)
-		} else {
-			_, err = s.offline.Update(ctx, key, encoded, revision)
-		}
-
-		if err == nil {
-			return nil
-		}
-
-		if attempt == casRetries-1 {
-			return fmt.Errorf("store: appending to queue %s: %w", key, err)
-		}
-	}
-
-	return nil
-}
-
-// Drain returns and clears everything waiting for a client.
-func (s *Store) Drain(ctx context.Context, key string) ([]Message, error) {
-	queue, revision, err := s.readQueue(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-
-	if revision == 0 || len(queue) == 0 {
-		return nil, nil
-	}
-
-	if err := s.offline.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
-		return nil, fmt.Errorf("store: clearing queue %s: %w", key, err)
-	}
-
-	now := time.Now()
-
-	return slices.DeleteFunc(queue, func(m Message) bool { return m.Expired(now) }), nil
-}
-
-// readQueue returns a client's queue and the revision it was read at. A
-// revision of zero means the key does not exist yet.
-func (s *Store) readQueue(ctx context.Context, key string) ([]Message, uint64, error) {
-	entry, err := s.offline.Get(ctx, key)
-	if err != nil {
-		if errors.Is(err, jetstream.ErrKeyNotFound) {
-			return nil, 0, nil
-		}
-
-		return nil, 0, fmt.Errorf("store: reading queue %s: %w", key, err)
-	}
-
-	var queue []Message
-	if err := json.Unmarshal(entry.Value(), &queue); err != nil {
-		// A corrupt queue is not worth refusing a connection over. Return the
-		// revision so the next write overwrites it, and start the client with
-		// an empty queue rather than locking it out of the broker.
-		//nolint:nilerr // deliberate: recover by discarding, not by failing
-		return nil, entry.Revision(), nil
-	}
-
-	return queue, entry.Revision(), nil
+	return s.DiscardQueue(ctx, key)
 }

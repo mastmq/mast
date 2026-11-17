@@ -77,7 +77,9 @@ func startCluster(t *testing.T) *cluster {
 	// logger that may itself be finished with.
 	t.Cleanup(func() {
 		for _, e := range c.edges {
-			e.Close()
+			if e != nil {
+				e.Close()
+			}
 		}
 
 		core.Close()
@@ -109,6 +111,12 @@ func startCluster(t *testing.T) *cluster {
 	}
 
 	return c
+}
+
+// stopEdge shuts one edge down for good, the way a rolling deploy does.
+func (c *cluster) stopEdge(i int) {
+	c.edges[i].Close()
+	c.edges[i] = nil
 }
 
 // waitForLeaf blocks until cond holds, using the longer leaf deadline.
@@ -707,5 +715,126 @@ func TestClusterQoS1SurvivesALeafOutage(t *testing.T) {
 
 	if got := delivered(); got != sent {
 		t.Errorf("the subscriber received %d messages for %d sent: redeliveries were not de-duplicated", got, sent)
+	}
+}
+
+// TestClusterOfflineQueueOutlivesItsEdge covers a device that is asleep when
+// the edge it last used goes away, which every rolling deploy does to every
+// sleeping device.
+//
+// Only the node a device disconnected from kept its subscriptions, so only
+// that node ever queued for it. Once that edge was gone nothing anywhere
+// was subscribed on the device's behalf, and everything published until it
+// woke up was dropped — while the guide said a session survives a restart.
+func TestClusterOfflineQueueOutlivesItsEdge(t *testing.T) {
+	c := startCluster(t)
+
+	const tenantName = "initech"
+
+	sleeper := persistent(t, c.addrs[0], "sleeper", tenantName)
+	sleeper.subscribeQoS(t, "fleet/sleeper/cmd", 1)
+	c.awaitInterest(t, sleeper, tenantName)
+	sleeper.client.Disconnect(100)
+
+	// The session has to be on record as away before the edge goes, or
+	// this is a test of a node crashing under a connected client instead.
+	key := "initech.sleeper"
+
+	if !waitForLeaf(func() bool {
+		sess, err := c.edges[1].Store().GetSession(t.Context(), key)
+
+		return err == nil && !sess.Present
+	}) {
+		t.Fatal("the session was never recorded as away")
+	}
+
+	c.stopEdge(0)
+
+	pub := connect(t, c.addrs[1], "dispatcher", tenantName)
+
+	const sent = 5
+	for i := range sent {
+		tok := pub.client.Publish("fleet/sleeper/cmd", 1, false, strconv.Itoa(i))
+		if !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
+			t.Fatalf("publish %d: %v", i, tok.Error())
+		}
+	}
+
+	// The core queues for it now. Waited on rather than slept past, and
+	// not fatal, so that a broker that drops the messages fails on the
+	// delivery check below with the count it actually delivered.
+	awaitMetric(t, c.core.ObsAddr(), `mast_offline_queued_total{tenant="`+tenantName+`"} `, sent)
+
+	back := persistent(t, c.addrs[1], "sleeper", tenantName)
+
+	delivered := func() int {
+		n := 0
+
+		for _, m := range back.messages() {
+			if strings.HasPrefix(m, "fleet/sleeper/cmd=") {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	waitForLeaf(func() bool { return delivered() >= sent })
+
+	if got := delivered(); got != sent {
+		t.Fatalf("%d of %d messages published while the device slept reached it after its edge went away: %v",
+			got, sent, back.messages())
+	}
+}
+
+// TestClusterReturnedDeviceIsNotQueuedFor covers the other half of the
+// queuer's bargain: once a device is back, nothing keeps its messages any
+// more. A queue filled while it was connected is a backlog of messages it
+// already had live, replayed at its next return.
+func TestClusterReturnedDeviceIsNotQueuedFor(t *testing.T) {
+	c := startCluster(t)
+
+	const tenantName = "umbrella"
+
+	first := persistent(t, c.addrs[0], "commuter", tenantName)
+	first.subscribeQoS(t, "fleet/commuter/cmd", 1)
+	c.awaitInterest(t, first, tenantName)
+	first.client.Disconnect(100)
+
+	back := persistent(t, c.addrs[1], "commuter", tenantName)
+
+	// The record has to say it is back before the live traffic starts, and
+	// the queuer has to have heard, which the record alone does not prove;
+	// a probe that reaches the device live is published after both.
+	if !waitForLeaf(func() bool {
+		sess, err := c.edges[1].Store().GetSession(t.Context(), "umbrella.commuter")
+
+		return err == nil && sess.Present
+	}) {
+		t.Fatal("the session was never recorded as held again")
+	}
+
+	pub := connect(t, c.addrs[0], "dispatcher", tenantName)
+
+	const sent = 5
+	for i := range sent {
+		tok := pub.client.Publish("fleet/commuter/cmd", 1, false, "live-"+strconv.Itoa(i))
+		if !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
+			t.Fatalf("publish %d: %v", i, tok.Error())
+		}
+	}
+
+	if !waitForLeaf(func() bool { return len(back.messages()) >= sent }) {
+		t.Fatalf("the returned device did not receive live traffic: %v", back.messages())
+	}
+
+	back.client.Disconnect(100)
+
+	again := persistent(t, c.addrs[0], "commuter", tenantName)
+
+	time.Sleep(settle)
+
+	if got := again.messages(); len(got) != 0 {
+		t.Errorf("messages the device received live were replayed at its next return: %v", got)
 	}
 }
