@@ -44,6 +44,8 @@ Litmus test for `domain`: can the package be tested with no network, no filesyst
 | `infra/config` | koanf: defaults → TOML → env → flags |
 | `infra/obs` | Prometheus metrics, health, pprof |
 
+`deployments/fire` is the Docker cluster and the chaos drills: three cores, three edges, SIGKILLs. A change to delivery or storage is not done until it has been through it, at least four runs against a baseline build; its README says how.
+
 ## Invariants
 
 These are properties the tests and the docs both depend on. Breaking one is a data-loss or isolation bug, not a style question.

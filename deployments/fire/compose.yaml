@@ -1,0 +1,102 @@
+# A three-core, three-edge mast cluster for chaos and load runs.
+name: mastfire
+
+x-mast: &mast
+  image: ${MAST_IMAGE:-mast:fire}
+  restart: on-failure
+  networks: [fire]
+
+services:
+  core-0:
+    <<: *mast
+    hostname: core-0
+    environment:
+      MAST__ROLE: core
+      MAST__NATS__NAME: core-0
+      MAST__NATS__MONITOR_ADDR: 0.0.0.0:8222
+      MAST__NATS__CLIENT_ADDR: 0.0.0.0:4222
+      MAST__CORE__LISTEN_ADDR: 0.0.0.0:6222
+      MAST__CORE__ROUTES: nats-route://core-0:6222,nats-route://core-1:6222,nats-route://core-2:6222
+      MAST__CORE__LEAF_ADDR: 0.0.0.0:7422
+      MAST__CORE__STORE_DIR: /home/nonroot/data
+      MAST__CORE__REPLICAS: "3"
+      MAST__OBS__ADDR: 0.0.0.0:9090
+      MAST__LOG__LEVEL: info
+      MAST__SESSION__EXPIRY: 1h
+    deploy: {resources: {limits: {cpus: "1.0", memory: 1g}}}
+  core-1:
+    <<: *mast
+    hostname: core-1
+    environment:
+      MAST__ROLE: core
+      MAST__NATS__NAME: core-1
+      MAST__NATS__MONITOR_ADDR: 0.0.0.0:8222
+      MAST__NATS__CLIENT_ADDR: 0.0.0.0:4222
+      MAST__CORE__LISTEN_ADDR: 0.0.0.0:6222
+      MAST__CORE__ROUTES: nats-route://core-0:6222,nats-route://core-1:6222,nats-route://core-2:6222
+      MAST__CORE__LEAF_ADDR: 0.0.0.0:7422
+      MAST__CORE__STORE_DIR: /home/nonroot/data
+      MAST__CORE__REPLICAS: "3"
+      MAST__OBS__ADDR: 0.0.0.0:9090
+      MAST__LOG__LEVEL: info
+      MAST__SESSION__EXPIRY: 1h
+    deploy: {resources: {limits: {cpus: "1.0", memory: 1g}}}
+  core-2:
+    <<: *mast
+    hostname: core-2
+    environment:
+      MAST__ROLE: core
+      MAST__NATS__NAME: core-2
+      MAST__NATS__MONITOR_ADDR: 0.0.0.0:8222
+      MAST__NATS__CLIENT_ADDR: 0.0.0.0:4222
+      MAST__CORE__LISTEN_ADDR: 0.0.0.0:6222
+      MAST__CORE__ROUTES: nats-route://core-0:6222,nats-route://core-1:6222,nats-route://core-2:6222
+      MAST__CORE__LEAF_ADDR: 0.0.0.0:7422
+      MAST__CORE__STORE_DIR: /home/nonroot/data
+      MAST__CORE__REPLICAS: "3"
+      MAST__OBS__ADDR: 0.0.0.0:9090
+      MAST__LOG__LEVEL: info
+      MAST__SESSION__EXPIRY: 1h
+    deploy: {resources: {limits: {cpus: "1.0", memory: 1g}}}
+  edge-0:
+    <<: *mast
+    hostname: edge-0
+    environment:
+      MAST__ROLE: edge
+      MAST__NATS__NAME: edge-0
+      MAST__EDGE__CORE_URLS: nats-leaf://core-0:7422,nats-leaf://core-1:7422,nats-leaf://core-2:7422
+      MAST__MQTT__ADDR: 0.0.0.0:1883
+      MAST__OBS__ADDR: 0.0.0.0:9090
+      MAST__LOG__LEVEL: info
+      MAST__SESSION__EXPIRY: 1h
+    depends_on: [core-0, core-1, core-2]
+    deploy: {resources: {limits: {cpus: "1.0", memory: 1g}}}
+  edge-1:
+    <<: *mast
+    hostname: edge-1
+    environment:
+      MAST__ROLE: edge
+      MAST__NATS__NAME: edge-1
+      MAST__EDGE__CORE_URLS: nats-leaf://core-0:7422,nats-leaf://core-1:7422,nats-leaf://core-2:7422
+      MAST__MQTT__ADDR: 0.0.0.0:1883
+      MAST__OBS__ADDR: 0.0.0.0:9090
+      MAST__LOG__LEVEL: info
+      MAST__SESSION__EXPIRY: 1h
+    depends_on: [core-0, core-1, core-2]
+    deploy: {resources: {limits: {cpus: "1.0", memory: 1g}}}
+  edge-2:
+    <<: *mast
+    hostname: edge-2
+    environment:
+      MAST__ROLE: edge
+      MAST__NATS__NAME: edge-2
+      MAST__EDGE__CORE_URLS: nats-leaf://core-0:7422,nats-leaf://core-1:7422,nats-leaf://core-2:7422
+      MAST__MQTT__ADDR: 0.0.0.0:1883
+      MAST__OBS__ADDR: 0.0.0.0:9090
+      MAST__LOG__LEVEL: info
+      MAST__SESSION__EXPIRY: 1h
+    depends_on: [core-0, core-1, core-2]
+    deploy: {resources: {limits: {cpus: "1.0", memory: 1g}}}
+
+networks:
+  fire: {name: mastfire}
