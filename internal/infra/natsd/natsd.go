@@ -216,7 +216,7 @@ func options(cfg config.Config) (*server.Options, error) {
 		opts.JetStreamDomain = JetStreamDomain
 	}
 
-	if err := applyClientListener(opts, cfg.NATS.ClientAddr); err != nil {
+	if err := applyClientListener(opts, cfg.NATS.ClientAddr, cfg.Role); err != nil {
 		return nil, err
 	}
 
@@ -244,7 +244,21 @@ func options(cfg config.Config) (*server.Options, error) {
 // applyClientListener configures the TCP client port. An empty address means
 // in-process only, which is what an edge node wants unless an operator needs
 // the nats CLI against it.
-func applyClientListener(opts *server.Options, addr string) error {
+//
+// Not on a core. nats-server opens its route listener only once the client
+// accept loop is running, and DontListen means there is no accept loop, so a
+// core left at the default empty address never listened for routes, never
+// formed a cluster, and failed to start fifteen seconds later. The chart and
+// the Ansible role both set an address, which is why it went unnoticed; a
+// core configured by hand from the example file did not. A core with no
+// address gets a client port on loopback that nothing outside can reach.
+func applyClientListener(opts *server.Options, addr string, role config.Role) error {
+	if addr == "" && role == config.RoleCore {
+		opts.Host, opts.Port = "127.0.0.1", server.RANDOM_PORT
+
+		return nil
+	}
+
 	if addr == "" {
 		opts.DontListen = true
 
