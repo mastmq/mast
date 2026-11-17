@@ -7,6 +7,8 @@
 //	drill publish — publish M messages to each sleeping device, record the acked
 //	drill verify  — wake every device on a different edge, count what it gets
 //	drill live    — connected subscribers under steady QoS 1 traffic, for chaos
+//	drill seed    — write N away sessions straight into the sessions bucket
+//	drill seedpub — QoS 1 to random seeded sessions, then count what was queued
 package main
 
 import (
@@ -52,6 +54,10 @@ func main() {
 		live()
 	case "retained":
 		retained()
+	case "seed":
+		seed()
+	case "seedpub":
+		seedpub()
 	default:
 		fmt.Println("unknown phase", os.Args[1])
 		os.Exit(2)

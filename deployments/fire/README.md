@@ -15,6 +15,7 @@ The results are on [the website](https://mastmq.github.io/#under-fire).
 | `drill-rolling-edges.sh` | persistent devices asleep while every edge restarts in turn, then woken on a different edge |
 | `drill-kill-sleepers.sh` | sleeping devices, with a core and two edges SIGKILLed while their messages are published |
 | `drill-live.sh` | connected devices under steady QoS 1 while an edge and a core are killed and another edge restarts |
+| `drill-scale.sh` | a fleet's worth of sleeping sessions — 300,000 by default, written straight into the sessions bucket by `drill seed` because one laptop cannot hold that many sockets — then load, a core restart, queueing for them, and 2,000 real sleepers among them |
 | `load.sh` | QoS 1 throughput, fan-out, a connect storm and a retained storm, with CPU sampled mid-run and JetStream API calls counted |
 
 ## Running it
@@ -36,6 +37,8 @@ To compare against another build, build it from a ref into its own tag. A build 
 $ image mast:base 3ae6982
 $ WAIT_QUEUERS=0 ./drill-rolling-edges.sh mast:base 2000
 ```
+
+`CORE_CPUS` and `GOGC` in the environment of `up` change the cores' CPU limit and every node's GC target; the scale drill's tail latency was a one-CPU core sharing its processor with the collector, which is how both came to be knobs.
 
 While a cluster is up, `reads` prints per node what each reader took off `mast_qos`, what it queued and how many sessions it holds as away, and `consumers` lists `mast_qos`'s consumers, which must be one per node and never more. Read both before guessing why something was lost.
 
