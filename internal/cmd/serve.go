@@ -8,6 +8,7 @@ import (
 	"github.com/mastmq/mast/internal/infra/broker"
 	"github.com/mastmq/mast/internal/infra/config"
 	"github.com/mastmq/mast/internal/infra/logger"
+	"github.com/mastmq/mast/internal/infra/memlimit"
 	"github.com/urfave/cli/v3"
 )
 
@@ -44,6 +45,8 @@ func serve(ctx context.Context, cmd *cli.Command) error {
 
 	log := logger.New(cfg.Log.Level, cfg.Log.Format)
 	slog.SetDefault(log)
+
+	memlimit.Apply(log)
 
 	log.InfoContext(ctx, "starting mast", "version", cmd.Version, "role", string(cfg.Role))
 
