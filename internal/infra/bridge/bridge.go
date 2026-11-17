@@ -141,6 +141,10 @@ type Hook struct {
 	noticeSub *nats.Subscription
 	nodeID    string
 
+	// owners is each live connection's own claim token, keyed by the
+	// connection, for the session records it writes.
+	owners sync.Map
+
 	metrics *obs.Metrics
 
 	// internalListener is the mochi listener id whose connections skip
@@ -211,6 +215,7 @@ func New(
 		durable:          atomic.Bool{},
 		stopDurable:      nil,
 		sessions:         newSessions(),
+		owners:           sync.Map{},
 		noticeSub:        nil,
 		nodeID:           opts.NodeID,
 	}
@@ -288,7 +293,7 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 		bare := cl.ID
 		cl.ID = mountClient(h.internalTenant, bare)
 		h.onConnected(cl, tenant.Identity{Tenant: h.internalTenant, Superuser: true})
-		h.claimSession(h.internalTenant, bare, cl.ID)
+		h.claimSession(h.internalTenant, bare, cl)
 
 		if pk.Connect.Clean {
 			h.dropSession(h.internalTenant, bare)
@@ -324,7 +329,7 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 
 	// Announce the claim so a copy of this client on another node stands
 	// down. mochi has already displaced any local copy by this point.
-	h.claimSession(identity.Tenant, bare, cl.ID)
+	h.claimSession(identity.Tenant, bare, cl)
 
 	// A clean start means the durable state goes now; a resumed session is
 	// put back in OnSessionEstablished, once mochi has actually added the
@@ -563,8 +568,12 @@ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 			h.markAway(cl, id, unmountClient(id, cl.ID))
 		}
 
+		h.owners.Delete(cl)
+
 		return
 	}
+
+	h.owners.Delete(cl)
 
 	if id, ok := h.tenantOf(cl); ok {
 		h.dropSession(id, unmountClient(id, cl.ID))
@@ -1131,7 +1140,9 @@ func (h *Hook) writeRetained(
 	filter packets.Subscription,
 	msg store.Message,
 ) error {
-	return h.deliverTo(cl, mount(id, msg.Topic), msg, min(msg.QoS, filter.Qos), true)
+	_, err := h.deliverTo(cl, mount(id, msg.Topic), msg, min(msg.QoS, filter.Qos), true)
+
+	return err
 }
 
 // deliverTo sends one message to one client and nobody else.
@@ -1142,15 +1153,20 @@ func (h *Hook) writeRetained(
 // on its way out and a replay must not skip, and the inflight entry, without
 // which a QoS 1 message lost to a dropped connection is simply gone — and for
 // a drained queue it is gone from the bucket too.
-func (h *Hook) deliverTo(cl *mqtt.Client, mountedTopic string, msg store.Message, qos byte, retain bool) error {
+//
+// It returns the packet id a QoS 1 or 2 delivery went out under, so a caller
+// can tell when the client has acknowledged it, and zero otherwise.
+func (h *Hook) deliverTo(
+	cl *mqtt.Client, mountedTopic string, msg store.Message, qos byte, retain bool,
+) (uint16, error) {
 	// The store already drops what it finds expired; this catches a message
 	// that expired between being read and being sent.
 	if msg.Expired(time.Now()) {
-		return nil
+		return 0, nil
 	}
 
 	if !h.OnACLCheck(cl, mountedTopic, false) {
-		return packets.ErrNotAuthorized
+		return 0, packets.ErrNotAuthorized
 	}
 
 	out := packets.Packet{
@@ -1169,12 +1185,12 @@ func (h *Hook) deliverTo(cl *mqtt.Client, mountedTopic string, msg store.Message
 
 	if out.FixedHeader.Qos > 0 {
 		if cl.State.Inflight.Len() >= int(h.server.Options.Capabilities.MaximumInflight) {
-			return packets.ErrQuotaExceeded
+			return 0, packets.ErrQuotaExceeded
 		}
 
 		packetID, err := cl.NextPacketID()
 		if err != nil {
-			return fmt.Errorf("bridge: packet id: %w", err)
+			return 0, fmt.Errorf("bridge: packet id: %w", err)
 		}
 
 		// NextPacketID returns uint32 but MQTT packet ids are 16 bit, and
@@ -1188,10 +1204,10 @@ func (h *Hook) deliverTo(cl *mqtt.Client, mountedTopic string, msg store.Message
 	}
 
 	if err := cl.WritePacket(out); err != nil {
-		return fmt.Errorf("bridge: writing to %s: %w", cl.ID, err)
+		return 0, fmt.Errorf("bridge: writing to %s: %w", cl.ID, err)
 	}
 
-	return nil
+	return out.PacketID, nil
 }
 
 // setExpiry dates a stored message from when it was published, not from

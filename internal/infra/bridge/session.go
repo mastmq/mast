@@ -9,6 +9,7 @@ import (
 
 	"github.com/mastmq/mast/internal/domain/tenant"
 	"github.com/mastmq/mast/internal/domain/topic"
+	mqtt "github.com/mastmq/mochi/v2"
 	"github.com/mastmq/mochi/v2/packets"
 	"github.com/nats-io/nats.go"
 )
@@ -113,8 +114,15 @@ func newOwner() string {
 // itself. mochi has already displaced any local client with this id, so a
 // claim still held for it belongs to that dead connection and is simply
 // overwritten.
-func (h *Hook) claimSession(id tenant.ID, bareClientID, mountedClientID string) {
+func (h *Hook) claimSession(id tenant.ID, bareClientID string, cl *mqtt.Client) {
 	owner := newOwner()
+	mountedClientID := cl.ID
+
+	// Kept against the connection as well as the client id. The id's claim
+	// passes to whichever connection took it last, and a record written for
+	// an old connection must carry that connection's token, or its late
+	// disconnect stamps the new owner's and passes the store's check.
+	h.owners.Store(cl, owner)
 
 	h.sessions.mu.Lock()
 	h.sessions.held[mountedClientID] = owner
@@ -137,6 +145,18 @@ func (h *Hook) releaseSession(mountedClientID string) {
 	h.sessions.mu.Lock()
 	delete(h.sessions.held, mountedClientID)
 	h.sessions.mu.Unlock()
+}
+
+// ownerOf returns the owner token claimed by this connection, empty if it
+// claimed none.
+func (h *Hook) ownerOf(cl *mqtt.Client) string {
+	if owner, ok := h.owners.Load(cl); ok {
+		if token, isString := owner.(string); isString {
+			return token
+		}
+	}
+
+	return ""
 }
 
 // holdsSession reports the owner token this node holds for a client, if any.

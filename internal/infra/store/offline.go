@@ -211,6 +211,14 @@ const (
 	jsErrClusterNotAvailable jetstream.ErrorCode = 10008
 )
 
+// Transient reports a failed queue write worth making again under the same
+// id: the stream did not settle it, or it went on not settling until the
+// caller's deadline. Anything else — a message the stream will never take —
+// fails the same way however often it is sent.
+func Transient(err error) bool {
+	return retryable(err) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, jetstream.ErrStreamNotFound)
+}
+
 // retryable reports a write the stream did not settle either way, which is
 // safe to send again under the same id.
 func retryable(err error) bool {
@@ -376,48 +384,76 @@ func queuedMsg(q Queued) (*nats.Msg, error) {
 	return msg, nil
 }
 
+// Backlog is what [Store.ReadQueue] found waiting for a client.
+type Backlog struct {
+	// Messages are oldest first: what an older version left in the legacy
+	// bucket, then the stream's.
+	Messages []Message
+	// Seqs holds each message's stream sequence, zero for one from the
+	// legacy bucket. A drain that stops part way trims only up to the one
+	// it could not deliver.
+	Seqs []uint64
+	// Through is the last stream sequence the read reached, counting the
+	// expired and unreadable ones it skipped.
+	Through uint64
+	// Legacy is the revision of the legacy entry read, zero if none.
+	Legacy uint64
+}
+
 // ReadQueue returns what is waiting for a client, oldest first, without
-// removing it, and the stream sequence the read reached. Hand that sequence
-// to [Store.TrimQueue] once the messages are delivered.
+// removing any of it. Hand what was delivered to [Store.TrimQueue].
 //
 // Reading and removing are two steps on purpose. The queue used to be read
 // and deleted in one call before anything was delivered, so a node dying in
 // between lost the backlog, and a message queued between the read and the
-// delete was deleted unread. A trim removes only what was read.
+// delete was deleted unread. The legacy bucket was still read that way —
+// deleted, then the stream read, and on a failed stream read both were
+// gone — until a review caught it.
 //
 // after skips what an earlier read already returned: a later look at the
 // same queue must not deliver again what a trim that failed left behind.
 // Zero reads everything.
-func (s *Store) ReadQueue(ctx context.Context, key string, after uint64) ([]Message, uint64, error) {
-	out, err := s.drainLegacy(ctx, key)
+func (s *Store) ReadQueue(ctx context.Context, key string, after uint64) (Backlog, error) {
+	legacy, rev, err := s.readLegacy(ctx, key)
 	if err != nil {
-		return nil, 0, err
+		return Backlog{}, err
 	}
 
-	through := after
+	b := Backlog{Messages: legacy, Seqs: make([]uint64, len(legacy)), Through: after, Legacy: rev}
 
 	now := time.Now()
 
 	err = s.direct.each(ctx, s.apiPrefix, streamOffline, offlinePrefix+key, after+1, func(m *nats.Msg, seq uint64) bool {
-		through = seq
+		b.Through = seq
 
 		if msg, ok := decodeQueued(m); ok && !msg.Expired(now) {
-			out = append(out, msg)
+			b.Messages = append(b.Messages, msg)
+			b.Seqs = append(b.Seqs, seq)
 		}
 
 		return true
 	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("store: reading queue %s: %w", key, err)
+		return Backlog{}, fmt.Errorf("store: reading queue %s: %w", key, err)
 	}
 
-	return out, through, nil
+	return b, nil
 }
 
 // TrimQueue removes a client's queued messages up to and including the
-// stream sequence through. Anything queued after the read that returned it
-// stays.
-func (s *Store) TrimQueue(ctx context.Context, key string, through uint64) error {
+// stream sequence through, and the legacy entry at revision legacy if it is
+// not zero. Anything queued after the read stays.
+func (s *Store) TrimQueue(ctx context.Context, key string, through, legacy uint64) error {
+	if legacy > 0 && s.legacyOffline != nil {
+		// Only the revision that was read and delivered: an old edge still
+		// running may have appended since, and that is left for the next
+		// drain, which delivers what was here again rather than lose it.
+		err := s.legacyOffline.Delete(ctx, key, jetstream.LastRevision(legacy))
+		if err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) && !isWrongRevision(err) {
+			return fmt.Errorf("store: clearing legacy queue %s: %w", key, err)
+		}
+	}
+
 	if through == 0 {
 		return nil
 	}
@@ -431,14 +467,28 @@ func (s *Store) TrimQueue(ctx context.Context, key string, through uint64) error
 	return nil
 }
 
+// jsErrWrongLastSequence is JetStream's answer to a conditional write whose
+// expected revision is not the current one.
+const jsErrWrongLastSequence jetstream.ErrorCode = 10071
+
+func isWrongRevision(err error) bool {
+	apiErr, ok := errors.AsType[*jetstream.APIError](err)
+
+	return ok && apiErr.ErrorCode == jsErrWrongLastSequence
+}
+
 // DiscardQueue empties a client's queue.
 //
 // It reads before it purges, for the same reason [Store.DeleteSession] does:
 // nearly every caller has nothing queued, a read is served by any replica,
 // and a purge is a replicated write.
 func (s *Store) DiscardQueue(ctx context.Context, key string) error {
-	if _, err := s.drainLegacy(ctx, key); err != nil {
+	if _, rev, err := s.readLegacy(ctx, key); err != nil {
 		return err
+	} else if rev > 0 {
+		if err := s.legacyOffline.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+			return fmt.Errorf("store: clearing legacy queue %s: %w", key, err)
+		}
 	}
 
 	subject := offlinePrefix + key
@@ -458,32 +508,30 @@ func (s *Store) DiscardQueue(ctx context.Context, key string) error {
 	return nil
 }
 
-// drainLegacy returns and removes what an older version left in the queue
-// bucket for this client.
-func (s *Store) drainLegacy(ctx context.Context, key string) ([]Message, error) {
+// readLegacy returns what an older version left in the queue bucket for
+// this client, and the revision it was read at, without removing it.
+func (s *Store) readLegacy(ctx context.Context, key string) ([]Message, uint64, error) {
 	if s.legacyOffline == nil {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	entry, err := s.legacyOffline.Get(ctx, key)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrKeyNotFound) {
-			return nil, nil
+			return nil, 0, nil
 		}
 
-		return nil, fmt.Errorf("store: reading legacy queue %s: %w", key, err)
-	}
-
-	if err := s.legacyOffline.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
-		return nil, fmt.Errorf("store: clearing legacy queue %s: %w", key, err)
+		return nil, 0, fmt.Errorf("store: reading legacy queue %s: %w", key, err)
 	}
 
 	var queue []Message
 	if err := json.Unmarshal(entry.Value(), &queue); err != nil {
-		return nil, nil //nolint:nilerr // a corrupt legacy queue is discarded, not fatal
+		// A corrupt legacy queue is not delivered, but it is still
+		// removed with the next trim.
+		return nil, entry.Revision(), nil //nolint:nilerr // corrupt is discarded, not fatal
 	}
 
-	return queue, nil
+	return queue, entry.Revision(), nil
 }
 
 // decodeQueued turns a message read off the queue stream back into a

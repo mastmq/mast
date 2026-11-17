@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"testing"
@@ -207,16 +208,16 @@ func TestSessions(t *testing.T) {
 func drain(t *testing.T, s *store.Store, key string) []store.Message {
 	t.Helper()
 
-	got, through, err := s.ReadQueue(context.Background(), key, 0)
+	got, err := s.ReadQueue(context.Background(), key, 0)
 	if err != nil {
 		t.Fatalf("ReadQueue(%s): %v", key, err)
 	}
 
-	if err := s.TrimQueue(context.Background(), key, through); err != nil {
+	if err := s.TrimQueue(context.Background(), key, got.Through, got.Legacy); err != nil {
 		t.Fatalf("TrimQueue(%s): %v", key, err)
 	}
 
-	return got
+	return got.Messages
 }
 
 func enqueue(t *testing.T, s *store.Store, key, id string, msg store.Message) bool {
@@ -268,15 +269,15 @@ func TestOfflineQueueTrimKeepsWhatItDidNotRead(t *testing.T) {
 
 	enqueue(t, s, "acme.dev-1", "", store.Message{Topic: "a/b", Payload: []byte("first"), QoS: 1})
 
-	read, through, err := s.ReadQueue(ctx, "acme.dev-1", 0)
-	if err != nil || len(read) != 1 {
-		t.Fatalf("ReadQueue = %d messages, %v", len(read), err)
+	read, err := s.ReadQueue(ctx, "acme.dev-1", 0)
+	if err != nil || len(read.Messages) != 1 {
+		t.Fatalf("ReadQueue = %d messages, %v", len(read.Messages), err)
 	}
 
 	// Arrives between the read and the trim.
 	enqueue(t, s, "acme.dev-1", "", store.Message{Topic: "a/b", Payload: []byte("late"), QoS: 1})
 
-	if err := s.TrimQueue(ctx, "acme.dev-1", through); err != nil {
+	if err := s.TrimQueue(ctx, "acme.dev-1", read.Through, read.Legacy); err != nil {
 		t.Fatalf("TrimQueue: %v", err)
 	}
 
@@ -296,7 +297,7 @@ func TestReadQueueAfterSkipsWhatWasRead(t *testing.T) {
 
 	enqueue(t, s, "acme.dev-1", "", store.Message{Topic: "a/b", Payload: []byte("delivered"), QoS: 1})
 
-	_, through, err := s.ReadQueue(ctx, "acme.dev-1", 0)
+	first, err := s.ReadQueue(ctx, "acme.dev-1", 0)
 	if err != nil {
 		t.Fatalf("ReadQueue: %v", err)
 	}
@@ -304,13 +305,13 @@ func TestReadQueueAfterSkipsWhatWasRead(t *testing.T) {
 	// No trim: as if it had timed out.
 	enqueue(t, s, "acme.dev-1", "", store.Message{Topic: "a/b", Payload: []byte("straggler"), QoS: 1})
 
-	got, _, err := s.ReadQueue(ctx, "acme.dev-1", through)
+	got, err := s.ReadQueue(ctx, "acme.dev-1", first.Through)
 	if err != nil {
 		t.Fatalf("ReadQueue after: %v", err)
 	}
 
-	if len(got) != 1 || string(got[0].Payload) != "straggler" {
-		t.Errorf("a second look returned %v, want only the straggler", got)
+	if len(got.Messages) != 1 || string(got.Messages[0].Payload) != "straggler" {
+		t.Errorf("a second look returned %v, want only the straggler", got.Messages)
 	}
 }
 
@@ -755,5 +756,110 @@ func TestReconcileLeavesAMatchingStoreAlone(t *testing.T) {
 
 	if len(fixed) != 0 {
 		t.Errorf("Reconcile changed %v on a store that matched", fixed)
+	}
+}
+
+// TestLegacyQueueStaysUntilTrimmed covers a device that slept through the
+// upgrade: what an older version queued for it in the bucket must survive
+// being read, and go only with the trim that follows its delivery. It was
+// deleted as it was read, so a node dying before delivery lost it.
+func TestLegacyQueueStaysUntilTrimmed(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	nc := bare(t)
+
+	js, err := jetstream.NewWithDomain(nc, natsd.JetStreamDomain)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+
+	legacy, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "mast_offline"})
+	if err != nil {
+		t.Fatalf("creating the legacy bucket: %v", err)
+	}
+
+	old, err := json.Marshal([]store.Message{{Topic: "a/b", Payload: []byte("from before"), QoS: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := legacy.Put(ctx, "acme.dev-1", old); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	s, err := store.Open(ctx, nc, natsd.JetStreamDomain, 1, time.Hour)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	t.Cleanup(s.Close)
+
+	enqueue(t, s, "acme.dev-1", "", store.Message{Topic: "a/b", Payload: []byte("from after"), QoS: 1})
+
+	first, err := s.ReadQueue(ctx, "acme.dev-1", 0)
+	if err != nil || len(first.Messages) != 2 || string(first.Messages[0].Payload) != "from before" {
+		t.Fatalf("ReadQueue = %+v, %v; want the legacy message first, then the stream's", first.Messages, err)
+	}
+
+	// Read and not delivered: a second read still finds the legacy entry.
+	again, err := s.ReadQueue(ctx, "acme.dev-1", 0)
+	if err != nil || len(again.Messages) != 2 {
+		t.Fatalf("after a read with no trim, the queue holds %d, want 2: %v", len(again.Messages), err)
+	}
+
+	if err := s.TrimQueue(ctx, "acme.dev-1", again.Through, again.Legacy); err != nil {
+		t.Fatalf("TrimQueue: %v", err)
+	}
+
+	if left := drain(t, s, "acme.dev-1"); len(left) != 0 {
+		t.Errorf("after the trim the queue still holds %v", left)
+	}
+
+	if _, err := legacy.Get(ctx, "acme.dev-1"); !errors.Is(err, jetstream.ErrKeyNotFound) {
+		t.Errorf("the legacy entry survived its trim: %v", err)
+	}
+}
+
+// TestMarkAwayDoesNotRecreateADeletedSession covers a disconnect noticed
+// after a clean start on another node deleted the record. Marking it away
+// recreated it, subscriptions and all, and the device's next resumed
+// session got back what its clean start had thrown away.
+func TestMarkAwayDoesNotRecreateADeletedSession(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := open(t)
+
+	written, err := s.MarkAway(ctx, "acme.gone", store.Session{
+		ClientID:      "gone",
+		Tenant:        "acme",
+		Subscriptions: []store.Subscription{{Filter: "a/#", QoS: 1}},
+		Owner:         "old",
+	})
+	if err != nil || written {
+		t.Fatalf("MarkAway on a missing record = %v, %v; want nothing written", written, err)
+	}
+
+	if _, err := s.GetSession(ctx, "acme.gone"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("MarkAway recreated a missing session: %v", err)
+	}
+
+	// And one that existed and was deleted, which leaves a tombstone.
+	dropped := store.Session{ClientID: "dropped", Tenant: "acme", Owner: "old"}
+	if err := s.PutSession(ctx, "acme.dropped", dropped); err != nil {
+		t.Fatalf("PutSession: %v", err)
+	}
+
+	if err := s.DeleteSession(ctx, "acme.dropped"); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+
+	if written, err := s.MarkAway(ctx, "acme.dropped", dropped); err != nil || written {
+		t.Fatalf("MarkAway on a deleted record = %v, %v; want nothing written", written, err)
+	}
+
+	if _, err := s.GetSession(ctx, "acme.dropped"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("MarkAway recreated a deleted session: %v", err)
 	}
 }

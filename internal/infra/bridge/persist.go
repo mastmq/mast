@@ -93,7 +93,7 @@ func (h *Hook) sessionRecord(cl *mqtt.Client, id tenant.ID, bareClientID string,
 		})
 	}
 
-	owner, _ := h.holdsSession(cl.ID)
+	owner := h.ownerOf(cl)
 
 	return store.Session{
 		ClientID:      bareClientID,
@@ -315,10 +315,13 @@ func (h *Hook) restoreSession(cl *mqtt.Client, id tenant.ID, bareClientID string
 
 // drainOffline delivers what arrived while the client was away.
 //
-// The queue is trimmed only after delivery, and only through what was read.
-// A node dying between the two delivers the backlog again on the next
-// connection rather than losing it, and a message queued while this ran
-// stays for the next drain.
+// Nothing is removed until the device has acknowledged it. The queue used
+// to be trimmed as soon as the backlog was written to the connection, which
+// is not the device having it: a connection that dropped before its PUBACKs
+// took the backlog with it, and the device reconnecting to another node
+// found nothing, because mochi's inflight copy stayed on this one. Delivery
+// also stops at the first message that cannot go — inflight full, the
+// connection gone — so a trim never passes one that was never sent.
 //
 // It reads only past after, the sequence an earlier drain reached, and
 // returns the sequence this one reached and whether it could read at all.
@@ -330,44 +333,132 @@ func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string, 
 
 	key := sessionKey(id, bareClientID)
 
-	queued, through, err := h.store.ReadQueue(ctx, key, after)
+	backlog, err := h.store.ReadQueue(ctx, key, after)
 	if err != nil {
 		h.log.Warn("draining offline queue", "client", cl.ID, "error", err)
 
 		return after, false
 	}
 
+	through, legacy := backlog.Through, backlog.Legacy
+	sent := make([]sentBacklog, 0, len(backlog.Messages))
+
 	// To this client alone. Publishing the backlog into the node instead
 	// handed it to every local subscriber of the same topics, who had
 	// already had it live, and re-queued it for every absent one.
-	for _, msg := range queued {
-		if err := h.deliverTo(cl, mount(id, msg.Topic), msg, msg.QoS, false); err != nil {
-			h.log.Warn("delivering a queued message", "client", cl.ID, "topic", msg.Topic, "error", err)
-		}
-	}
+	for i, msg := range backlog.Messages {
+		packet, err := h.deliverTo(cl, mount(id, msg.Topic), msg, msg.QoS, false)
+		if err != nil {
+			h.log.Warn("delivering a queued message; the rest waits for the next look",
+				"client", cl.ID, "topic", msg.Topic, "error", err)
 
-	// A deadline of its own: in a wake storm every device's trim is a
-	// replicated write at once, and one sharing the read's deadline mostly
-	// ran out of it. A trim that still fails costs storage until the stream
-	// ages it out, not a repeat, since later reads start past it.
-	if through > after {
-		trimCtx, cancelTrim := context.WithTimeout(context.Background(), storeTimeout)
-		if err := h.store.TrimQueue(trimCtx, key, through); err != nil {
-			h.log.Debug("trimming offline queue", "client", cl.ID, "error", err)
+			through, legacy = stoppedAt(backlog.Seqs[i], after, legacy)
+
+			break
 		}
 
-		cancelTrim()
+		sent = append(sent, sentBacklog{seq: backlog.Seqs[i], packet: packet})
 	}
 
-	if len(queued) > 0 {
+	if through > after || legacy > 0 {
+		go h.trimWhenAcked(cl, key, sent, after, through, legacy)
+	}
+
+	if len(sent) > 0 {
 		h.count(func(m *obs.Metrics) {
-			m.OfflineDelivered.WithLabelValues(string(id)).Add(float64(len(queued)))
+			m.OfflineDelivered.WithLabelValues(string(id)).Add(float64(len(sent)))
 		})
 		h.log.Info("offline queue delivered",
-			"client", bareClientID, "tenant", string(id), "messages", len(queued))
+			"client", bareClientID, "tenant", string(id), "messages", len(sent))
 	}
 
 	return through, true
+}
+
+// sentBacklog is one queued message written to the client: its stream
+// sequence (zero from the legacy bucket) and the packet id it went under
+// (zero for one that needs no acknowledgement).
+type sentBacklog struct {
+	seq    uint64
+	packet uint16
+}
+
+// stoppedAt is how far a drain may trim when it stopped at the message
+// with stream sequence seq: up to the one before it. A message from the
+// legacy bucket comes before every stream message, so stopping on one
+// trims nothing at all.
+func stoppedAt(seq, after, legacy uint64) (uint64, uint64) {
+	if seq == 0 {
+		return after, 0
+	}
+
+	return seq - 1, legacy
+}
+
+// How long a drain waits for the device to acknowledge its backlog before
+// trimming only what it has, and how often it looks.
+const (
+	backlogAckWait = 30 * time.Second
+	backlogAckPoll = 100 * time.Millisecond
+)
+
+// trimWhenAcked removes the backlog from the queue once the device has
+// acknowledged it — through the last message before the first it has not,
+// when the wait runs out or the connection goes. What stays is delivered
+// again on a later look or the next connection: a duplicate, which
+// at-least-once allows, rather than a loss.
+//
+// A packet id that has left the inflight store has been acknowledged. One
+// still there may be a new message that reused the id, which only means
+// trimming less.
+func (h *Hook) trimWhenAcked(cl *mqtt.Client, key string, sent []sentBacklog, after, through, legacy uint64) {
+	ticker := time.NewTicker(backlogAckPoll)
+	defer ticker.Stop()
+
+	deadline := time.Now().Add(backlogAckWait)
+
+	for firstUnacked(cl, sent) >= 0 && !cl.Closed() && time.Now().Before(deadline) {
+		<-ticker.C
+	}
+
+	if i := firstUnacked(cl, sent); i >= 0 {
+		through, legacy = stoppedAt(sent[i].seq, after, legacy)
+		through = max(through, after)
+	}
+
+	if through <= after {
+		through = 0
+	}
+
+	if through == 0 && legacy == 0 {
+		return
+	}
+
+	// A deadline of its own: in a wake storm every device's trim is a
+	// replicated write at once. A trim that still fails costs storage until
+	// the stream ages it out, not a repeat, since later reads start past it.
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+
+	if err := h.store.TrimQueue(ctx, key, through, legacy); err != nil {
+		h.log.Debug("trimming offline queue", "client", cl.ID, "error", err)
+	}
+}
+
+// firstUnacked returns the index of the first message the client has not
+// acknowledged, or -1.
+func firstUnacked(cl *mqtt.Client, sent []sentBacklog) int {
+	for i, s := range sent {
+		if s.packet == 0 {
+			continue
+		}
+
+		if _, ok := cl.State.Inflight.Get(s.packet); ok {
+			return i
+		}
+	}
+
+	return -1
 }
 
 // drainLater reads the queue again after the first drain: until it works,

@@ -101,20 +101,26 @@ func (d *directReader) page(
 	var last uint64
 
 	for {
-		var m *nats.Msg
-
-		select {
-		case <-ctx.Done():
-			return last, false, fmt.Errorf("store: direct get on %s: %w", subject, ctx.Err())
-		case m = <-replies:
+		m, err := next(ctx, subject, replies)
+		if err != nil {
+			return last, false, err
 		}
 
 		seq, end, more, err := readReply(m)
-
-		switch {
-		case err != nil:
+		if err != nil {
 			return last, false, err
-		case end:
+		}
+
+		// Every reply names the sequence of the one before it, and the
+		// status that ends the batch names the last. A reply missing in
+		// between — dropped by a subscription that fell behind, which nats.go
+		// reports only to an error handler — would otherwise read as a short
+		// batch, and a drain would trim the message it never delivered.
+		if err := continuous(m, last); err != nil {
+			return last, false, err
+		}
+
+		if end {
 			return last, more && last > 0, nil
 		}
 
@@ -123,6 +129,16 @@ func (d *directReader) page(
 		if !fn(m, seq) {
 			return last, false, nil
 		}
+	}
+}
+
+// next waits for one reply.
+func next(ctx context.Context, subject string, replies <-chan *nats.Msg) (*nats.Msg, error) {
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("store: direct get on %s: %w", subject, ctx.Err())
+	case m := <-replies:
+		return m, nil
 	}
 }
 
@@ -160,6 +176,26 @@ func readReply(m *nats.Msg) (uint64, bool, bool, error) {
 	default:
 		return 0, false, false, fmt.Errorf("%w: %s %s", errDirectGet, status, m.Header.Get("Description"))
 	}
+}
+
+// errDirectGap reports a batched read that lost a reply in transit.
+var errDirectGap = errors.New("store: direct get lost a reply")
+
+// continuous checks that m follows the reply whose sequence was last. A
+// reply without the header — a 404, or a server too old to send it — is
+// taken on trust.
+func continuous(m *nats.Msg, last uint64) error {
+	raw := m.Header.Get(nats.JSLastSequence)
+	if raw == "" {
+		return nil
+	}
+
+	prev, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || prev == last {
+		return nil //nolint:nilerr // an unreadable header is not evidence of a gap
+	}
+
+	return fmt.Errorf("%w: after %d came one following %d", errDirectGap, last, prev)
 }
 
 // register opens a reply slot. Its channel holds a full page and the status

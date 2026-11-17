@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -417,13 +418,13 @@ func (s *Store) ConsumeDurable(
 
 // ConsumeDurableFlushed is [Store.ConsumeDurable] for a handler that
 // finishes its work after it returns. flush is called before every
-// acknowledgement and must not return until everything handled so far is
-// done, because an acknowledgement tells the stream never to send those
-// messages to this node again.
+// acknowledgement and must not return nil until everything handled so far
+// is done, because an acknowledgement tells the stream never to send those
+// messages to this node again. On an error nothing is acknowledged.
 func (s *Store) ConsumeDurableFlushed(
 	ctx context.Context,
 	handle DurableHandler,
-	flush func(),
+	flush func() error,
 	onErr func(error),
 ) (func(), error) {
 	// Everything already on the stream counts as handled: a node reads what
@@ -491,7 +492,7 @@ const (
 type durableConsumer struct {
 	store  *Store
 	handle DurableHandler
-	flush  func()
+	flush  func() error
 	onErr  func(error)
 
 	mu sync.Mutex
@@ -593,7 +594,17 @@ func (c *durableConsumer) receive(m jetstream.Msg) {
 	}
 	c.mu.Unlock()
 
-	c.handle(m.Subject(), m.Headers(), m.Data())
+	// When the stream stored it, in the header a direct get uses for the
+	// same thing. The queuer decides by it whether a device was away when a
+	// message was published, rather than when the queuer got round to it.
+	header := m.Headers()
+	if header == nil {
+		header = nats.Header{}
+	}
+
+	header.Set(nats.JSTimeStamp, meta.Timestamp.UTC().Format(time.RFC3339Nano))
+
+	c.handle(m.Subject(), header, m.Data())
 
 	c.mu.Lock()
 	// A redelivery after a late acknowledgement is in turn but behind the
@@ -631,7 +642,11 @@ func (c *durableConsumer) ack() {
 	// After taking m, so the flush covers it: m was handled before it was
 	// recorded as the latest.
 	if c.flush != nil {
-		c.flush()
+		if err := c.flush(); err != nil {
+			c.onErr(fmt.Errorf("store: not acknowledging durable messages: %w", err))
+
+			return
+		}
 	}
 
 	if err := m.Ack(); err != nil {
@@ -917,28 +932,77 @@ func (s *Store) MarkAway(ctx context.Context, key string, sess Session) (bool, e
 	}
 
 	for range casRetries {
-		entry, err := s.sessions.Get(ctx, key)
+		current, revision, err := s.leaderSession(ctx, key)
 
 		switch {
-		case errors.Is(err, jetstream.ErrKeyNotFound):
-			_, err = s.sessions.Create(ctx, key, encoded)
+		case errors.Is(err, errNoRecord):
+			// Nothing to mark: a session with no record has nothing to
+			// queue for, and one whose record was deleted — by a clean
+			// start on another node, say — must stay deleted. Creating it
+			// here brought back subscriptions that clean start had dropped.
+			return false, nil
 		case err != nil:
-			return false, fmt.Errorf("store: reading session %s: %w", key, err)
-		default:
-			var current Session
-			if json.Unmarshal(entry.Value(), &current) == nil && current.Owner != "" && current.Owner != sess.Owner {
-				return false, nil
-			}
-
-			_, err = s.sessions.Update(ctx, key, encoded, entry.Revision())
+			return false, err
+		case current.Owner != "" && current.Owner != sess.Owner:
+			return false, nil
 		}
 
-		if err == nil {
+		if _, err = s.sessions.Update(ctx, key, encoded, revision); err == nil {
 			return true, nil
 		}
 	}
 
 	return false, fmt.Errorf("store: marking session %s away: %w", key, errContended)
+}
+
+// errNoRecord reports a session the stream leader holds no live record for.
+var errNoRecord = errors.New("store: no session record")
+
+// errLeaderRead reports a stream message get the leader refused.
+var errLeaderRead = errors.New("store: reading from the stream leader")
+
+// leaderReply is a stream message get's answer.
+type leaderReply struct {
+	Error *struct {
+		Code    int    `json:"code"`
+		ErrCode int    `json:"err_code"`
+		Desc    string `json:"description"`
+	} `json:"error"`
+	Message *struct {
+		Seq    uint64 `json:"seq"`
+		Header []byte `json:"hdrs"`
+		Data   []byte `json:"data"`
+	} `json:"message"`
+}
+
+func decodeLeaderSession(key string, data []byte) (Session, uint64, error) {
+	var none Session
+
+	var reply leaderReply
+	if err := json.Unmarshal(data, &reply); err != nil {
+		return none, 0, fmt.Errorf("store: reading session %s: %w", key, err)
+	}
+
+	switch {
+	case reply.Error != nil && reply.Error.Code == http.StatusNotFound, reply.Message == nil:
+		return none, 0, errNoRecord
+	case reply.Error != nil:
+		return none, 0, fmt.Errorf("%w: session %s: %d %s", errLeaderRead, key, reply.Error.ErrCode, reply.Error.Desc)
+	}
+
+	// A delete or purge is a record too, marked in its header.
+	op := string(reply.Message.Header)
+	if strings.Contains(op, "KV-Operation: DEL") || strings.Contains(op, "KV-Operation: PURGE") {
+		return none, 0, errNoRecord
+	}
+
+	var current Session
+	if err := json.Unmarshal(reply.Message.Data, &current); err != nil {
+		// An unreadable record is overwritten rather than kept.
+		return none, reply.Message.Seq, nil //nolint:nilerr // see above
+	}
+
+	return current, reply.Message.Seq, nil
 }
 
 // errContended reports a revision-checked write that kept losing.
@@ -988,4 +1052,31 @@ func (s *Store) DeleteSession(ctx context.Context, key string) error {
 	}
 
 	return s.DiscardQueue(ctx, key)
+}
+
+// leaderSession reads a session record from the sessions stream's leader.
+//
+// Not the bucket's Get, which is a direct get any replica may answer, and a
+// replica can be a moment behind. A device that subscribed and disconnected
+// at once had its record written and then looked up on a replica that had
+// not yet seen it; MarkAway took that for a deleted session and wrote
+// nothing, the record stayed as the subscribe left it — held — and no queuer
+// kept that sleeper's messages. Twenty of five thousand in one drill. A
+// stream message get is answered by the leader only, which has every write
+// it acknowledged. It costs a request to the leader, once per disconnect of
+// a lasting session, beside the replicated write that follows anyway.
+func (s *Store) leaderSession(ctx context.Context, key string) (Session, uint64, error) {
+	req, err := json.Marshal(map[string]string{"last_by_subj": "$KV." + bucketSessions + "." + key})
+	if err != nil {
+		return Session{}, 0, fmt.Errorf("store: encoding session read: %w", err)
+	}
+
+	subject := s.apiPrefix + "STREAM.MSG.GET." + kvStreamPrefix + bucketSessions
+
+	msg, err := s.js.Conn().RequestWithContext(ctx, subject, req)
+	if err != nil {
+		return Session{}, 0, fmt.Errorf("store: reading session %s: %w", key, err)
+	}
+
+	return decodeLeaderSession(key, msg.Data)
 }

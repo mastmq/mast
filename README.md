@@ -34,7 +34,7 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 - **Portable sessions** — subscriptions live in a shared bucket and the offline queue on a shared stream, filled by the core tier, so a device that reconnects to a different node finds its session and whatever QoS 1 or 2 traffic it missed, even when the edge it last used has since been restarted. Verified by a cluster test and by killing cores and edges under load in a three-core, three-edge cluster
 - **Cross-node takeover** — a second connection with an existing client id disconnects the first wherever in the cluster it is, which MQTT requires and a single node cannot do alone. Client ids are scoped to their tenant, so one tenant cannot displace another's device by reusing an id
 
-Not yet: per-tenant quotas, connection rate limiting, full QoS for shared subscriptions whose members span nodes, and queueing for a connected device in the second after its edge is killed outright.
+Not yet: per-tenant quotas, connection rate limiting, full QoS for shared subscriptions whose members span nodes, and queueing for a connected device between its edge being killed outright and its reconnecting elsewhere.
 
 ## Why
 
