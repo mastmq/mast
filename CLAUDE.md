@@ -191,7 +191,7 @@ Two traps that cost real time:
 | Workflow | Does |
 | --- | --- |
 | `test.yaml` | lint, test + codecov, `govulncheck`, **fuzz on every push**, then build |
-| `docker.yaml` | multi-tag ghcr image. PRs build but do not publish |
+| `docker.yaml` | multi-tag ghcr image for linux/amd64 and linux/arm64, cross-compiled in the build stage rather than emulated. PRs build but do not publish |
 | `release.yaml` | linux amd64/arm64 tarballs and a checksum file on the GitHub release, for `mastmq/ansible`. The file names are that collection's interface |
 | `codeql.yml` | weekly security scan |
 

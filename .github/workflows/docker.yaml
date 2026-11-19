@@ -42,6 +42,10 @@ jobs:
         with:
           context: .
           file: build/package/Dockerfile
+          # arm64 too: the release ships arm64 binaries and the Ansible role
+          # installs them, so an amd64-only image left Graviton nodes and
+          # Apple Silicon laptops as the one place mast could not run.
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

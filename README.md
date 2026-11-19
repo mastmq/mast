@@ -15,7 +15,7 @@
   &nbsp;·&nbsp; <a href="https://github.com/mastmq/bench">Benchmarks</a>
 </p>
 
-> **Status: early, but it runs.** A single `mast` process starts an embedded nats-server, terminates MQTT, and moves messages end to end with tenant isolation, wildcards, and shared subscriptions. QoS 0 through 2, retained messages, wills and persistent sessions all work, and a session follows a device between nodes and keeps collecting its messages when the edge it last used is restarted. QoS 1 and 2 hold across nodes too: a QoS 1 or 2 publish is stored on a replicated stream before it is acknowledged. The limit worth knowing before you read further: shared subscriptions spanning nodes are still best-effort ([delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md)). See [what works](#what-works).
+> **Status: early, but it runs.** A single `mast` process starts an embedded nats-server, terminates MQTT, and moves messages end to end with tenant isolation, wildcards, and shared subscriptions. QoS 0 through 2, retained messages, wills and persistent sessions all work, and a session follows a device between nodes and keeps collecting its messages when the edge it last used is restarted. QoS 1 and 2 hold across nodes too: a QoS 1 or 2 publish is stored on a replicated stream before it is acknowledged. Two limits are worth knowing before you read further: shared subscriptions spanning nodes are still best-effort, and a node that dies after it has taken a message can lose it, which includes what is published to a device still connected to an edge that is killed outright ([delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md)). See [what works](#what-works).
 
 ## What works
 
@@ -61,10 +61,20 @@ You do not need the split until you are big. Up to roughly ten nodes, run every 
 ## Quick start
 
 ```console
-$ go build ./cmd/mast
-$ ./mast config show          # resolved configuration as JSON
-$ ./mast --role=core          # not runnable yet; reports the plan and exits
+$ docker run -p 1883:1883 ghcr.io/mastmq/mast     # all-in-one, one tenant, every topic allowed
 ```
+
+Or from source, which is the same binary:
+
+```console
+$ go build ./cmd/mast
+$ ./mast                      # all-in-one: MQTT and storage in one process
+$ ./mast config show          # the resolved configuration as JSON
+$ ./mast --role=core          # Raft and the KV buckets; wants a volume
+$ ./mast --role=edge          # MQTT only, joins the cores as a leaf node
+```
+
+The default `static` auth mode admits everyone into one tenant, which is right for a laptop and wrong for anything reachable by someone else; see [authentication and authorization](#authentication-and-authorization). For a real deployment use the [Helm chart](https://github.com/mastmq/charts) on Kubernetes, or the [Ansible collection](https://github.com/mastmq/ansible) on virtual machines and bare metal, which installs the release tarballs under systemd.
 
 ## Authentication and authorization
 
