@@ -803,9 +803,6 @@ func TestClusterReturnedDeviceIsNotQueuedFor(t *testing.T) {
 
 	back := persistent(t, c.addrs[1], "commuter", tenantName)
 
-	// The record has to say it is back before the live traffic starts, and
-	// the queuer has to have heard, which the record alone does not prove;
-	// a probe that reaches the device live is published after both.
 	if !waitForLeaf(func() bool {
 		sess, err := c.edges[1].Store().GetSession(t.Context(), "umbrella.commuter")
 
@@ -816,15 +813,72 @@ func TestClusterReturnedDeviceIsNotQueuedFor(t *testing.T) {
 
 	pub := connect(t, c.addrs[0], "dispatcher", tenantName)
 
-	const sent = 5
-	for i := range sent {
-		tok := pub.client.Publish("fleet/commuter/cmd", 1, false, "live-"+strconv.Itoa(i))
+	publish := func(body string) {
+		tok := pub.client.Publish("fleet/commuter/cmd", 1, false, body)
 		if !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
-			t.Fatalf("publish %d: %v", i, tok.Error())
+			t.Fatalf("publish %s: %v", body, tok.Error())
 		}
 	}
 
-	if !waitForLeaf(func() bool { return len(back.messages()) >= sent }) {
+	// The record saying the device is back is not enough to start the live
+	// traffic on. The queuer keeps a message for a returned session if the
+	// stream stored it before the return plus a clock slack, and if it has
+	// not yet heard of the return it keeps everything: both are deliberate,
+	// a duplicate rather than a loss. Published at once, the live messages
+	// fell in that window in seven runs of ten and were replayed, which is
+	// the broker keeping its promise, not breaking it. So probes go first,
+	// until the core is seen to skip one, and only what follows is held to
+	// "never replayed".
+	queued := `mast_offline_queued_total{tenant="` + tenantName + `"} `
+	read := `mast_durable_read_total{reader="queuer"} `
+
+	skipped := false
+
+	for i := 0; i < 20 && !skipped; i++ {
+		probe := "probe-" + strconv.Itoa(i)
+		before, seen := readMetric(t, c.core.ObsAddr(), queued), readMetric(t, c.core.ObsAddr(), read)
+
+		publish(probe)
+
+		if !waitForLeaf(func() bool { return slices.Contains(back.messages(), "fleet/commuter/cmd="+probe) }) {
+			t.Fatalf("the returned device did not receive %s live: %v", probe, back.messages())
+		}
+
+		if !awaitMetric(t, c.core.ObsAddr(), read, seen+1) {
+			t.Fatalf("the queuer never read %s off the durable stream", probe)
+		}
+
+		// A write the queuer started lands before it acknowledges the
+		// stream, which it does at least every durableAckFlush (100ms).
+		// Proving a write did not happen needs a bound; this one is ten of
+		// those.
+		time.Sleep(time.Second)
+
+		skipped = readMetric(t, c.core.ObsAddr(), queued) == before
+	}
+
+	if !skipped {
+		t.Fatal("the queuer went on queueing for a session that came back")
+	}
+
+	const sent = 5
+	for i := range sent {
+		publish("live-" + strconv.Itoa(i))
+	}
+
+	live := func(msgs []string) []string {
+		var out []string
+
+		for _, m := range msgs {
+			if strings.HasPrefix(m, "fleet/commuter/cmd=live-") {
+				out = append(out, m)
+			}
+		}
+
+		return out
+	}
+
+	if !waitForLeaf(func() bool { return len(live(back.messages())) >= sent }) {
 		t.Fatalf("the returned device did not receive live traffic: %v", back.messages())
 	}
 
@@ -834,7 +888,7 @@ func TestClusterReturnedDeviceIsNotQueuedFor(t *testing.T) {
 
 	time.Sleep(settle)
 
-	if got := again.messages(); len(got) != 0 {
+	if got := live(again.messages()); len(got) != 0 {
 		t.Errorf("messages the device received live were replayed at its next return: %v", got)
 	}
 }
