@@ -43,6 +43,7 @@ Litmus test for `domain`: can the package be tested with no network, no filesyst
 | `infra/jwtauth` | local token verification |
 | `infra/config` | koanf: defaults → TOML → env → flags |
 | `infra/obs` | Prometheus metrics, `/healthz` (liveness), `/readyz` (readiness: an edge's leaf link, a core's JetStream), pprof |
+| `infra/tracing` | builds the OpenTelemetry tracer provider and OTLP/HTTP exporter. The spans themselves are in `bridge/trace.go` |
 | `infra/memlimit` | sets GOMEMLIMIT from the container's cgroup limit, which Go does not read by itself |
 
 `deployments/fire` is the Docker cluster and the chaos drills: three cores, three edges, SIGKILLs. A change to delivery or storage is not done until it has been through it, at least four runs against a baseline build; its README says how.
@@ -60,6 +61,8 @@ These are properties the tests and the docs both depend on. Breaking one is a da
 **Authentication always fails closed**, whatever `auth.http.on_error` says. Admitting a connection whose tenant is unknown means inventing an isolation boundary. `on_error` governs authorization only.
 
 **The hot QoS 0 publish path does zero storage operations.** `OnPublish` on a non-retained QoS 0 message touches only `EncodeTopic` and `nc.PublishMsg`. QoS 1 and 2 are the one deliberate exception: they are written to the durable stream before they are acknowledged, because that acknowledgement is a promise core NATS alone cannot keep (#11). Adding a store call to the QoS 0 path would change the cost model the whole design rests on — if you think one is needed, raise it rather than adding it.
+
+**Tracing off costs a comparison.** The bridge's tracer is nil when `tracing.enabled` is false, and every traced path checks for nil before it does anything else. Do not replace that with a no-op tracer: extracting a parent and building a context allocate whether or not anything records them, and the QoS 0 path is judged in allocations. `BenchmarkPublishQoS0` against the previous build is the proof, and `BenchmarkPublishQoS0Traced` is what turning it on costs.
 
 **Metric cardinality is per tenant, never per device.** 300k label series will take down Prometheus before they take down the broker.
 

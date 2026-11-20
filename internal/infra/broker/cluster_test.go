@@ -49,6 +49,14 @@ type cluster struct {
 func startCluster(t *testing.T) *cluster {
 	t.Helper()
 
+	return startClusterWith(t, nil)
+}
+
+// startClusterWith is startCluster with a hook that adjusts each edge's
+// configuration before it starts. A nil hook changes nothing.
+func startClusterWith(t *testing.T, edgeConfig func(*config.Config)) *cluster {
+	t.Helper()
+
 	log := slog.New(slog.DiscardHandler)
 	if os.Getenv("MAST_TEST_LOG") != "" {
 		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -99,6 +107,10 @@ func startCluster(t *testing.T) *cluster {
 		cfg.Obs.Addr = anyPort
 		cfg.MQTT.Addr = freeAddr(t)
 		cfg.Edge.CoreURLs = []string{"nats-leaf://" + leafAddr}
+
+		if edgeConfig != nil {
+			edgeConfig(&cfg)
+		}
 
 		edge, err := broker.Start(t.Context(), cfg, byUsername{}, tenant.AllowAll{}, log)
 		if err != nil {
