@@ -36,6 +36,6 @@ A gap listed here is still a gap. [Delivery guarantees](https://github.com/mastm
 
 **Multi-pod load generation** ([bench#1](https://github.com/mastmq/bench/issues/1)). Every benchmark runs from one pod, which becomes the limit before the broker does. Until load comes from several pods, no result from the harness is mast's ceiling.
 
-**Website deploy through Actions** ([mastmq.github.io#2](https://github.com/mastmq/mastmq.github.io/issues/2)). The site is served from committed build output, a stopgap from when no token could write a workflow. Building it in Actions removes the output from git and the chance of it drifting from the source.
+**Website deploy through Actions** ([mastmq.github.io#2](https://github.com/mastmq/mastmq.github.io/issues/2)). Done: a push to `main` checks, builds and deploys the site through GitHub Actions, and the build output, once committed as a stopgap, is out of git.
 
 Something missing from this list? Open an issue, or start a thread in [Discussions](https://github.com/mastmq/mast/discussions/categories/ideas).
