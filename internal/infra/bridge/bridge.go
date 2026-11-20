@@ -43,6 +43,7 @@ import (
 
 	"github.com/mastmq/mast/internal/domain/tenant"
 	"github.com/mastmq/mast/internal/domain/topic"
+	"github.com/mastmq/mast/internal/infra/limits"
 	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mastmq/mochi/v2"
@@ -115,7 +116,7 @@ type Hook struct {
 	// by connection rather than by client id, so that a disconnect reported
 	// twice — once by a takeover, once by mochi — is released once, and a
 	// new connection with the same id is never mistaken for the old one.
-	open map[*mqtt.Client]tenant.ID
+	open map[*mqtt.Client]openConn
 	// persistedAt is when each client's session was last written, so the
 	// refresher rewrites only what is about to age out of the bucket.
 	persistedAt map[string]time.Time
@@ -147,6 +148,9 @@ type Hook struct {
 
 	metrics *obs.Metrics
 
+	// limits enforces each tenant's limits. Nil enforces none.
+	limits *limits.Limiter
+
 	// internalListener is the mochi listener id whose connections skip
 	// authentication, and internalTenant is where they land.
 	internalListener string
@@ -175,6 +179,19 @@ type Options struct {
 	// DurableQoS carries QoS 1 and 2 across the fabric on the durable
 	// stream, which the store must already have opened.
 	DurableQoS bool
+
+	// Limits enforces per-tenant limits. Nil enforces none. Connections on
+	// the internal listener are never limited: they are the deployment's
+	// own services, and a tenant's devices filling its quota must not lock
+	// them out.
+	Limits *limits.Limiter
+}
+
+// openConn is a connection the gauge counted: its tenant, and whether the
+// limiter counted it too and so has to be told when it goes.
+type openConn struct {
+	tenant  tenant.ID
+	limited bool
 }
 
 // New builds a bridge over an established NATS connection.
@@ -206,7 +223,8 @@ func New(
 		seen:             newSeen(),
 		ids:              newIDs(),
 		tenants:          sync.Map{},
-		open:             make(map[*mqtt.Client]tenant.ID),
+		open:             make(map[*mqtt.Client]openConn),
+		limits:           opts.Limits,
 		persistedAt:      make(map[string]time.Time),
 		sessionExpiry:    opts.SessionExpiry,
 		stop:             make(chan struct{}),
@@ -292,7 +310,10 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	if h.isInternal(cl) {
 		bare := cl.ID
 		cl.ID = mountClient(h.internalTenant, bare)
-		h.onConnected(cl, tenant.Identity{Tenant: h.internalTenant, Superuser: true})
+
+		var unlimited tenant.Overrides
+
+		h.onConnected(cl, tenant.Identity{Tenant: h.internalTenant, Superuser: true, Limits: unlimited}, false)
 		h.claimSession(h.internalTenant, bare, cl)
 
 		if pk.Connect.Clean {
@@ -323,9 +344,13 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	bare := cl.ID
 	cl.ID = mountClient(identity.Tenant, bare)
 
+	if !h.admit(cl, identity) {
+		return false
+	}
+
 	h.log.Debug("client authenticated",
 		"client", cl.ID, "tenant", string(identity.Tenant), "superuser", identity.Superuser)
-	h.onConnected(cl, identity)
+	h.onConnected(cl, identity, h.limits != nil)
 
 	// Announce the claim so a copy of this client on another node stands
 	// down. mochi has already displaced any local copy by this point.
@@ -457,6 +482,10 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		return pk, packets.ErrNotAuthorized
 	}
 
+	if h.overRate(cl, id) {
+		return h.rateLimited(cl, pk, id)
+	}
+
 	subject, err := topic.EncodeTopic(string(id), unmount(id, pk.TopicName))
 	if err != nil {
 		h.log.Warn("dropping publish with unencodable topic",
@@ -494,7 +523,7 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		h.log.Error("forwarding publish to nats", "subject", subject, "error", err)
 	}
 
-	h.count(func(m *obs.Metrics) { m.MessagesIn.WithLabelValues(string(id)).Inc() })
+	h.count(func(m *obs.Metrics) { m.MessagesIn.WithLabelValues(m.Tenant(string(id))).Inc() })
 
 	return pk, packets.CodeSuccessIgnore
 }
@@ -871,7 +900,7 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 		return
 	}
 
-	h.count(func(m *obs.Metrics) { m.MessagesOut.WithLabelValues(tenantID).Inc() })
+	h.count(func(m *obs.Metrics) { m.MessagesOut.WithLabelValues(m.Tenant(tenantID)).Inc() })
 }
 
 // route is what the bridge tells its own later hooks about a message it
@@ -1117,7 +1146,7 @@ func (h *Hook) replayRetained(cl *mqtt.Client, id tenant.ID, filter packets.Subs
 
 	if len(messages) > 0 {
 		h.count(func(m *obs.Metrics) {
-			m.RetainedReplayed.WithLabelValues(string(id)).Add(float64(len(messages)))
+			m.RetainedReplayed.WithLabelValues(m.Tenant(string(id))).Add(float64(len(messages)))
 		})
 	}
 
@@ -1243,16 +1272,19 @@ func (h *Hook) forget(clientID string) {
 // the internal listener returned early, so a node holding thousands of
 // connections on it reported none, and the gauge was blind to the one
 // listener a load test is most likely to use.
-func (h *Hook) onConnected(cl *mqtt.Client, identity tenant.Identity) {
+//
+// limited says the limiter counted the connection, so that whoever releases
+// it from the gauge releases it from the limiter too, exactly once.
+func (h *Hook) onConnected(cl *mqtt.Client, identity tenant.Identity, limited bool) {
 	h.tenants.Store(cl.ID, identity)
 
 	h.mu.Lock()
-	h.open[cl] = identity.Tenant
+	h.open[cl] = openConn{tenant: identity.Tenant, limited: limited}
 	h.mu.Unlock()
 
 	h.count(func(m *obs.Metrics) {
-		m.ConnectionsTotal.WithLabelValues(string(identity.Tenant)).Inc()
-		m.ConnectionsOpen.WithLabelValues(string(identity.Tenant)).Inc()
+		m.ConnectionsTotal.WithLabelValues(m.Tenant(string(identity.Tenant))).Inc()
+		m.ConnectionsOpen.WithLabelValues(m.Tenant(string(identity.Tenant))).Inc()
 	})
 }
 
@@ -1260,7 +1292,7 @@ func (h *Hook) onConnected(cl *mqtt.Client, identity tenant.Identity) {
 // than once for the same connection; only the first call counts.
 func (h *Hook) onDisconnected(cl *mqtt.Client) {
 	h.mu.Lock()
-	id, counted := h.open[cl]
+	conn, counted := h.open[cl]
 	delete(h.open, cl)
 	h.mu.Unlock()
 
@@ -1268,8 +1300,12 @@ func (h *Hook) onDisconnected(cl *mqtt.Client) {
 		return
 	}
 
+	if conn.limited {
+		h.limits.Release(conn.tenant)
+	}
+
 	h.count(func(m *obs.Metrics) {
-		m.ConnectionsOpen.WithLabelValues(string(id)).Dec()
+		m.ConnectionsOpen.WithLabelValues(m.Tenant(string(conn.tenant))).Dec()
 	})
 }
 

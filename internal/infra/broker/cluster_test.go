@@ -49,6 +49,14 @@ type cluster struct {
 func startCluster(t *testing.T) *cluster {
 	t.Helper()
 
+	return startClusterWith(t, func(*config.Config) {})
+}
+
+// startClusterWith is [startCluster] with every node's configuration passed
+// through mutate first, as a deployment renders one file for every node.
+func startClusterWith(t *testing.T, mutate func(*config.Config)) *cluster {
+	t.Helper()
+
 	log := slog.New(slog.DiscardHandler)
 	if os.Getenv("MAST_TEST_LOG") != "" {
 		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -64,6 +72,7 @@ func startCluster(t *testing.T) *cluster {
 	coreCfg.Core.StoreDir = t.TempDir()
 	coreCfg.Core.LeafAddr = leafAddr
 	coreCfg.MQTT.Addr = "" // a core terminates no MQTT
+	mutate(&coreCfg)
 
 	core, err := broker.Start(t.Context(), coreCfg, byUsername{}, tenant.AllowAll{}, log)
 	if err != nil {
@@ -99,6 +108,7 @@ func startCluster(t *testing.T) *cluster {
 		cfg.Obs.Addr = anyPort
 		cfg.MQTT.Addr = freeAddr(t)
 		cfg.Edge.CoreURLs = []string{"nats-leaf://" + leafAddr}
+		mutate(&cfg)
 
 		edge, err := broker.Start(t.Context(), cfg, byUsername{}, tenant.AllowAll{}, log)
 		if err != nil {

@@ -55,6 +55,7 @@ func Build(cfg config.Config, log *slog.Logger) (tenant.Resolver, tenant.Policy,
 			TenantClaim:    cfg.Auth.JWT.TenantClaim,
 			Tenant:         tenant.ID(cfg.Tenant.Default),
 			SuperuserClaim: cfg.Auth.JWT.SuperuserClaim,
+			LimitsClaim:    cfg.Auth.JWT.LimitsClaim,
 			Issuer:         cfg.Auth.JWT.Issuer,
 			Audience:       cfg.Auth.JWT.Audience,
 		}, log)

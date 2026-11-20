@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -78,6 +79,15 @@ type Metrics struct {
 	// QueuerAway is how many sessions this node's queuer is keeping
 	// messages for. It should match on every core.
 	QueuerAway prometheus.Gauge
+
+	// LimitExceeded counts what a tenant's limits refused, by tenant and by
+	// limit: "connections", "publish_rate", or "offline_queue" for queued
+	// messages discarded on reconnect because the queue held more than the
+	// tenant may keep.
+	LimitExceeded *prometheus.CounterVec
+
+	// tenants bounds how many label values the tenant label takes.
+	tenants *tenantLabels
 }
 
 // NATSCounts is what the NATS client's asynchronous handlers have observed.
@@ -101,8 +111,9 @@ type Sources struct {
 	NATS func() NATSCounts
 }
 
-// NewMetrics registers mast's metrics on a registry.
-func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
+// NewMetrics registers mast's metrics on a registry. maxTenants bounds how
+// many tenants get a label value of their own; zero leaves it unbounded.
+func NewMetrics(reg prometheus.Registerer, src Sources, maxTenants int) *Metrics {
 	factory := func(name, help string, labels ...string) *prometheus.CounterVec {
 		c := prometheus.NewCounterVec(prometheus.CounterOpts{ //nolint:exhaustruct_v5 // defaults are right
 			Namespace: namespace,
@@ -149,6 +160,9 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 			Name:      "queuer_away_sessions",
 			Help:      "Sessions this node's queuer keeps messages for, because no connection holds them.",
 		}),
+		LimitExceeded: factory("limit_exceeded_total",
+			"Connections, publishes and queued messages refused or discarded by a tenant limit.", "tenant", "limit"),
+		tenants: &tenantLabels{max: maxTenants, mu: sync.RWMutex{}, known: make(map[string]struct{})},
 	}
 
 	if src.Subscriptions != nil {
@@ -164,6 +178,60 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 	registerNATSCounts(reg, src.NATS)
 
 	return m
+}
+
+// OtherTenants is the label value every tenant past the bound shares. A
+// tenant id is restricted to [A-Za-z0-9_-], so no real tenant can be named
+// this and have its series mistaken for the overflow.
+const OtherTenants = "~other"
+
+// Tenant is the label value to record id under: id itself for the first
+// tenants this node sees, up to the configured bound, and [OtherTenants]
+// for the rest.
+//
+// The first come keep their labels for the life of the process. A tenant
+// that changes series halfway through would break every rate() over it,
+// which is worse than a late tenant being folded into the overflow.
+func (m *Metrics) Tenant(id string) string { return m.tenants.label(id) }
+
+// tenantLabels hands out label values until it has handed out max.
+type tenantLabels struct {
+	max   int
+	mu    sync.RWMutex
+	known map[string]struct{}
+}
+
+func (t *tenantLabels) label(id string) string {
+	if t.max == 0 {
+		return id
+	}
+
+	t.mu.RLock()
+	_, ok := t.known[id]
+	full := len(t.known) >= t.max
+	t.mu.RUnlock()
+
+	switch {
+	case ok:
+		return id
+	case full:
+		return OtherTenants
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if _, ok := t.known[id]; ok {
+		return id
+	}
+
+	if len(t.known) >= t.max {
+		return OtherTenants
+	}
+
+	t.known[id] = struct{}{}
+
+	return id
 }
 
 // registerNATSCounts publishes the fabric's asynchronous tallies.

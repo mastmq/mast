@@ -340,6 +340,8 @@ func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string, 
 		return after, false
 	}
 
+	h.limitBacklog(id, &backlog)
+
 	through, legacy := backlog.Through, backlog.Legacy
 	sent := make([]sentBacklog, 0, len(backlog.Messages))
 
@@ -366,7 +368,7 @@ func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string, 
 
 	if len(sent) > 0 {
 		h.count(func(m *obs.Metrics) {
-			m.OfflineDelivered.WithLabelValues(string(id)).Add(float64(len(sent)))
+			m.OfflineDelivered.WithLabelValues(m.Tenant(string(id))).Add(float64(len(sent)))
 		})
 		h.log.Info("offline queue delivered",
 			"client", bareClientID, "tenant", string(id), "messages", len(sent))
@@ -560,12 +562,18 @@ func (h *Hook) discardOffline(id tenant.ID, bareClientID string) {
 // client, and persisting it would turn a fire-and-forget message into
 // storage that outlives the thing it described.
 func (h *Hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) {
-	if h.store == nil || !queuesForAbsence(cl) {
+	if !queuesForAbsence(cl) {
 		return
 	}
 
 	id, ok := h.tenantOf(cl)
 	if !ok {
+		return
+	}
+
+	h.limitInflight(cl, id)
+
+	if h.store == nil {
 		return
 	}
 
@@ -605,6 +613,6 @@ func (h *Hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) 
 		return
 	}
 
-	h.count(func(m *obs.Metrics) { m.OfflineQueued.WithLabelValues(string(id)).Inc() })
+	h.count(func(m *obs.Metrics) { m.OfflineQueued.WithLabelValues(m.Tenant(string(id))).Inc() })
 	h.log.Debug("queued for an absent client", "client", cl.ID, "topic", msg.Topic)
 }

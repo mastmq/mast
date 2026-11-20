@@ -23,13 +23,16 @@ const (
 	legacyBucketOffline = "mast_offline"
 )
 
-// maxOfflineMessages bounds how much is kept for one absent client.
+// DefaultQueueLimit bounds how much is kept for one absent client unless
+// [WithQueueLimit] says otherwise.
 //
 // The bound is the point: without it a single disconnected device subscribed
 // to a chatty topic would grow until the stream did. MQTT lets a broker
 // discard, and discarding the oldest is the least surprising choice — which
-// the stream now does itself, per subject.
-const maxOfflineMessages = 100
+// the stream now does itself, per subject. The stream can only hold one
+// bound for every subject, so a tenant whose limit is smaller has it applied
+// when its queue is drained.
+const DefaultQueueLimit = 100
 
 // offlineDedupWindow is how long the stream remembers a queued message's id.
 // The edge that held the session and the queuer on every core write the
@@ -58,7 +61,7 @@ const (
 // NATS message may hold. One subject per session, with the stream keeping
 // the newest hundred, makes an append one small write and leaves the
 // discarding to the server.
-func (s *Store) openOffline(ctx context.Context, replicas int, ttl time.Duration) error {
+func (s *Store) openOffline(ctx context.Context, replicas int, ttl time.Duration, limit int) error {
 	dedup := offlineDedupWindow
 	if ttl > 0 {
 		dedup = min(dedup, ttl)
@@ -69,7 +72,7 @@ func (s *Store) openOffline(ctx context.Context, replicas int, ttl time.Duration
 		Subjects:          []string{offlinePrefix + ">"},
 		Retention:         jetstream.LimitsPolicy,
 		Discard:           jetstream.DiscardOld,
-		MaxMsgsPerSubject: maxOfflineMessages,
+		MaxMsgsPerSubject: int64(limit),
 		MaxAge:            ttl,
 		Storage:           jetstream.FileStorage,
 		Replicas:          replicas,
@@ -124,7 +127,7 @@ func QueueID(messageID, key string) string {
 }
 
 // Enqueue appends one message to an absent client's queue. The oldest is
-// dropped once the queue holds [maxOfflineMessages].
+// dropped once the queue holds the stream's limit.
 func (s *Store) Enqueue(ctx context.Context, q Queued) (bool, error) {
 	stored, err := s.EnqueueMany(ctx, []Queued{q})
 

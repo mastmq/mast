@@ -32,4 +32,7 @@ var (
 	// nothing: with no retention, a node cut off for an instant catches up
 	// on nothing, which is the failure the stream exists to prevent.
 	ErrBadDurableMaxAge = errors.New("config: fabric.durable_max_age must be positive when fabric.durable_qos is on")
+
+	// ErrBadLimit is returned for a tenant limit that cannot mean anything.
+	ErrBadLimit = errors.New("config: invalid limit")
 )

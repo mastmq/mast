@@ -272,13 +272,38 @@ func (s *Store) Reconcile(ctx context.Context, replicas int) ([]string, error) {
 	return fixed, nil
 }
 
+// Option adjusts what [Open] provisions.
+type Option func(*openConfig)
+
+// openConfig is what the options set.
+type openConfig struct {
+	queueLimit int
+}
+
+// WithQueueLimit sets how many messages the offline stream keeps for one
+// absent session. Values below one keep the default.
+func WithQueueLimit(n int) Option {
+	return func(c *openConfig) {
+		if n > 0 {
+			c.queueLimit = n
+		}
+	}
+}
+
 // Open creates the buckets and streams if they are absent, sets their
 // configuration if they are not, and returns a handle. Only a node carrying
 // JetStream calls it; an edge calls [Bind].
 //
 // replicas is the replication factor for each bucket; it must not exceed the
 // number of JetStream peers or bucket creation fails.
-func Open(ctx context.Context, nc *nats.Conn, domain string, replicas int, ttl time.Duration) (*Store, error) {
+func Open(
+	ctx context.Context, nc *nats.Conn, domain string, replicas int, ttl time.Duration, opts ...Option,
+) (*Store, error) {
+	cfg := openConfig{queueLimit: DefaultQueueLimit}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	s, err := newStore(nc, domain)
 	if err != nil {
 		return nil, err
@@ -308,7 +333,7 @@ func Open(ctx context.Context, nc *nats.Conn, domain string, replicas int, ttl t
 		*spec.into = kv
 	}
 
-	if err := s.openOffline(ctx, replicas, ttl); err != nil {
+	if err := s.openOffline(ctx, replicas, ttl, cfg.queueLimit); err != nil {
 		return nil, err
 	}
 

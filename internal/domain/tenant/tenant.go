@@ -71,6 +71,13 @@ type Identity struct {
 	// policy anyway would enforce rules the old broker ignored and break
 	// services on the day of the switch.
 	Superuser bool
+
+	// Limits are what the authentication backend said about the tenant's
+	// limits, when it said anything. They sit above the configured ones,
+	// because the service that names tenants is the one that knows what each
+	// has paid for; mast does not own tenant lifecycle, and a config file
+	// listing ten thousand tenants is not a place anyone keeps current.
+	Limits Overrides
 }
 
 // Resolver maps credentials to the identity behind the connection.
@@ -104,7 +111,9 @@ func (s Static) Resolve(_ context.Context, _ Credentials) (Identity, error) {
 		return Identity{}, ErrUnauthenticated
 	}
 
-	return Identity{Tenant: s.Tenant, Superuser: false}, nil
+	var none Overrides
+
+	return Identity{Tenant: s.Tenant, Superuser: false, Limits: none}, nil
 }
 
 // AllowAll permits every operation. It pairs with [Static] for single-tenant
