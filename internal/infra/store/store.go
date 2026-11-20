@@ -403,12 +403,61 @@ func (s *Store) ReplayDurable(ctx context.Context, since time.Time, fn DurableHa
 }
 
 // Reachable reports whether the sessions bucket's stream has a leader this
-// node can reach. A node cut off from the rest of the cluster cannot, and
-// it is the one node whose opinion of who else is alive must not be acted
-// on: every other node would look dead to it.
+// node can reach, and whether that leader is in touch with a majority of
+// its replicas. A node cut off from the rest of the cluster fails one or
+// the other, and it is the one node whose opinion of who else is alive
+// must not be acted on: every other node would look dead to it.
+//
+// Reaching the leader alone was the first check, and it is not enough. A
+// core cut off together with the edge it serves may itself lead the
+// stream, and it answers its own request: Raft keeps a leader without
+// quorum for up to twenty seconds, past the ten in which an edge is
+// declared dead. Its view of its replicas tells the truth sooner. Each one
+// answers the leader's heartbeat every second, and one that has not been
+// heard from for [replicaSilence] is on the far side of a split.
 func (s *Store) Reachable(ctx context.Context) error {
-	if _, err := s.js.Stream(ctx, kvStreamPrefix+bucketSessions); err != nil {
+	stream, err := s.js.Stream(ctx, kvStreamPrefix+bucketSessions)
+	if err != nil {
 		return fmt.Errorf("store: reaching the sessions stream: %w", err)
+	}
+
+	return quorate(stream.CachedInfo().Cluster)
+}
+
+// replicaSilence is how long a stream leader may go without hearing from a
+// replica before the replica is counted as out of reach. Raft heartbeats
+// every second, so three is two missed beats of slack: the same allowance
+// nats-server gives a follower judging its own leader.
+const replicaSilence = 3 * time.Second
+
+// errNoQuorum is a stream leader that is not in touch with a majority of
+// its replicas.
+var errNoQuorum = errors.New("store: the sessions stream's leader cannot hear a majority of its replicas")
+
+// quorate reports whether a stream's leader, as its own info describes it,
+// hears a majority of the stream's replicas, itself included. A stream that
+// is not replicated has no one to be cut off from.
+func quorate(cluster *jetstream.ClusterInfo) error {
+	if cluster == nil {
+		return nil
+	}
+
+	if cluster.Leader == "" {
+		return fmt.Errorf("%w: no leader", errNoQuorum)
+	}
+
+	heard := 1 // the leader, which answered
+
+	for _, r := range cluster.Replicas {
+		// Active is zero for a replica never heard from, as well as for
+		// one heard from this instant; only the second counts.
+		if r != nil && !r.Offline && r.Active > 0 && r.Active < replicaSilence {
+			heard++
+		}
+	}
+
+	if size := len(cluster.Replicas) + 1; 2*heard <= size {
+		return fmt.Errorf("%w: %d of %d", errNoQuorum, heard, size)
 	}
 
 	return nil
