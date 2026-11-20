@@ -17,6 +17,10 @@ on:
 
 permissions:
   contents: write
+  # Build provenance for the archives: an OIDC token for the Sigstore
+  # certificate, and the right to store the attestation on the repository.
+  id-token: write
+  attestations: write
 
 jobs:
   binaries:
@@ -47,6 +51,15 @@ jobs:
           done
           (cd dist && sha256sum ./*.tar.gz | sed 's| \./| |' > "mast_${version}_checksums.txt")
           cat "dist/mast_${version}_checksums.txt"
+
+      # Attested before upload, and over the files exactly as uploaded, so
+      # `gh attestation verify` works on what a user downloads. The names
+      # are left alone: they are mastmq/ansible's interface.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*_checksums.txt
 
       # A tag pushed without a release gets a draft, so the notes are still
       # written by a person before anything is announced.

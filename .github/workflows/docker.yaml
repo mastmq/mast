@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
   packages: write
+  # Keyless signing: cosign trades the workflow's OIDC token for a
+  # short-lived Sigstore certificate naming this workflow and ref, so there
+  # is no signing key to store, rotate or leak.
+  id-token: write
 
 jobs:
   image:
@@ -39,6 +43,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v7
+        id: build
         with:
           context: .
           file: build/package/Dockerfile
@@ -51,3 +56,20 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Stored in the registry beside the image, per platform, so they
+          # travel with it to any mirror. mode=max records the build's
+          # inputs in full, which is what makes the provenance worth reading.
+          sbom: true
+          provenance: mode=max
+
+      - uses: sigstore/cosign-installer@v4.1.3
+        if: github.event_name != 'pull_request'
+
+      # The digest, not a tag: a tag can be moved to another image after it
+      # was signed, a digest cannot. Signing the index covers both
+      # platforms, since cosign verify resolves a tag to the same index.
+      - name: sign
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/${GITHUB_REPOSITORY}@${DIGEST}"

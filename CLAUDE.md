@@ -42,7 +42,7 @@ Litmus test for `domain`: can the package be tested with no network, no filesyst
 | `infra/httpauth` | the callback backend, with a TTL cache. Speaks both the mast wire and the EMQX v5 wire |
 | `infra/jwtauth` | local token verification |
 | `infra/config` | koanf: defaults → TOML → env → flags |
-| `infra/obs` | Prometheus metrics, health, pprof |
+| `infra/obs` | Prometheus metrics, `/healthz` (liveness), `/readyz` (readiness: an edge's leaf link, a core's JetStream), pprof |
 | `infra/memlimit` | sets GOMEMLIMIT from the container's cgroup limit, which Go does not read by itself |
 
 `deployments/fire` is the Docker cluster and the chaos drills: three cores, three edges, SIGKILLs. A change to delivery or storage is not done until it has been through it, at least four runs against a baseline build; its README says how.
@@ -191,8 +191,8 @@ Two traps that cost real time:
 | Workflow | Does |
 | --- | --- |
 | `test.yaml` | lint, test + codecov, `govulncheck`, **fuzz on every push**, then build |
-| `docker.yaml` | multi-tag ghcr image for linux/amd64 and linux/arm64, cross-compiled in the build stage rather than emulated. PRs build but do not publish |
-| `release.yaml` | linux amd64/arm64 tarballs and a checksum file on the GitHub release, for `mastmq/ansible`. The file names are that collection's interface |
+| `docker.yaml` | multi-tag ghcr image for linux/amd64 and linux/arm64, cross-compiled in the build stage rather than emulated, with an SBOM and `mode=max` provenance, and the pushed digest signed keylessly with cosign. PRs build but do not publish |
+| `release.yaml` | linux amd64/arm64 tarballs and a checksum file on the GitHub release, for `mastmq/ansible`, each with a GitHub build-provenance attestation. The file names are that collection's interface |
 | `codeql.yml` | weekly security scan |
 
 `govulncheck` runs on every push, not only on dependency bumps — a dependency can become vulnerable without a line of our code changing. It fails only on *reachable* vulnerabilities; treating unreachable ones as failure is how a red pipeline stops meaning anything.

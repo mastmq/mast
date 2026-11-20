@@ -137,6 +137,25 @@ The observability listener (`obs.addr`, `127.0.0.1:9090` by default) serves `/me
 
 `/healthz` is liveness: it answers 200 for as long as the process runs and answers. `/readyz` answers 200 only when the node can serve, and 503 with the reason when it cannot. An edge is ready when it is serving MQTT and its leaf connection to the core is up; a core or an all-in-one node is ready when its embedded nats-server and JetStream are, by nats-server's own health check. Point a readiness probe at `/readyz` and a liveness probe at `/healthz`, never the other way round: an edge whose core is away is not fixed by a restart, and a liveness probe on `/readyz` would restart every edge in the fleet whenever the core tier is.
 
+## Verifying a release
+
+From v0.3.2, every image pushed to `ghcr.io/mastmq/mast` is signed keylessly with cosign, from the workflow that built it, and carries an SBOM and SLSA provenance. Check the signature of a release image against the identity of the workflow and the tag:
+
+```console
+$ cosign verify ghcr.io/mastmq/mast:0.3.2 \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity https://github.com/mastmq/mast/.github/workflows/docker.yaml@refs/tags/v0.3.2
+$ docker buildx imagetools inspect ghcr.io/mastmq/mast:0.3.2 --format '{{ json .SBOM }}'
+$ docker buildx imagetools inspect ghcr.io/mastmq/mast:0.3.2 --format '{{ json .Provenance }}'
+```
+
+From the same release, the archives and the checksum file carry GitHub build provenance. Verify a downloaded file with the GitHub CLI:
+
+```console
+$ gh attestation verify mast_0.3.2_linux_amd64.tar.gz -R mastmq/mast
+$ sha256sum -c --ignore-missing mast_0.3.2_checksums.txt
+```
+
 ## Development
 
 ```console
