@@ -197,6 +197,24 @@ func TestValidate(t *testing.T) {
 			config.ErrBadAdminGather,
 		},
 		{
+			"an admin api that waits longer than any request should",
+			func(c *config.Config) {
+				c.Admin.Addr = ":9091"
+				c.Admin.TokenFile = "/run/secrets/admin"
+				c.Admin.Gather = 10 * time.Second
+			},
+			config.ErrBadAdminGather,
+		},
+		{
+			"an admin api at the longest gather",
+			func(c *config.Config) {
+				c.Admin.Addr = ":9091"
+				c.Admin.TokenFile = "/run/secrets/admin"
+				c.Admin.Gather = config.MaxAdminGather
+			},
+			nil,
+		},
+		{
 			"an admin api with a token file",
 			func(c *config.Config) {
 				c.Admin.Addr = ":9091"

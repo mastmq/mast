@@ -168,5 +168,5 @@ addr = ""
 token_file = ""
 # How long to wait for every node to answer a list or stats request. A node
 # slower than this is missing from that response, which says how many nodes
-# answered.
+# answered. Every list and stats request waits this long; at most 5s.
 gather = "500ms"

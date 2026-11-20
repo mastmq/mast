@@ -109,6 +109,12 @@ type Config struct {
 // the rest is room for a node busy with a reconnect storm.
 const defaultAdminGather = 500 * time.Millisecond
 
+// MaxAdminGather bounds the admin API's gather window. Every list and stats
+// request waits the whole window, so a window of seconds is already a slow
+// API; one longer than this is a typo or a cluster too far apart for this
+// design, not a setting to accept quietly.
+const MaxAdminGather = 5 * time.Second
+
 // Admin configures the administrative HTTP API: listing a tenant's sessions,
 // reading one, disconnecting a client, and a tenant's counts.
 type Admin struct {
@@ -523,7 +529,7 @@ func (c Config) validateAdmin() error {
 		return ErrAdminNeedsToken
 	}
 
-	if c.Admin.Gather <= 0 {
+	if c.Admin.Gather <= 0 || c.Admin.Gather > MaxAdminGather {
 		return fmt.Errorf("%w: got %v", ErrBadAdminGather, c.Admin.Gather)
 	}
 

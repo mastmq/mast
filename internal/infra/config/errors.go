@@ -38,6 +38,7 @@ var (
 	ErrAdminNeedsToken = errors.New("config: admin.addr requires admin.token_file")
 
 	// ErrBadAdminGather guards against a gather window that closes before
-	// any other node can answer, which would report a cluster as one node.
-	ErrBadAdminGather = errors.New("config: admin.gather must be positive")
+	// any other node can answer, which would report a cluster as one node,
+	// and one so long that every list and stats request waits it out.
+	ErrBadAdminGather = errors.New("config: admin.gather must be positive and at most 5s")
 )
