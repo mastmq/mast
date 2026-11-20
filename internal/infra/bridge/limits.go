@@ -46,6 +46,16 @@ func (h *Hook) admit(cl *mqtt.Client, identity tenant.Identity) bool {
 		return true
 	}
 
+	// Before refusing, release what mochi closed without telling us: a
+	// leaked slot must not be the reason a device is turned away, and
+	// waiting for the next reap would refuse it once for nothing.
+	if h.reapClosed() > 0 {
+		limits, err = h.limits.Admit(identity.Tenant, identity.Limits, h.holds(cl))
+		if err == nil {
+			return true
+		}
+	}
+
 	h.log.Info("connection refused at the tenant's connection limit",
 		"client", cl.ID, "tenant", string(identity.Tenant), "limit", limits.MaxConnections)
 	h.count(func(m *obs.Metrics) {
@@ -160,22 +170,91 @@ func (h *Hook) limitBacklog(id tenant.ID, backlog *store.Backlog) {
 // mqtt's MaximumInflight, thousands, so the tenant's limit is applied here,
 // as each message for the absent client arrives.
 //
-// Oldest is by creation second, then packet id, which mochi allocates in
-// increasing order; inside the one second in which ids wrap past 65535 the
-// order is wrong and a newer message may go first. mochi's own resend
-// order is no better than the second.
+// Trimming on every message cost a copy of the whole store per message once
+// a sleeper was full, on the fan-out goroutine, for every sleeper the
+// message reached. So the store is let run an eighth past the limit and
+// then cut back to it in one go, which is one copy per keep/8 messages; the
+// exact cut happens in OnSessionEstablish, when the device comes back,
+// so what it is resent is still exactly its limit.
 func (h *Hook) limitInflight(cl *mqtt.Client, id tenant.ID) {
 	if h.limits == nil {
 		return
 	}
 
 	keep := h.limits.OfflineQueue(id)
-	if keep <= 0 || cl.State.Inflight.Len() <= keep {
+
+	// Len counts acknowledgements as well as messages, so it is only an
+	// upper bound on what trimInflight counts; that is enough to skip it.
+	if keep <= 0 || cl.State.Inflight.Len() <= keep+keep/offlineSlack {
 		return
 	}
 
-	held := cl.State.Inflight.GetAll(false)
-	slices.SortFunc(held, func(a, b packets.Packet) int {
+	h.trimInflight(cl, id, keep)
+}
+
+// offlineSlack is the fraction, as its denominator, by which an absent
+// client's inflight store may run past its limit before it is cut back.
+const offlineSlack = 8
+
+// OnSessionEstablish cuts the session a returning device is about to
+// inherit to exactly its tenant's offline limit, which limitInflight lets
+// run a little over.
+//
+// It runs after authentication and before mochi copies the old client's
+// inflight store into the new one, so the old client is still the one in
+// the client map, and only its store has to be cut. A client that is still
+// connected is being taken over, not resumed: what it holds is in flight to
+// a live device, not queued for an absent one, and is left alone.
+func (h *Hook) OnSessionEstablish(cl *mqtt.Client, pk packets.Packet) {
+	if h.limits == nil || pk.Connect.Clean {
+		return
+	}
+
+	existing, ok := h.server.Clients.Get(cl.ID)
+	if !ok || existing == cl || !queuesForAbsence(existing) {
+		return
+	}
+
+	id, ok := h.tenantOf(cl)
+	if !ok {
+		return
+	}
+
+	if keep := h.limits.OfflineQueue(id); keep > 0 {
+		h.trimInflight(existing, id, keep)
+	}
+}
+
+// trimInflight discards the oldest PUBLISH packets in cl's inflight store
+// past keep.
+//
+// Only PUBLISH packets are queued messages. The store also holds a PUBREL
+// for a QoS 2 message the client has PUBREC'd, and a PUBREC for a QoS 2
+// message the client sent and has not released. Those are protocol state,
+// not messages: dropping the PUBREL leaves the client holding its packet id
+// as "awaiting PUBREL", and when mochi reuses that id for a new message the
+// client must take it for a duplicate and never deliver it (MQTT-4.3.3);
+// dropping the PUBREC answers the client's PUBREL with "packet identifier
+// not found" for a message that was published. They are also the oldest
+// entries, made before the disconnect, so the first an oldest-first trim
+// took. They neither count towards the limit nor are dropped, and only a
+// dropped PUBLISH gives back the send quota it took.
+//
+// Oldest is by creation second, then packet id, which mochi allocates in
+// increasing order; inside the one second in which ids wrap past 65535 the
+// order is wrong and a newer message may go first. mochi's own resend
+// order is no better than the second.
+func (h *Hook) trimInflight(cl *mqtt.Client, id tenant.ID, keep int) {
+	queued := slices.DeleteFunc(cl.State.Inflight.GetAll(false), func(pk packets.Packet) bool {
+		return pk.FixedHeader.Type != packets.Publish
+	})
+
+	excess := len(queued) - keep
+	if excess <= 0 {
+		return
+	}
+
+	slices.SortFunc(queued, func(a, b packets.Packet) int {
 		if c := cmp.Compare(a.Created, b.Created); c != 0 {
 			return c
 		}
@@ -185,7 +264,7 @@ func (h *Hook) limitInflight(cl *mqtt.Client, id tenant.ID) {
 
 	dropped := 0
 
-	for _, pk := range held[:max(0, len(held)-keep)] {
+	for _, pk := range queued[:excess] {
 		if cl.State.Inflight.Delete(pk.PacketID) {
 			atomic.AddInt64(&h.server.Info.Inflight, -1)
 			cl.State.Inflight.IncreaseSendQuota()

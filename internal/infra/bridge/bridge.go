@@ -255,6 +255,8 @@ func (h *Hook) Attach(server *mqtt.Server) {
 		go h.refreshSessions()
 	}
 
+	go h.reapLoop()
+
 	h.startDurable()
 }
 
@@ -296,6 +298,7 @@ func (h *Hook) Provides(b byte) bool {
 		mqtt.OnWill,
 		mqtt.OnPacketEncode,
 		mqtt.OnQosPublish,
+		mqtt.OnSessionEstablish,
 		mqtt.OnSessionEstablished,
 		mqtt.OnSelectSubscribers,
 	}, b)
@@ -1289,15 +1292,16 @@ func (h *Hook) onConnected(cl *mqtt.Client, identity tenant.Identity, limited bo
 }
 
 // onDisconnected records a connection going away. It is safe to call more
-// than once for the same connection; only the first call counts.
-func (h *Hook) onDisconnected(cl *mqtt.Client) {
+// than once for the same connection; only the first call counts, and it
+// reports whether this call was that one.
+func (h *Hook) onDisconnected(cl *mqtt.Client) bool {
 	h.mu.Lock()
 	conn, counted := h.open[cl]
 	delete(h.open, cl)
 	h.mu.Unlock()
 
 	if !counted {
-		return
+		return false
 	}
 
 	if conn.limited {
@@ -1307,6 +1311,74 @@ func (h *Hook) onDisconnected(cl *mqtt.Client) {
 	h.count(func(m *obs.Metrics) {
 		m.ConnectionsOpen.WithLabelValues(m.Tenant(string(conn.tenant))).Dec()
 	})
+
+	return true
+}
+
+// reapInterval is how often counted connections that mochi closed without
+// an OnDisconnect are released. A leaked slot is also reported to every
+// other node, so this bounds how long the cluster counts one, not only this
+// node.
+const reapInterval = 5 * time.Second
+
+// reapClosed releases every connection still counted as open that mochi has
+// already closed, and reports how many there were.
+//
+// mochi calls OnConnectAuthenticate, which counts a connection, and later
+// OnDisconnect, which releases it; but between the two, attachClient
+// returns without OnDisconnect when the CONNACK write fails or when
+// resending a resumed session's inflight messages fails. The second is
+// ordinary: a device with a backlog whose link drops, or which is taken
+// over, while the backlog is being resent. Each one leaked a slot for the
+// life of the process, so a tenant of flaky mobile devices at its limit was
+// slowly locked out on every node. attachClient always stops the client on
+// its way out, so a closed client still counted here is exactly such a
+// leak, or a normal disconnect a moment before its OnDisconnect, which
+// onDisconnected's once-only release makes harmless.
+//
+// The proper fix is in mochi, calling OnDisconnect on every path after
+// Clients.Add; this stays as the guarantee that a slot cannot leak for
+// good whatever path mochi grows next.
+func (h *Hook) reapClosed() int {
+	h.mu.Lock()
+
+	var closed []*mqtt.Client
+
+	for cl := range h.open {
+		if cl.Closed() {
+			closed = append(closed, cl)
+		}
+	}
+	h.mu.Unlock()
+
+	reaped := 0
+
+	for _, cl := range closed {
+		if h.onDisconnected(cl) {
+			reaped++
+		}
+	}
+
+	if reaped > 0 {
+		h.log.Debug("released connections mochi closed without a disconnect", "connections", reaped)
+	}
+
+	return reaped
+}
+
+// reapLoop runs reapClosed every reapInterval until the hook stops.
+func (h *Hook) reapLoop() {
+	ticker := time.NewTicker(reapInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-h.stop:
+			return
+		case <-ticker.C:
+			h.reapClosed()
+		}
+	}
 }
 
 // count records a metric when metrics are enabled, so every call site stays

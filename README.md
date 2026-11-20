@@ -137,6 +137,8 @@ Three limits, under `[limits]` in the config. Each one's scope is where it can b
 | `publish_rate`, `publish_burst` | per tenant, per node | QoS 0 dropped; MQTT 5 QoS 1 gets PUBACK 0x96 Message rate too high; MQTT 5 QoS 2 and 3.1.1 QoS 1/2 are disconnected |
 | `offline_queue` | per absent session | the oldest queued messages are discarded |
 
+`offline_queue` defaults to 100 and applies with no `[limits]` section at all. Before limits existed, a device that came back to the node it left was resent everything mochi held for it, up to mochi's inflight maximum of thousands, while a device that came back on another node got the stream's newest 100. Now both get the newest 100. Set `offline_queue` higher, under `[limits]` or for one tenant, to keep more.
+
 The connection count is shared by every node publishing its per-tenant counts on core NATS every `sync_interval` (2s), so connections arriving on several nodes within one interval can overshoot the limit by that many. Nothing goes through JetStream: a strict count would put a replicated write on every CONNECT, which is what a reconnect storm cannot pay. A device taking over its own client id on the same node is always admitted.
 
 `[limits.tenants.<id>]` overrides the defaults field by field. The authentication backend can override both, because it is the system that knows what each tenant has paid for: a `limits` object in the HTTP reply, or the JWT claim named by `auth.jwt.limits_claim`, with the same keys:
@@ -145,7 +147,7 @@ The connection count is shared by every node publishing its per-tenant counts on
 {"allow": true, "tenant": "acme", "limits": {"max_connections": 5000, "publish_rate": 200, "offline_queue": 50}}
 ```
 
-The latest authentication of a tenant on a node sets its limits there. An override can lower a tenant's offline queue but not raise it past the largest value in the config, which is what the core tells the stream to keep per session. `mast_limit_exceeded_total{tenant, limit}` counts what each limit refused, and `obs.max_tenant_labels` (1000) bounds how many tenants get a label of their own; the rest are counted as `~other`.
+The newest statement wins, per tenant per node. A reply or token that says nothing about limits leaves the tenant's overrides as they were; it is not a statement that the tenant has none. A JWT's `iat` orders it against the tenant's other devices' tokens, so a device still holding a token from before the tenant's plan changed cannot put the old limits back; a token without `iat` never replaces one with it. An HTTP reply is dated when it arrives. Once set, an override from authentication stays until a newer one replaces it, so lifting it takes a newer token or reply that states the configured value. Because each node keeps what it last heard, two nodes can enforce different limits for a tenant until each has seen a connection with the newest token. An override can lower a tenant's offline queue but not raise it past the largest value in the config, which is what the core tells the stream to keep per session. `mast_limit_exceeded_total{tenant, limit}` counts what each limit refused, and `obs.max_tenant_labels` (1000) bounds how many tenants get a label of their own; the rest are counted as `~other`.
 
 ## Configuration
 

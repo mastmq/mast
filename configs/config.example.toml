@@ -166,7 +166,9 @@ max_tenant_labels = 1000
 [limits]
 # Every tenant's limits. A tenant's entry under [limits.tenants] overrides
 # them field by field, and the authentication backend can override both: the
-# "limits" object in an HTTP reply, or auth.jwt.limits_claim.
+# "limits" object in an HTTP reply, or auth.jwt.limits_claim. The newest
+# statement wins (a JWT's iat, an HTTP reply's arrival), and one that names
+# no limits leaves the tenant's overrides as they were.
 #
 # Cluster-wide. Nodes exchange counts every sync_interval on core NATS, so
 # connections arriving on several nodes at once can overshoot by what they
@@ -182,7 +184,9 @@ publish_rate = 0
 publish_burst = 0
 # QoS 1/2 messages kept for one absent session, newest first. The largest
 # value configured here or under [limits.tenants] is what the offline stream
-# keeps per session; an authentication override can only lower it.
+# keeps per session; an authentication override can only lower it. It also
+# bounds what a device returning to the node it left is resent, which before
+# limits was everything mochi held, up to thousands.
 offline_queue = 100
 sync_interval = "2s"
 

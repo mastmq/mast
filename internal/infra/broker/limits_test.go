@@ -49,7 +49,7 @@ func startLimited(t *testing.T, mutate func(*config.Limits)) (string, string) {
 
 // connectV5 sends an MQTT 5 CONNECT for tenant acme and returns the CONNACK
 // whatever it says, where dialV5 fails the test on anything but success.
-func connectV5(t *testing.T, addr, clientID string) (*paho5.Client, *paho5.Connack) {
+func connectV5(t *testing.T, addr, clientID string) *paho5.Connack {
 	t.Helper()
 
 	var d net.Dialer
@@ -75,7 +75,7 @@ func connectV5(t *testing.T, addr, clientID string) (*paho5.Client, *paho5.Conna
 		t.Cleanup(func() { _ = client.Disconnect(&paho5.Disconnect{ReasonCode: 0}) })
 	}
 
-	return client, ack
+	return ack
 }
 
 // tryV3 connects an MQTT 3.1.1 client and returns the error the broker
@@ -116,7 +116,7 @@ func TestConnectionLimitRefusesWithQuotaExceeded(t *testing.T) {
 	connect(t, addr, "first", "acme")
 	connect(t, addr, "second", "acme")
 
-	if _, ack := connectV5(t, addr, "third-v5"); ack.ReasonCode != reasonQuotaExceeded {
+	if ack := connectV5(t, addr, "third-v5"); ack.ReasonCode != reasonQuotaExceeded {
 		t.Errorf("a v5 connection past the limit got CONNACK %#x, want %#x", ack.ReasonCode, reasonQuotaExceeded)
 	}
 
@@ -232,8 +232,19 @@ func TestPublishRateV3Disconnects(t *testing.T) {
 // TestOfflineQueueLimit sends a returning device only the newest messages
 // its tenant may keep. On one node that is mochi's own session being held
 // to the limit; TestClusterOfflineQueueLimit covers the stream's queue.
+//
+// Sixteen is the case where the store runs an eighth over the limit while
+// the device is away, and is cut to exactly the limit only as it returns.
 func TestOfflineQueueLimit(t *testing.T) {
-	const keep, sent = 3, 10
+	for _, tc := range []struct{ keep, sent int }{{3, 10}, {16, 20}} {
+		t.Run(strconv.Itoa(tc.keep), func(t *testing.T) {
+			offlineQueueLimit(t, tc.keep, tc.sent)
+		})
+	}
+}
+
+func offlineQueueLimit(t *testing.T, keep, sent int) {
+	t.Helper()
 
 	addr, obsAddr := startLimited(t, func(l *config.Limits) {
 		l.Tenants = map[string]config.TenantLimits{"acme": {OfflineQueue: new(keep)}}
@@ -251,14 +262,19 @@ func TestOfflineQueueLimit(t *testing.T) {
 		}
 	}
 
-	if !awaitMetric(t, obsAddr, `mast_offline_queued_total{tenant="acme"} `, sent) {
+	if !awaitMetric(t, obsAddr, `mast_offline_queued_total{tenant="acme"} `, float64(sent)) {
 		t.Fatalf("only %v of %d messages were queued",
 			readMetric(t, obsAddr, `mast_offline_queued_total{tenant="acme"} `), sent)
 	}
 
 	back := persistent(t, addr, "sleeper", "acme")
 
-	want := []string{"fleet/sleeper/cmd=7", "fleet/sleeper/cmd=8", "fleet/sleeper/cmd=9"}
+	want := make([]string, 0, keep)
+	for i := sent - keep; i < sent; i++ {
+		want = append(want, "fleet/sleeper/cmd="+strconv.Itoa(i))
+	}
+
+	slices.Sort(want)
 
 	waitFor(func() bool { return len(back.messages()) >= keep })
 
@@ -276,8 +292,9 @@ func TestOfflineQueueLimit(t *testing.T) {
 		t.Errorf("a returning device was sent %v, want the newest %d: %v", got, keep, want)
 	}
 
-	if got := readMetric(t, obsAddr, `mast_limit_exceeded_total{limit="offline_queue",tenant="acme"} `); got != sent-keep {
-		t.Errorf("mast_limit_exceeded_total for offline_queue = %v, want %d", got, sent-keep)
+	discarded := readMetric(t, obsAddr, `mast_limit_exceeded_total{limit="offline_queue",tenant="acme"} `)
+	if discarded != float64(sent-keep) {
+		t.Errorf("mast_limit_exceeded_total for offline_queue = %v, want %d", discarded, sent-keep)
 	}
 }
 
