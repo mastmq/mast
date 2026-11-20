@@ -35,7 +35,7 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 
 An [admin API](#admin-api), off by default, lists and disconnects a tenant's sessions across the cluster. End-to-end tests cover it; the fire drills have not run against it yet.
 
-Not yet: per-tenant quotas, connection rate limiting, full QoS for shared subscriptions whose members span nodes, and queueing for a connected device between its edge being killed outright and its reconnecting elsewhere.
+Not yet: per-tenant quotas, connection rate limiting, full QoS for shared subscriptions whose members span nodes, and queueing for a connected device between its edge being killed outright and its reconnecting elsewhere. Each of these has an issue, and the [roadmap](ROADMAP.md) lists them with the rest of what comes next.
 
 ## Why
 
@@ -183,6 +183,8 @@ $ just test       # go test -race with coverage
 $ just fuzz 60s   # fuzz the topic codec
 $ just lint       # golangci-lint
 ```
+
+Questions go to [Discussions](https://github.com/mastmq/mast/discussions). [CONTRIBUTING.md](https://github.com/mastmq/.github/blob/main/CONTRIBUTING.md) covers building and testing every repository in the org, commits and style; [SECURITY.md](https://github.com/mastmq/.github/blob/main/SECURITY.md) covers reporting a vulnerability privately. What is planned is in the [roadmap](ROADMAP.md).
 
 ## License
 
