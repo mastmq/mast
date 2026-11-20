@@ -42,6 +42,10 @@ type Server struct {
 	nc  *nats.Conn
 	log *slog.Logger
 
+	// edge is whether this node dials a core as a leaf, which decides what
+	// "ready" means for it.
+	edge bool
+
 	// closing tells the asynchronous handlers that a disconnect is the
 	// shutdown they were asked for rather than an incident. Without it every
 	// clean stop logs an error about losing the fabric.
@@ -128,6 +132,7 @@ func Start(cfg config.Config, log *slog.Logger) (*Server, error) {
 		ns:            ns,
 		nc:            nil,
 		log:           log,
+		edge:          cfg.Role == config.RoleEdge,
 		closing:       atomic.Bool{},
 		asyncErrors:   atomic.Uint64{},
 		slowConsumers: atomic.Uint64{},
@@ -156,6 +161,41 @@ func Start(cfg config.Config, log *slog.Logger) (*Server, error) {
 	s.nc = nc
 
 	return s, nil
+}
+
+// ErrNotServing is wrapped by [Server.Ready] when the node cannot serve yet.
+var ErrNotServing = errors.New("natsd: not ready to serve")
+
+// Ready reports whether this node's fabric can carry traffic: nil when it
+// can, an error saying why not when it cannot.
+//
+// It asks nats-server's own health check rather than reimplementing one,
+// because that check already knows what JetStream needs to be ready and
+// mast would only get it subtly wrong. What differs is the question. An
+// edge carries no JetStream and every message it accepts crosses its leaf
+// connection, so for an edge "ready" is that connection being up. A core or
+// an all-in-one node is asked the full question: accepting connections, and
+// JetStream enabled, its meta group led, and its streams current.
+func (s *Server) Ready() error {
+	if !s.nc.IsConnected() {
+		return fmt.Errorf("%w: the in-process connection is %s", ErrNotServing, s.nc.Status())
+	}
+
+	opts := &server.HealthzOptions{}
+	if s.edge {
+		opts.LeafRemotesConnected = true
+	}
+
+	health := s.ns.Healthz(opts)
+	if health.Error != "" {
+		return fmt.Errorf("%w: %s", ErrNotServing, health.Error)
+	}
+
+	if len(health.Errors) > 0 {
+		return fmt.Errorf("%w: %s", ErrNotServing, health.Errors[0].Error)
+	}
+
+	return nil
 }
 
 // WaitForLeaf blocks until this node has an upstream leaf connection, or ctx

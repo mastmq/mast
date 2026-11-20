@@ -1,5 +1,12 @@
 // Package obs serves the observability endpoints: Prometheus metrics,
-// liveness, and pprof.
+// liveness, readiness, and pprof.
+//
+// Liveness and readiness are different questions and are kept apart on
+// purpose. /healthz says the process is running and answering, which is what
+// a restart can fix. /readyz says the node can serve, which a restart cannot
+// fix: an edge whose core is down is not helped by being killed, and a
+// liveness probe that failed on it would restart every edge in the fleet the
+// moment the core tier hiccupped.
 //
 // pprof is on by default rather than behind a flag. It costs nothing until
 // something scrapes it, and the first time a broker leaks goroutines under
@@ -198,14 +205,25 @@ func registerNATSCounts(reg prometheus.Registerer, read func() NATSCounts) {
 		func(c NATSCounts) uint64 { return c.Reconnects })
 }
 
-// Serve starts the observability server. A blank address disables it.
+// Readiness reports whether the node can serve: nil when it can, an error
+// saying why not when it cannot.
+type Readiness func() error
+
+// Serve starts the observability server. A blank address disables it. A nil
+// ready reports the node always ready.
 //
 // The listener is opened before returning, and a failure to open it is an
 // error rather than a log line. Binding in the background meant a port
 // conflict left the process running and reporting ready with nothing on
 // /metrics — the same silence this package was written to end, arriving by
 // a different route.
-func Serve(ctx context.Context, addr string, reg *prometheus.Registry, log *slog.Logger) (*Server, error) {
+func Serve(
+	ctx context.Context,
+	addr string,
+	reg *prometheus.Registry,
+	ready Readiness,
+	log *slog.Logger,
+) (*Server, error) {
 	if addr == "" {
 		return nil, nil //nolint:nilnil // no address means no server, which is not a failure
 	}
@@ -221,6 +239,7 @@ func Serve(ctx context.Context, addr string, reg *prometheus.Registry, log *slog
 			log.Debug("writing healthz response", "error", err)
 		}
 	})
+	mux.HandleFunc("GET /readyz", readyz(ready, log))
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
 	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
@@ -252,9 +271,30 @@ func Serve(ctx context.Context, addr string, reg *prometheus.Registry, log *slog
 		}
 	}()
 
-	srv.log.Info("observability listening", "addr", srv.addr, "paths", "/metrics /healthz /debug/pprof")
+	srv.log.Info("observability listening", "addr", srv.addr, "paths", "/metrics /healthz /readyz /debug/pprof")
 
 	return srv, nil
+}
+
+// readyz answers 200 when the node can serve and 503 with the reason when
+// it cannot, so that a failing probe says why in the kubelet's event.
+func readyz(ready Readiness, log *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		status, body := http.StatusOK, "ok\n"
+
+		if ready != nil {
+			if err := ready(); err != nil {
+				status, body = http.StatusServiceUnavailable, err.Error()+"\n"
+			}
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(status)
+
+		if _, err := w.Write([]byte(body)); err != nil {
+			log.Debug("writing readyz response", "error", err)
+		}
+	}
 }
 
 // Close stops the server.

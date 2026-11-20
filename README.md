@@ -131,6 +131,12 @@ Defaults, then an optional TOML file, then environment variables, then explicitl
 
 Environment variables are prefixed `MAST__` and nest with a double underscore, so `MAST__MQTT__ADDR=":8883"` sets `mqtt.addr`.
 
+## Health and metrics
+
+The observability listener (`obs.addr`, `127.0.0.1:9090` by default) serves `/metrics`, `/healthz`, `/readyz` and `/debug/pprof`.
+
+`/healthz` is liveness: it answers 200 for as long as the process runs and answers. `/readyz` answers 200 only when the node can serve, and 503 with the reason when it cannot. An edge is ready when it is serving MQTT and its leaf connection to the core is up; a core or an all-in-one node is ready when its embedded nats-server and JetStream are, by nats-server's own health check. Point a readiness probe at `/readyz` and a liveness probe at `/healthz`, never the other way round: an edge whose core is away is not fixed by a restart, and a liveness probe on `/readyz` would restart every edge in the fleet whenever the core tier is.
+
 ## Development
 
 ```console

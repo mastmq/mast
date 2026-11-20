@@ -561,6 +561,10 @@ func TestMetricsEndpoint(t *testing.T) {
 		t.Errorf("/healthz returned %q", health)
 	}
 
+	if ready := scrape(t, "http://"+node.ObsAddr()+"/readyz"); !strings.Contains(ready, "ok") {
+		t.Errorf("/readyz returned %q on a node that is serving", ready)
+	}
+
 	// pprof earns its place the first time a broker leaks goroutines under
 	// load and cannot be redeployed with a debug build.
 	if idx := scrape(t, "http://"+node.ObsAddr()+"/debug/pprof/"); !strings.Contains(idx, "goroutine") {

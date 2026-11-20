@@ -595,6 +595,53 @@ func TestCoreServesObservability(t *testing.T) {
 	}
 }
 
+// TestReadyzFollowsTheCore covers /readyz on both tiers, and an edge whose
+// core goes away.
+//
+// The edge stays alive — /healthz keeps answering 200, because restarting it
+// would not bring the core back — and stops being ready, because a device
+// sent to it now could publish to nobody outside it.
+func TestReadyzFollowsTheCore(t *testing.T) {
+	c := startCluster(t)
+
+	edge := c.obs[0]
+
+	for name, addr := range map[string]string{"core": c.core.ObsAddr(), "edge": edge} {
+		if !waitForLeaf(func() bool { return status(t, addr, "/readyz") == http.StatusOK }) {
+			t.Fatalf("the %s never became ready: %d", name, status(t, addr, "/readyz"))
+		}
+	}
+
+	c.core.Close()
+
+	if !waitForLeaf(func() bool { return status(t, edge, "/readyz") == http.StatusServiceUnavailable }) {
+		t.Fatalf("an edge whose core is gone still reports ready: %d", status(t, edge, "/readyz"))
+	}
+
+	if got := status(t, edge, "/healthz"); got != http.StatusOK {
+		t.Errorf("an edge whose core is gone fails its liveness check: %d", got)
+	}
+}
+
+// status is the HTTP status of one GET on a node's observability endpoint.
+func status(t *testing.T, obsAddr, path string) int {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+obsAddr+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0
+	}
+
+	_ = resp.Body.Close()
+
+	return resp.StatusCode
+}
+
 // TestEdgeStartsBeforeItsCore covers pods starting in any order, which is
 // what Kubernetes does.
 //

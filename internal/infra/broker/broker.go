@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mastmq/mast/internal/domain/tenant"
@@ -40,6 +41,14 @@ type Broker struct {
 	store  *store.Store
 	obs    *obs.Server
 	log    *slog.Logger
+
+	// serving is set once the node does everything its role does: on an
+	// edge or an all-in-one node, once MQTT is being served over an open
+	// store. Readiness is false before it, whatever the fabric says.
+	serving atomic.Bool
+	// closeOnce makes Close safe to call twice, which a test that stops a
+	// node early and then runs its cleanup does.
+	closeOnce sync.Once
 
 	// life ends the background work a node owns past Start: the queuer, and
 	// on a core the loop that keeps trying to start it.
@@ -95,6 +104,7 @@ func Start(
 
 	b := &Broker{
 		nats: nats, hook: nil, server: nil, store: nil, obs: nil, log: log,
+		serving: atomic.Bool{}, closeOnce: sync.Once{},
 		life: life, shutdown: shutdown, wg: sync.WaitGroup{},
 		queueMu: sync.Mutex{}, queuer: nil, queueStore: nil,
 	}
@@ -107,7 +117,7 @@ func Start(
 	// Before the role check, because every role needs it. It used to come
 	// after, so a core — the node holding Raft and every bucket — served no
 	// metrics, no health and no pprof at all.
-	b.obs, err = obs.Serve(ctx, cfg.Obs.Addr, registry, log)
+	b.obs, err = obs.Serve(ctx, cfg.Obs.Addr, registry, b.Ready, log)
 	if err != nil {
 		b.abort()
 
@@ -121,6 +131,7 @@ func Start(
 	// the peers it is waiting for.
 	if cfg.Role == config.RoleCore {
 		b.wg.Go(func() { b.runCore(b.life, cfg, metrics) })
+		b.serving.Store(true)
 
 		return b, nil
 	}
@@ -131,7 +142,32 @@ func Start(
 		return nil, err
 	}
 
+	b.serving.Store(true)
+
 	return b, nil
+}
+
+// errStarting is what readiness reports while Start has not finished.
+var errStarting = errors.New("broker: still starting")
+
+// Ready reports whether this node can serve, which is what /readyz answers.
+//
+// The fabric is asked every time rather than remembered, because readiness
+// is lost as well as gained: an edge whose leaf connection drops can take
+// no message across the cluster, and a load balancer should stop sending it
+// devices until the link is back. A core is ready when nats-server says its
+// JetStream is, which in a cluster already includes a meta leader and
+// current streams; mast adds nothing of its own on top.
+func (b *Broker) Ready() error {
+	if !b.serving.Load() {
+		return errStarting
+	}
+
+	if err := b.nats.Ready(); err != nil {
+		return fmt.Errorf("broker: %w", err)
+	}
+
+	return nil
 }
 
 // openStore opens the shared buckets, waiting first for the link that makes
@@ -273,6 +309,10 @@ func (b *Broker) QueuerReady() bool {
 // Close stops the node, MQTT first so that no new message enters the bridge
 // after the fabric beneath it has gone.
 func (b *Broker) Close() {
+	b.closeOnce.Do(b.close)
+}
+
+func (b *Broker) close() {
 	b.obs.Close()
 
 	if b.server != nil {
