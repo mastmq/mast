@@ -32,4 +32,11 @@ var (
 	// nothing: with no retention, a node cut off for an instant catches up
 	// on nothing, which is the failure the stream exists to prevent.
 	ErrBadDurableMaxAge = errors.New("config: fabric.durable_max_age must be positive when fabric.durable_qos is on")
+
+	// ErrInvalidSampler guards against a typo that would otherwise fall
+	// back to sampling everything, or nothing, without a word.
+	ErrInvalidSampler = errors.New("config: invalid tracing.sampler")
+
+	// ErrBadSamplerArg is returned for a sampling ratio outside [0, 1].
+	ErrBadSamplerArg = errors.New("config: tracing.sampler_arg must be a ratio between 0 and 1")
 )

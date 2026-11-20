@@ -61,6 +61,20 @@ Two designs are possible for the NATS layer, and mast starts with the first. A s
 
 Per-tenant quotas, metering and rate limits live at the connection lifecycle in the edge process. This is the capability that has no home in `nats-server` and is the main reason mast exists as a frontend rather than as configuration.
 
+## Tracing
+
+Tracing follows a message, not a connection. `mqtt.publish` opens on the ingress node, its stores and its NATS publish are children of it, and its context rides the fabric as W3C `traceparent` and `tracestate` headers on the NATS message — on the durable stream too, which copies every header. Each node that injects the message for its subscribers opens `mqtt.deliver` under the publish, whichever path it arrived by, so a message fanned out to three edges is one publish with three deliveries in one trace.
+
+**Off has to mean free.** The hot QoS 0 path is judged in allocations, and an OpenTelemetry no-op tracer is not free: extracting a parent and wrapping it in a context allocates whether or not anything records it. So off means no tracer at all, and the bridge checks for a nil one before doing anything — one comparison on publish and one on delivery. Turning it on does not change the cost model either: spans go to a bounded batch queue and are dropped when it is full, so a slow collector cannot push back onto a publish.
+
+**The sampling decision travels.** The publish's context is written onto the NATS message even when it is not sampled. Without it, every delivering node would roll its own ratio and a trace would arrive in pieces; with it, a parent-based sampler on each node agrees with the ingress.
+
+**The MQTT 5 user property is used only when the client asked.** A client that sends `traceparent` gets its publish traced inside its own trace, and its subscribers receive `traceparent` pointing at the span that delivered to them. A message that did not carry one is not given one: adding a property to every message would change what every MQTT 5 subscriber receives, and grow every delivery, for clients that never asked to be traced. A node with tracing off passes the property through untouched, as it does every other.
+
+**Baggage is not carried.** It is arbitrary data a client could make every node copy onto every message.
+
+**OTLP over HTTP only, through the official exporter.** It costs about 4.8 MB of a 35 MB linux binary, and part of that is gRPC: the HTTP exporter's shared config package and the OTLP collector types import it even though nothing dials it. A hand-written exporter that encodes the request with `protowire` would avoid that, at the price of copying the SDK's span-to-protobuf conversion and its reading of every `OTEL_EXPORTER_OTLP_*` variable — retries, headers, TLS, compression — and keeping them current. That is the wrong code to own for a feature that is off by default. One exporter rather than two keeps one set of those variables meaning one thing; every collector accepts OTLP/HTTP on 4318.
+
 ## Known sharp edges
 
 **Cross-node QoS 1 and 2 ride a stream, one consumer per node.** The fabric between nodes is core NATS, which is at-most-once, and an ingress node used to PUBACK before the message had crossed it — so a leaf reconnect or a slow consumer silently lost QoS 1 messages both ends had acknowledged (#11). A QoS 1 or 2 publish is now written to one replicated JetStream stream before the ingress acknowledges it, and every node reads that stream through a single consumer of its own, acknowledging what it has handed to its MQTT layer and receiving again anything it did not acknowledge. That is a consumer per *node*, which stays within the rule this design rests on: never per subscription, session or device.

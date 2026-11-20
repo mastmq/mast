@@ -4,6 +4,8 @@ package config
 
 import (
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,6 +103,38 @@ type Config struct {
 	Auth    Auth    `json:"auth"    koanf:"auth"`
 	Session Session `json:"session" koanf:"session"`
 	Fabric  Fabric  `json:"fabric"  koanf:"fabric"`
+	Tracing Tracing `json:"tracing" koanf:"tracing"`
+}
+
+// Tracing configures OpenTelemetry tracing of the message path.
+//
+// Every field that has a standard OTEL_* counterpart defers to it when left
+// empty, so a deployment that already sets the OpenTelemetry environment for
+// its other services configures mast the same way. A value set here wins.
+type Tracing struct {
+	// Enabled turns tracing on. Off, the broker builds no tracer at all and
+	// the publish path pays one branch per message.
+	Enabled bool `json:"enabled" koanf:"enabled"`
+	// Endpoint is the OTLP/HTTP collector URL, such as
+	// "http://otel-collector:4318". An http scheme means plain text. Empty
+	// defers to OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, then
+	// OTEL_EXPORTER_OTLP_ENDPOINT, then http://localhost:4318.
+	Endpoint string `json:"endpoint" koanf:"endpoint"`
+	// Sampler is one of the OTEL_TRACES_SAMPLER names. Empty defers to that
+	// variable, then to parentbased_always_on.
+	Sampler string `json:"sampler" koanf:"sampler"`
+	// SamplerArg is the ratio for the traceidratio samplers, as
+	// OTEL_TRACES_SAMPLER_ARG spells it. Empty means 1.
+	SamplerArg string `json:"sampler_arg" koanf:"sampler_arg"`
+}
+
+// Samplers lists the sampler names [Tracing.Sampler] accepts: the ones
+// OTEL_TRACES_SAMPLER defines that need nothing beyond the SDK.
+func Samplers() []string {
+	return []string{
+		"always_on", "always_off", "traceidratio",
+		"parentbased_always_on", "parentbased_always_off", "parentbased_traceidratio",
+	}
 }
 
 // Fabric configures how messages cross between nodes.
@@ -348,6 +382,12 @@ func Default() Config {
 			DurableMaxAge: defaultDurableMaxAge,
 		},
 		Auth: defaultAuth(),
+		Tracing: Tracing{
+			Enabled:    false,
+			Endpoint:   "",
+			Sampler:    "",
+			SamplerArg: "",
+		},
 	}
 }
 
@@ -477,7 +517,32 @@ func (c Config) Validate() error {
 		return fmt.Errorf("%w: got %v", ErrBadDurableMaxAge, c.Fabric.DurableMaxAge)
 	}
 
+	if err := c.validateTracing(); err != nil {
+		return err
+	}
+
 	return c.validateAuth()
+}
+
+// validateTracing checks the sampler eagerly, even with tracing off, so that
+// turning it on later cannot be what reveals a typo.
+func (c Config) validateTracing() error {
+	t := c.Tracing
+
+	if t.Sampler != "" && !slices.Contains(Samplers(), t.Sampler) {
+		return fmt.Errorf("%w: %q is not one of %v", ErrInvalidSampler, t.Sampler, Samplers())
+	}
+
+	if t.SamplerArg == "" {
+		return nil
+	}
+
+	ratio, err := strconv.ParseFloat(t.SamplerArg, 64)
+	if err != nil || ratio < 0 || ratio > 1 {
+		return fmt.Errorf("%w: got %q", ErrBadSamplerArg, t.SamplerArg)
+	}
+
+	return nil
 }
 
 // validateRole checks that the role is one mast knows and that it has what

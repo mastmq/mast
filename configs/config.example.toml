@@ -155,3 +155,21 @@ durable_max_age = "5m"
 
 [obs]
 addr = "127.0.0.1:9090"  # /metrics, /healthz, /readyz and net/http/pprof
+
+[tracing]
+# OpenTelemetry traces of the message path: publish, the durable store, the
+# fabric between nodes, and delivery. Off, no tracer exists and a publish
+# pays one branch for it. Every other key here defers to its standard
+# OTEL_* variable when empty, and OTEL_SERVICE_NAME, OTEL_RESOURCE_ATTRIBUTES
+# and OTEL_EXPORTER_OTLP_HEADERS are honoured as they are anywhere else.
+enabled = false
+# The OTLP/HTTP collector, e.g. "http://otel-collector:4318"; an http scheme
+# means plain text. Empty: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, then
+# OTEL_EXPORTER_OTLP_ENDPOINT, then http://localhost:4318.
+endpoint = ""
+# An OTEL_TRACES_SAMPLER name: always_on, always_off, traceidratio,
+# parentbased_always_on, parentbased_always_off, parentbased_traceidratio.
+# Empty: OTEL_TRACES_SAMPLER, then parentbased_always_on.
+sampler = ""
+# The ratio for the traceidratio samplers, e.g. "0.01". Empty means 1.
+sampler_arg = ""
