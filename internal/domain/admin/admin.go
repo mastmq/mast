@@ -35,8 +35,9 @@ const (
 	SubjectStats = "mast.admin.stats"
 )
 
-// Page sizes. The maximum bounds both the HTTP response and each node's
-// reply, which crosses the fabric as one NATS message.
+// Page sizes. The maximum bounds the HTTP response and how many clients a
+// node puts in its reply. It does not bound the reply's bytes, which grow
+// with each client's filters; [EncodeList] does that.
 const (
 	DefaultLimit = 100
 	MaxLimit     = 1000
@@ -72,6 +73,10 @@ type Session struct {
 	// Persistent is whether the session outlives its connection.
 	Persistent    bool           `json:"persistent"`
 	Subscriptions []Subscription `json:"subscriptions"`
+	// SubscriptionsTruncated says Subscriptions is only the first of the
+	// filters the session holds, in filter order: the whole list did not
+	// fit in one NATS message between nodes. Stats still counts them all.
+	SubscriptionsTruncated bool `json:"subscriptions_truncated,omitempty"`
 	// Inflight counts QoS 1 and 2 messages the node is waiting for the
 	// client to acknowledge.
 	Inflight int `json:"inflight"`
@@ -171,12 +176,20 @@ func Window(sessions []Session, after string, limit int) []Session {
 // with the window of stored sessions into one page of at most limit, and
 // reports whether there is another.
 //
+// until is the lowest last client id among the nodes that stopped short of
+// their window to fit their reply in one message (see [ListReply]), or empty
+// when none did. Such a node holds clients after its last one that it did
+// not send, so the page may not reach past it: a page cut there, with a
+// cursor at its end, lets the next request ask that node again from the
+// right place. A page that ran on would put the cursor past clients that
+// node never sent, and no later page would list them.
+//
 // A client both connected and stored appears once: the connection says
 // where it is and what it holds right now, the record that it is
 // persistent and when it was last written. Two nodes answering for one
 // client — a takeover caught half way — keep the first answer; the other
 // node is about to drop it.
-func Merge(live, stored []Session, limit int) ([]Session, bool) {
+func Merge(live, stored []Session, limit int, until string) ([]Session, bool) {
 	byID := make(map[string]Session, len(live)+len(stored))
 
 	for _, s := range live {
@@ -199,8 +212,11 @@ func Merge(live, stored []Session, limit int) ([]Session, bool) {
 	}
 
 	out := make([]Session, 0, len(byID))
+
 	for _, s := range byID {
-		out = append(out, s)
+		if until == "" || s.ClientID <= until {
+			out = append(out, s)
+		}
 	}
 
 	slices.SortFunc(out, byClientID)
@@ -209,7 +225,7 @@ func Merge(live, stored []Session, limit int) ([]Session, bool) {
 		return out[:limit], true
 	}
 
-	return out, false
+	return out, until != ""
 }
 
 func byClientID(a, b Session) int { return cmp.Compare(a.ClientID, b.ClientID) }

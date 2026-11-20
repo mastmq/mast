@@ -3,6 +3,7 @@ package bridge
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 
@@ -39,6 +40,10 @@ func (h *Hook) listenForAdmin() {
 }
 
 // onAdminRequest answers one admin control-plane request.
+//
+// An answer that cannot be sent is replaced by a [admin.Failure], so the
+// asking node reports an error instead of counting this node as absent and
+// silently leaving its clients out.
 func (h *Hook) onAdminRequest(msg *nats.Msg) {
 	if h.server == nil || msg.Reply == "" {
 		return
@@ -51,67 +56,102 @@ func (h *Hook) onAdminRequest(msg *nats.Msg) {
 		return
 	}
 
-	reply, ok := h.answer(msg.Subject, req)
-	if !ok {
+	data, ok, err := h.answer(msg.Subject, req)
+	if err == nil && !ok {
 		return
 	}
 
-	data, err := json.Marshal(reply)
+	if err == nil {
+		err = msg.Respond(data)
+	}
+
 	if err != nil {
-		h.log.Error("encoding admin reply", "subject", msg.Subject, "error", err)
-
-		return
-	}
-
-	if err := msg.Respond(data); err != nil {
-		h.log.Warn("answering admin request", "subject", msg.Subject, "error", err)
+		h.reportFailure(msg, err)
 	}
 }
 
-// answer is this node's reply to one request, and false when this node has
-// nothing to say: a get or a disconnect for a client it does not hold.
-func (h *Hook) answer(subject string, req admin.Request) (any, bool) {
+// reportFailure answers with a [admin.Failure] in place of an answer that
+// could not be built or sent.
+func (h *Hook) reportFailure(msg *nats.Msg, cause error) {
+	h.log.Warn("answering admin request", "subject", msg.Subject, "error", cause)
+
+	failure, err := json.Marshal(admin.Failure{Node: h.nodeID, Error: cause.Error()})
+	if err != nil {
+		return
+	}
+
+	if err := msg.Respond(failure); err != nil {
+		h.log.Warn("reporting a failed admin answer", "subject", msg.Subject, "error", err)
+	}
+}
+
+// answer is this node's encoded reply to one request, and false when this
+// node has nothing to say: a get or a disconnect for a client it does not
+// hold.
+func (h *Hook) answer(subject string, req admin.Request) ([]byte, bool, error) {
 	id := tenant.ID(req.Tenant)
 
 	switch subject {
 	case admin.SubjectList:
-		return admin.Window(h.connectedIn(id), req.After, admin.ClampLimit(req.Limit)), true
+		data, err := admin.EncodeList(h.nodeID, h.windowIn(id, req.After, admin.ClampLimit(req.Limit)), h.replyBudget())
+
+		return data, true, err
 	case admin.SubjectStats:
-		return h.statsFor(id), true
+		return encode(h.statsFor(id))
 	case admin.SubjectGet:
 		cl, ok := h.connected(id, req.ClientID)
 		if !ok {
-			return nil, false
+			return nil, false, nil
 		}
 
-		return h.describe(id, cl), true
+		data, err := admin.EncodeSession(h.describe(id, cl), h.replyBudget())
+
+		return data, true, err
 	case admin.SubjectDisconnect:
 		if !h.disconnect(id, req.ClientID) {
-			return nil, false
+			return nil, false, nil
 		}
 
 		//nolint:exhaustruct_v5 // names the node, nothing else
-		return admin.Session{ClientID: req.ClientID, Node: h.nodeID}, true
+		return encode(admin.Session{ClientID: req.ClientID, Node: h.nodeID})
 	default:
-		return nil, false
+		return nil, false, nil
 	}
+}
+
+// encode is a fixed-size answer, which always fits a NATS message.
+func encode(reply any) ([]byte, bool, error) {
+	data, err := json.Marshal(reply)
+	if err != nil {
+		return nil, true, fmt.Errorf("encoding admin reply: %w", err)
+	}
+
+	return data, true, nil
+}
+
+// replyBudget is the largest reply the fabric carries: the server's
+// max_payload, as the connection learned it. A reply goes out with no
+// headers, so the payload is all of it.
+func (h *Hook) replyBudget() int {
+	return int(h.nc.MaxPayload())
 }
 
 // openIn returns the connections this node holds for a tenant.
 //
-// It reads the gauge's map, which holds exactly the connections that are
-// open: mochi keeps a persistent client in its own map while it is away,
-// and that one is not connected anywhere.
+// It reads the per-tenant index of the gauge's map, which holds exactly the
+// connections that are open: mochi keeps a persistent client in its own
+// map while it is away, and that one is not connected anywhere. Only
+// pointers are copied under the lock, which the CONNECT and DISCONNECT
+// path also takes, and only the tenant's own.
 func (h *Hook) openIn(id tenant.ID) []*mqtt.Client {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	var out []*mqtt.Client
+	conns := h.openByTenant[id]
 
-	for cl, owner := range h.open {
-		if owner == id {
-			out = append(out, cl)
-		}
+	out := make([]*mqtt.Client, 0, len(conns))
+	for cl := range conns {
+		out = append(out, cl)
 	}
 
 	return out
@@ -131,13 +171,38 @@ func (h *Hook) connected(id tenant.ID, clientID string) (*mqtt.Client, bool) {
 	return cl, open && owner == id
 }
 
-// connectedIn describes every client this node holds for a tenant.
-func (h *Hook) connectedIn(id tenant.ID) []admin.Session {
+// windowIn describes this node's clients in a tenant after the cursor, in
+// client id order, at most limit+1 of them: what [admin.Window] would keep.
+//
+// It picks the window by client id first and describes only what is in it.
+// Describing every client and windowing afterwards — sorting and copying
+// each one's filters only to throw most of them away — made one page cost
+// as much as the tenant's size, and reading every page cost its square.
+func (h *Hook) windowIn(id tenant.ID, after string, limit int) []admin.Session {
+	type named struct {
+		id string
+		cl *mqtt.Client
+	}
+
 	conns := h.openIn(id)
 
-	out := make([]admin.Session, 0, len(conns))
+	picked := make([]named, 0, len(conns))
+
 	for _, cl := range conns {
-		out = append(out, h.describe(id, cl))
+		if bare := unmountClient(id, cl.ID); bare > after {
+			picked = append(picked, named{id: bare, cl: cl})
+		}
+	}
+
+	slices.SortFunc(picked, func(a, b named) int { return strings.Compare(a.id, b.id) })
+
+	if len(picked) > limit+1 {
+		picked = picked[:limit+1]
+	}
+
+	out := make([]admin.Session, 0, len(picked))
+	for _, p := range picked {
+		out = append(out, h.describe(id, p.cl))
 	}
 
 	return out
@@ -159,16 +224,17 @@ func (h *Hook) describe(id tenant.ID, cl *mqtt.Client) admin.Session {
 	slices.SortFunc(filters, func(a, b admin.Subscription) int { return strings.Compare(a.Filter, b.Filter) })
 
 	return admin.Session{
-		ClientID:        unmountClient(id, cl.ID),
-		Connected:       true,
-		Node:            h.nodeID,
-		Remote:          cl.Net.Remote,
-		ProtocolVersion: cl.Properties.ProtocolVersion,
-		Persistent:      outlivesConnection(cl),
-		Subscriptions:   filters,
-		Inflight:        cl.State.Inflight.Len(),
-		Queued:          0,
-		UpdatedAt:       nil,
+		ClientID:               unmountClient(id, cl.ID),
+		Connected:              true,
+		Node:                   h.nodeID,
+		Remote:                 cl.Net.Remote,
+		ProtocolVersion:        cl.Properties.ProtocolVersion,
+		Persistent:             outlivesConnection(cl),
+		Subscriptions:          filters,
+		SubscriptionsTruncated: false,
+		Inflight:               cl.State.Inflight.Len(),
+		Queued:                 0,
+		UpdatedAt:              nil,
 	}
 }
 

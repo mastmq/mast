@@ -116,6 +116,9 @@ type Hook struct {
 	// twice — once by a takeover, once by mochi — is released once, and a
 	// new connection with the same id is never mistaken for the old one.
 	open map[*mqtt.Client]tenant.ID
+	// openByTenant indexes open by tenant, so the admin API's list reads a
+	// tenant's connections without walking every tenant's under the lock.
+	openByTenant map[tenant.ID]map[*mqtt.Client]struct{}
 	// persistedAt is when each client's session was last written, so the
 	// refresher rewrites only what is about to age out of the bucket.
 	persistedAt map[string]time.Time
@@ -211,6 +214,7 @@ func New(
 		ids:              newIDs(),
 		tenants:          sync.Map{},
 		open:             make(map[*mqtt.Client]tenant.ID),
+		openByTenant:     make(map[tenant.ID]map[*mqtt.Client]struct{}),
 		persistedAt:      make(map[string]time.Time),
 		sessionExpiry:    opts.SessionExpiry,
 		stop:             make(chan struct{}),
@@ -1258,6 +1262,14 @@ func (h *Hook) onConnected(cl *mqtt.Client, identity tenant.Identity) {
 
 	h.mu.Lock()
 	h.open[cl] = identity.Tenant
+
+	conns, ok := h.openByTenant[identity.Tenant]
+	if !ok {
+		conns = make(map[*mqtt.Client]struct{})
+		h.openByTenant[identity.Tenant] = conns
+	}
+
+	conns[cl] = struct{}{}
 	h.mu.Unlock()
 
 	h.count(func(m *obs.Metrics) {
@@ -1272,6 +1284,15 @@ func (h *Hook) onDisconnected(cl *mqtt.Client) {
 	h.mu.Lock()
 	id, counted := h.open[cl]
 	delete(h.open, cl)
+
+	if conns := h.openByTenant[id]; counted && conns != nil {
+		delete(conns, cl)
+
+		// A tenant whose last device left takes no room.
+		if len(conns) == 0 {
+			delete(h.openByTenant, id)
+		}
+	}
 	h.mu.Unlock()
 
 	if !counted {

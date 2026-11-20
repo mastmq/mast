@@ -84,7 +84,7 @@ func TestMergeAcrossNodesPagesWithoutLoss(t *testing.T) {
 			live = append(live, admin.Window(n, after, limit)...)
 		}
 
-		page, more := admin.Merge(live, admin.Window(stored, after, limit), limit)
+		page, more := admin.Merge(live, admin.Window(stored, after, limit), limit, "")
 		if len(page) > limit {
 			t.Fatalf("page of %d, limit %d", len(page), limit)
 		}
@@ -109,7 +109,7 @@ func TestMergePrefersTheConnectionAndKeepsTheRecord(t *testing.T) {
 	live := []admin.Session{{ClientID: "rover", Connected: true, Node: "edge-a"}}
 	stored := []admin.Session{{ClientID: "rover", Persistent: true}, {ClientID: "sleeper", Persistent: true}}
 
-	page, more := admin.Merge(live, stored, 10)
+	page, more := admin.Merge(live, stored, 10, "")
 	if more {
 		t.Fatal("two sessions reported as more than a page of ten")
 	}
@@ -131,11 +131,11 @@ func TestMergePrefersTheConnectionAndKeepsTheRecord(t *testing.T) {
 func TestMergeReportsAFullPage(t *testing.T) {
 	t.Parallel()
 
-	if _, more := admin.Merge(named("a", "b"), nil, 2); more {
+	if _, more := admin.Merge(named("a", "b"), nil, 2, ""); more {
 		t.Fatal("exactly a page reported as more")
 	}
 
-	if _, more := admin.Merge(named("a", "b", "c"), nil, 2); !more {
+	if _, more := admin.Merge(named("a", "b", "c"), nil, 2, ""); !more {
 		t.Fatal("a page and one over reported as the last page")
 	}
 }

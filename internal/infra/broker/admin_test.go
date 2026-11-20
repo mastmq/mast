@@ -2,6 +2,7 @@ package broker_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -400,5 +402,66 @@ func TestClusterAdminReachesEveryNode(t *testing.T) {
 
 	if !waitForLeaf(func() bool { return !rover.client.IsConnected() }) {
 		t.Fatal("a disconnect asked of one edge did not reach the client on the other")
+	}
+}
+
+// TestAdminAPIAnswersForAClientTooBigForOneMessage holds one client whose
+// filters alone are more than NATS carries in one message (max_payload,
+// 1 MB by default), and a light client after it.
+//
+// The node's answer used to be refused by NATS: the get reported the
+// connected client as unknown, and the list dropped the node, its clients
+// and, through the cursor, every page's worth of them. Now the heavy client
+// comes back with the first of its filters and says so, the list stops
+// after it, and the next page reaches the light one.
+func TestAdminAPIAnswersForAClientTooBigForOneMessage(t *testing.T) {
+	const (
+		filters = 5000
+		batch   = 500
+	)
+
+	mqttAddr, adminAddr := startAdmin(t)
+
+	heavy := connect(t, mqttAddr, "heavy", "acme")
+	connect(t, mqttAddr, "light", "acme")
+
+	// About 220 bytes of JSON per filter, so 5000 of them pass 1 MB.
+	pad := strings.Repeat("x", 180)
+
+	for start := 0; start < filters; start += batch {
+		set := make(map[string]byte, batch)
+		for i := start; i < start+batch; i++ {
+			set[fmt.Sprintf("devices/heavy/%s/%05d/#", pad, i)] = 0
+		}
+
+		tok := heavy.client.SubscribeMultiple(set, nil)
+		if !tok.WaitTimeout(30*time.Second) || tok.Error() != nil {
+			t.Fatalf("subscribing filters %d to %d: %v", start, start+batch, tok.Error())
+		}
+	}
+
+	status, s := getSession(t, adminAddr, "acme", "heavy")
+	if status != http.StatusOK || !s.Connected {
+		t.Fatalf("get heavy: status %d, %+v; want it connected", status, s.ClientID)
+	}
+
+	if !s.SubscriptionsTruncated || len(s.Subscriptions) == 0 || len(s.Subscriptions) >= filters {
+		t.Errorf("heavy came back with %d of %d filters, truncated %v; want some, marked",
+			len(s.Subscriptions), filters, s.SubscriptionsTruncated)
+	}
+
+	first := list(t, adminAddr, "acme", "?limit=1000")
+	if !slices.Equal(clientIDs(first), []string{"heavy"}) || first.Next == "" || first.Nodes != 1 {
+		t.Fatalf("first page = %v next %q nodes %d; want heavy alone, a cursor, and the node",
+			clientIDs(first), first.Next, first.Nodes)
+	}
+
+	second := list(t, adminAddr, "acme", "?limit=1000&cursor="+url.QueryEscape(first.Next))
+	if !slices.Equal(clientIDs(second), []string{"light"}) || second.Next != "" {
+		t.Fatalf("second page = %v next %q; want light and the end", clientIDs(second), second.Next)
+	}
+
+	if st := stats(t, adminAddr, "acme"); st.Subscriptions != filters {
+		t.Errorf("stats count %d filters, want every one of %d", st.Subscriptions, filters)
 	}
 }

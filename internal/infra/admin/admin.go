@@ -43,7 +43,9 @@ import (
 const minTokenLen = 16
 
 // requestTimeout bounds one request's work on the store and the fabric,
-// beyond the gather window.
+// beyond the gather window. Each request's deadline is the gather window
+// plus this, so a long window cannot eat the time the store reads after it
+// need; with a fixed deadline, a window of ten seconds failed every list.
 const requestTimeout = 10 * time.Second
 
 // readHeaderTimeout bounds a client that opens a connection and stalls.
@@ -58,6 +60,8 @@ var (
 	ErrShortToken    = errors.New("admin: the token is shorter than 16 bytes")
 	errStoreNotReady = errors.New("the store is not ready on this node yet")
 	errBadLimit      = errors.New("limit must be a positive integer")
+	errNodeFailed    = errors.New("admin: a node could not answer")
+	errUndecodable   = errors.New("admin: undecodable reply from a node")
 )
 
 // Server is a running admin API.
@@ -235,10 +239,10 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.gather+requestTimeout)
 	defer cancel()
 
-	live, nodes, err := s.connectedIn(ctx, tenantName, after, limit)
+	live, nodes, until, err := s.connectedIn(ctx, tenantName, after, limit)
 	if err != nil {
 		s.writeError(w, http.StatusBadGateway, err.Error())
 
@@ -259,7 +263,7 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	page, more := admin.Merge(live, admin.Window(stored, after, limit), limit)
+	page, more := admin.Merge(live, admin.Window(stored, after, limit), limit, until)
 
 	if err := s.fillStored(ctx, st, tenantName, page); err != nil {
 		s.writeError(w, http.StatusBadGateway, err.Error())
@@ -276,27 +280,42 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 // connectedIn gathers every node's window of its connected clients in a
-// tenant, and how many nodes answered.
-func (s *Server) connectedIn(ctx context.Context, tenantName, after string, limit int) ([]admin.Session, int, error) {
+// tenant, how many nodes answered, and the client id the page may not run
+// past, which is empty unless a node stopped short of its window (see
+// [admin.Merge]).
+func (s *Server) connectedIn(
+	ctx context.Context, tenantName, after string, limit int,
+) ([]admin.Session, int, string, error) {
 	replies, err := s.ask(ctx, admin.SubjectList, listRequest(tenantName, after, limit), false)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 
-	var live []admin.Session
+	var (
+		live  []admin.Session
+		until string
+	)
 
-	for _, reply := range replies {
-		var window []admin.Session
-		if err := json.Unmarshal(reply, &window); err != nil {
-			s.log.Warn("undecodable list reply", "error", err)
-
-			continue
+	for _, data := range replies {
+		var reply admin.ListReply
+		if err := json.Unmarshal(data, &reply); err != nil {
+			// A node that answered and was not understood would otherwise
+			// be counted with its clients missing from the page and
+			// skipped by the cursor: the silent loss the count exists to
+			// prevent.
+			return nil, 0, "", fmt.Errorf("%w: %w", errUndecodable, err)
 		}
 
-		live = append(live, window...)
+		live = append(live, reply.Sessions...)
+
+		if reply.Truncated && len(reply.Sessions) > 0 {
+			if last := reply.Sessions[len(reply.Sessions)-1].ClientID; until == "" || last < until {
+				until = last
+			}
+		}
 	}
 
-	return live, len(replies), nil
+	return live, len(replies), until, nil
 }
 
 // fillStored completes a page from the store: when each stored record was
@@ -367,7 +386,7 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.gather+requestTimeout)
 	defer cancel()
 
 	replies, err := s.ask(ctx, admin.SubjectGet, clientRequest(tenantName, clientID), true)
@@ -419,7 +438,7 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 func (s *Server) disconnect(w http.ResponseWriter, r *http.Request) {
 	tenantName, clientID := r.PathValue("tenant"), r.PathValue("client")
 
-	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.gather+requestTimeout)
 	defer cancel()
 
 	replies, err := s.ask(ctx, admin.SubjectDisconnect, clientRequest(tenantName, clientID), true)
@@ -459,7 +478,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.gather+requestTimeout)
 	defer cancel()
 
 	replies, err := s.ask(ctx, admin.SubjectStats, listRequest(tenantName, "", 0), false)
@@ -474,9 +493,9 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	for _, reply := range replies {
 		var n admin.NodeStats
 		if err := json.Unmarshal(reply, &n); err != nil {
-			s.log.Warn("undecodable stats reply", "error", err)
+			s.writeError(w, http.StatusBadGateway, fmt.Errorf("%w: %w", errUndecodable, err).Error())
 
-			continue
+			return
 		}
 
 		nodes = append(nodes, n)
@@ -547,6 +566,10 @@ func (s *Server) ask(ctx context.Context, subject string, req admin.Request, fir
 			}
 
 			return replies, nil
+		}
+
+		if failure, failed := admin.FailureOf(msg.Data); failed {
+			return nil, fmt.Errorf("%w: node %s: %s", errNodeFailed, failure.Node, failure.Error)
 		}
 
 		replies = append(replies, msg.Data)
