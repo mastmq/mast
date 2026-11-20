@@ -40,7 +40,7 @@ Not yet: per-tenant quotas, connection rate limiting, full QoS for shared subscr
 
 Every open-source MQTT broker that does real multi-tenancy makes you give something up. EMQX adopted the Business Source License in 5.9, and forming a cluster from multiple nodes now requires a paid license key. BifroMQ has genuine native multi-tenancy but runs on the JVM. VerneMQ's source is Apache 2.0 while its official packages and Docker images are governed by a EULA that charges for commercial use. RabbitMQ gives you vhosts but supports neither QoS 2 nor shared subscriptions. Mosquitto, NanoMQ, FlashMQ and mochi-mqtt do not cluster at all.
 
-mast is the combination that does not currently exist off the shelf: MQTT 5 with shared subscriptions, tenant isolation with per-tenant limits, free clustering, no JVM, and a single binary you can also run standalone at a customer site.
+mast is the combination that does not currently exist off the shelf: MQTT 5 with shared subscriptions, tenant isolation, free clustering, no JVM, and a single binary you can also run standalone at a customer site. Per-tenant limits are the piece still missing: tenants cannot see each other's traffic, but one tenant can still use more than its share of a node (see [what works](#what-works)).
 
 ## Design
 

@@ -51,10 +51,12 @@ core_urls = []        # required in the edge role
 credentials = ""
 
 [tenant]
-# Every connection resolves to this tenant while mast ships only the static
-# resolver. A real deployment replaces the resolver with one backed by its own
-# identity system, exactly as BifroMQ's auth provider does: mast does not own
-# tenant lifecycle.
+# The tenant a connection joins when its authentication names none. In static
+# mode that is every connection. auth.http (mast wire) takes the tenant from
+# the service's reply and auth.jwt from a token claim, so there this applies
+# only where they cannot name one: the emqx wire, which has no tenant field,
+# and a token without the claim. Connections on the internal listener join it
+# too. mast does not own tenant lifecycle; your identity system does.
 default = "default"
 
 [auth]
@@ -152,4 +154,4 @@ durable_qos = true
 durable_max_age = "5m"
 
 [obs]
-addr = "127.0.0.1:9090"  # /metrics and net/http/pprof
+addr = "127.0.0.1:9090"  # /metrics, /healthz, /readyz and net/http/pprof
