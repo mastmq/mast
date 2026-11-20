@@ -141,6 +141,10 @@ type Hook struct {
 	noticeSub *nats.Subscription
 	nodeID    string
 
+	// adminSub is the one subscription through which the admin API, on
+	// any node, asks this one about the clients it holds.
+	adminSub *nats.Subscription
+
 	// owners is each live connection's own claim token, keyed by the
 	// connection, for the session records it writes.
 	owners sync.Map
@@ -217,6 +221,7 @@ func New(
 		sessions:         newSessions(),
 		owners:           sync.Map{},
 		noticeSub:        nil,
+		adminSub:         nil,
 		nodeID:           opts.NodeID,
 	}
 	h.subs = newRegistry(nc, h.onNATSMessage)
@@ -232,6 +237,7 @@ func (h *Hook) Attach(server *mqtt.Server) {
 	h.injector = server.NewClient(nil, mqtt.LocalListener, mqtt.InlineClientId, true)
 
 	h.listenForNotices()
+	h.listenForAdmin()
 
 	if h.store != nil && h.sessionExpiry > 0 {
 		go h.refreshSessions()
@@ -252,6 +258,10 @@ func (h *Hook) Stop() error {
 		if h.noticeSub != nil {
 			// The connection is closing with the server regardless.
 			_ = h.noticeSub.Unsubscribe()
+		}
+
+		if h.adminSub != nil {
+			_ = h.adminSub.Unsubscribe()
 		}
 	})
 

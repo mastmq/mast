@@ -34,6 +34,8 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 - **Portable sessions** — subscriptions live in a shared bucket and the offline queue on a shared stream, filled by the core tier, so a device that reconnects to a different node finds its session and whatever QoS 1 or 2 traffic it missed, even when the edge it last used has since been restarted. Verified by a cluster test and by killing cores and edges under load in a three-core, three-edge cluster
 - **Cross-node takeover** — a second connection with an existing client id disconnects the first wherever in the cluster it is, which MQTT requires and a single node cannot do alone. Client ids are scoped to their tenant, so one tenant cannot displace another's device by reusing an id
 
+- **Admin API** — off by default; list a tenant's sessions, read one, disconnect a client and read a tenant's counts, for the whole cluster from any node. See [Admin API](#admin-api)
+
 Not yet: per-tenant quotas, connection rate limiting, full QoS for shared subscriptions whose members span nodes, and queueing for a connected device between its edge being killed outright and its reconnecting elsewhere.
 
 ## Why
@@ -124,6 +126,24 @@ The tenant comes from `auth.jwt.tenant_claim`, and `auth.jwt.superuser_claim` by
 ### Both
 
 Two things worth knowing before you point this at production. Authorization is asked **on every publish**, so it is cached with a TTL — set `cache_ttl = "0s"` if decisions must take effect instantly, and accept a network round trip per message. And authentication **always fails closed** whatever `on_error` says, because admitting a connection whose tenant is unknown would mean inventing an isolation boundary; `on_error` governs authorization only.
+
+## Admin API
+
+An HTTP API for operators, off until `admin.addr` is set. It has its own listener, apart from the metrics one, because it can disconnect devices. Every request carries `Authorization: Bearer <token>`, where the token is read once at startup from `admin.token_file`; there is no setting for the token itself, so it cannot end up in a config file or an environment listing. The comparison is constant-time.
+
+| Request | Answers |
+| --- | --- |
+| `GET /v1/tenants/{tenant}/sessions?limit=&cursor=` | a page of the tenant's sessions, connected or stored, in client id order; `next` is the cursor for the following page |
+| `GET /v1/tenants/{tenant}/sessions/{client}` | one session: where it is connected, its subscriptions, what is in flight and what is queued |
+| `POST /v1/tenants/{tenant}/sessions/{client}/disconnect` | disconnects the client with MQTT 5's *administrative action* reason, on whichever node holds it; a persistent session is kept, as if the device had gone by itself |
+| `GET /v1/tenants/{tenant}/stats` | connections, subscriptions, stored sessions and queued messages |
+
+Any node answers for the cluster, a core included. Connected clients are known only to the node holding them, so the API asks every node over the control plane and waits `admin.gather` for answers; a list or stats request always waits that long, and says in `nodes` how many answered. A get or a disconnect returns as soon as the holding node replies. A client id containing `/` is sent escaped, as `%2F`.
+
+```console
+$ curl -H "Authorization: Bearer $(cat /run/secrets/mast-admin)" localhost:9091/v1/tenants/acme/stats
+{"tenant":"acme","connections":2,"subscriptions":3,"stored_sessions":2,"queued_messages":1,"nodes":2}
+```
 
 ## Configuration
 

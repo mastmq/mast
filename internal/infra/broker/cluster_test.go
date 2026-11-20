@@ -46,7 +46,10 @@ type cluster struct {
 // isolation holding across the fabric, session ownership — is invisible to a
 // single node, so before this existed those were verified by hand against
 // three processes and then not verified again.
-func startCluster(t *testing.T) *cluster {
+//
+// Each option adjusts every node's configuration, core and edges alike,
+// before it starts.
+func startCluster(t *testing.T, options ...func(*config.Config)) *cluster {
 	t.Helper()
 
 	log := slog.New(slog.DiscardHandler)
@@ -64,6 +67,10 @@ func startCluster(t *testing.T) *cluster {
 	coreCfg.Core.StoreDir = t.TempDir()
 	coreCfg.Core.LeafAddr = leafAddr
 	coreCfg.MQTT.Addr = "" // a core terminates no MQTT
+
+	for _, option := range options {
+		option(&coreCfg)
+	}
 
 	core, err := broker.Start(t.Context(), coreCfg, byUsername{}, tenant.AllowAll{}, log)
 	if err != nil {
@@ -99,6 +106,10 @@ func startCluster(t *testing.T) *cluster {
 		cfg.Obs.Addr = anyPort
 		cfg.MQTT.Addr = freeAddr(t)
 		cfg.Edge.CoreURLs = []string{"nats-leaf://" + leafAddr}
+
+		for _, option := range options {
+			option(&cfg)
+		}
 
 		edge, err := broker.Start(t.Context(), cfg, byUsername{}, tenant.AllowAll{}, log)
 		if err != nil {
