@@ -551,6 +551,7 @@ func limitOptions(cfg config.Config, nodeID string) limits.Options {
 			PublishRate:    t.PublishRate,
 			PublishBurst:   t.PublishBurst,
 			OfflineQueue:   t.OfflineQueue,
+			IssuedAt:       time.Time{}, // configured, not stated by authentication
 		}
 	}
 

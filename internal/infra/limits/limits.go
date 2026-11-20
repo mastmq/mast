@@ -104,8 +104,11 @@ type usage struct {
 	// the lock so an unlimited tenant's publish costs one atomic load.
 	limited atomic.Bool
 
-	mu       sync.Mutex
-	limits   tenant.Limits
+	mu     sync.Mutex
+	limits tenant.Limits
+	// auth is the newest overrides authentication stated for the tenant on
+	// this node, which stay until newer ones replace them.
+	auth     tenant.Overrides
 	conns    int
 	reported int
 	bucket   quota.Bucket
@@ -176,9 +179,10 @@ func (l *Limiter) Stop() {
 
 // Admit counts a new connection for id, unless that would take the tenant
 // past its connection limit. auth is what the connection's authentication
-// said about the tenant's limits; it becomes the tenant's limits on this
-// node, because the latest word from the service that owns tenants is the
-// best one there is.
+// said about the tenant's limits. It becomes the tenant's limits on this
+// node when it supersedes what is in force (see [tenant.Overrides.Supersedes]):
+// the newest word from the service that owns tenants is the best one there
+// is, and one that says nothing, or was issued before it, changes nothing.
 //
 // replacing is true when the connection takes over a client id this node
 // already holds. Such a connection is always admitted: the old one is about
@@ -196,7 +200,11 @@ func (l *Limiter) Admit(id tenant.ID, auth tenant.Overrides, replacing bool) (te
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
-	u.apply(l.configured(id).With(auth), now)
+	if auth.Supersedes(u.auth) {
+		u.auth = auth
+	}
+
+	u.apply(l.configured(id).With(u.auth), now)
 
 	if u.limits.MaxConnections > 0 && !replacing && u.conns+remote >= u.limits.MaxConnections {
 		return u.limits, fmt.Errorf("%w: %d of %d", ErrTooManyConnections, u.conns+remote, u.limits.MaxConnections)
@@ -298,6 +306,7 @@ func (l *Limiter) usage(id tenant.ID, now time.Time) *usage {
 		limited:  atomic.Bool{},
 		mu:       sync.Mutex{},
 		limits:   limits,
+		auth:     tenant.Overrides{}, //nolint:exhaustruct_v5 // none stated yet
 		conns:    0,
 		reported: 0,
 		bucket:   quota.NewBucket(limits.PublishRate, limits.Burst(), now),

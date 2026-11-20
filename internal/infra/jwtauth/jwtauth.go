@@ -222,6 +222,14 @@ func (v *Verifier) limitsFrom(claims jwt.MapClaims) tenant.Overrides {
 		return none
 	}
 
+	// The token's iat orders it against the tenant's other devices' tokens,
+	// so one issued before the tenant's plan changed cannot restore the old
+	// limits. A token without one is undated, which the limiter treats as
+	// older than any dated one.
+	if iat, err := claims.GetIssuedAt(); err == nil && iat != nil {
+		limits.IssuedAt = iat.Time
+	}
+
 	return limits
 }
 

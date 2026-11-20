@@ -3,6 +3,7 @@ package tenant
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ErrBadLimit is returned for a limit that cannot mean anything: a negative
@@ -43,6 +44,30 @@ type Overrides struct {
 	PublishRate    *float64 `json:"publish_rate,omitempty"`
 	PublishBurst   *int     `json:"publish_burst,omitempty"`
 	OfflineQueue   *int     `json:"offline_queue,omitempty"`
+
+	// IssuedAt is when the authentication backend stated these overrides:
+	// a JWT's iat, or the time an HTTP reply arrived. It is not part of the
+	// wire format, and configured overrides leave it zero.
+	//
+	// It is there because one tenant's devices do not authenticate with one
+	// statement. Each JWT carries its own claim, and a device still holding
+	// a token from before the tenant's plan changed would otherwise put the
+	// old limit back on every node it connected to. Overrides older than
+	// the ones in force are ignored; see [Overrides.Supersedes].
+	IssuedAt time.Time `json:"-"`
+}
+
+// Supersedes reports whether o should replace current as a tenant's
+// overrides from authentication.
+//
+// An empty o never does: a token or reply that says nothing about limits
+// says nothing, and is not a statement that the tenant has none, so the
+// limits in force stay. Otherwise o replaces current unless it was issued
+// before it. An o with no issue time is as old as possible against one that
+// has one, so a token without an iat cannot undo a dated one; against
+// another without, the later authentication wins.
+func (o Overrides) Supersedes(current Overrides) bool {
+	return !o.Empty() && !o.IssuedAt.Before(current.IssuedAt)
 }
 
 // Validate reports a field o sets to something negative.

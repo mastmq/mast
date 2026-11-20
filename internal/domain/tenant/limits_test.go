@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/mastmq/mast/internal/domain/tenant"
 )
@@ -75,6 +76,36 @@ func TestBurstDefaultsToOneSecond(t *testing.T) {
 	for _, tc := range cases {
 		if got := tc.limits.Burst(); got != tc.want {
 			t.Errorf("Burst(%+v) = %v, want %v", tc.limits, got, tc.want)
+		}
+	}
+}
+
+func TestSupersedes(t *testing.T) {
+	t.Parallel()
+
+	early, late := time.Unix(1_700_000_000, 0), time.Unix(1_700_000_600, 0)
+	queue := func(at time.Time) tenant.Overrides {
+		return tenant.Overrides{OfflineQueue: new(5), IssuedAt: at}
+	}
+
+	cases := []struct {
+		name          string
+		next, current tenant.Overrides
+		want          bool
+	}{
+		{"the first statement", queue(early), tenant.Overrides{}, true},
+		{"a newer one", queue(late), queue(early), true},
+		// A device still holding a token from before the plan changed.
+		{"an older one", queue(early), queue(late), false},
+		// Saying nothing is not saying "unlimited".
+		{"an empty one", tenant.Overrides{IssuedAt: late}, queue(early), false},
+		{"an undated one over a dated one", queue(time.Time{}), queue(early), false},
+		{"an undated one over an undated one", queue(time.Time{}), queue(time.Time{}), true},
+	}
+
+	for _, tc := range cases {
+		if got := tc.next.Supersedes(tc.current); got != tc.want {
+			t.Errorf("%s: Supersedes = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

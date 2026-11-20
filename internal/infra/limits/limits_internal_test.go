@@ -97,6 +97,46 @@ func TestOverridesLayer(t *testing.T) {
 	}
 }
 
+// TestAuthOverridesAreNotUndone covers a tenant whose devices hold tokens
+// from different days. One that says nothing about limits, or that was
+// issued before the limits in force, used to reset the tenant on the node
+// it connected to, so the limit there depended on which device came last.
+func TestAuthOverridesAreNotUndone(t *testing.T) {
+	t.Parallel()
+
+	l, clock := local(Options{Defaults: tenant.Limits{MaxConnections: 5000, OfflineQueue: 100}, Interval: time.Second})
+
+	admit := func(o tenant.Overrides) int {
+		t.Helper()
+
+		got, err := l.Admit("acme", o, false)
+		if err != nil {
+			t.Fatalf("Admit: %v", err)
+		}
+
+		return got.MaxConnections
+	}
+
+	planChanged := clock.Add(-time.Hour)
+	before := planChanged.Add(-24 * time.Hour)
+
+	if got := admit(tenant.Overrides{MaxConnections: new(500), IssuedAt: planChanged}); got != 500 {
+		t.Fatalf("the new plan's token: limit %d, want 500", got)
+	}
+
+	if got := admit(tenant.Overrides{MaxConnections: new(5000), IssuedAt: before}); got != 500 {
+		t.Errorf("a token from the old plan put the limit back to %d", got)
+	}
+
+	if got := admit(tenant.Overrides{}); got != 500 {
+		t.Errorf("a token with no limits claim reset the limit to %d", got)
+	}
+
+	if got := admit(tenant.Overrides{MaxConnections: new(800), IssuedAt: *clock}); got != 800 {
+		t.Errorf("a newer token: limit %d, want 800", got)
+	}
+}
+
 func TestPublishRateIsPerTenant(t *testing.T) {
 	t.Parallel()
 

@@ -354,6 +354,11 @@ func (c *Client) Resolve(ctx context.Context, creds tenant.Credentials) (tenant.
 		limits = none
 	}
 
+	// Authentication replies are never cached, so each is the service's
+	// word as of now, and orders against the tenant's earlier ones by when
+	// it arrived.
+	limits.IssuedAt = time.Now()
+
 	return tenant.Identity{Tenant: tenant.ID(reply.Tenant), Superuser: false, Limits: limits}, nil
 }
 

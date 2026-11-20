@@ -312,3 +312,28 @@ func TestLimitsClaim(t *testing.T) {
 		})
 	}
 }
+
+// TestLimitsClaimIsDated carries the token's iat with its limits, which is
+// what lets a node tell a token from before a tenant's plan changed from
+// one after.
+func TestLimitsClaimIsDated(t *testing.T) {
+	t.Parallel()
+
+	v := verifier(t, func(o *jwtauth.Options) { o.LimitsClaim = "limits" })
+
+	issued := time.Now().Add(-time.Minute).Truncate(time.Second)
+	token := sign(t, jwt.SigningMethodHS512, []byte(secret), jwt.MapClaims{
+		"tenant": "acme",
+		"limits": map[string]any{"max_connections": 10},
+		"iat":    issued.Unix(),
+	})
+
+	got, err := v.Resolve(context.Background(), tenant.Credentials{Username: token})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if !got.Limits.IssuedAt.Equal(issued) {
+		t.Errorf("IssuedAt = %v, want the token's iat %v", got.Limits.IssuedAt, issued)
+	}
+}
