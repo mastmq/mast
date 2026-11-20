@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -162,7 +163,7 @@ func NewMetrics(reg prometheus.Registerer, src Sources, maxTenants int) *Metrics
 		}),
 		LimitExceeded: factory("limit_exceeded_total",
 			"Connections, publishes and queued messages refused or discarded by a tenant limit.", "tenant", "limit"),
-		tenants: &tenantLabels{max: maxTenants, mu: sync.RWMutex{}, known: make(map[string]struct{})},
+		tenants: &tenantLabels{max: maxTenants, known: sync.Map{}, mu: sync.Mutex{}, count: 0, full: atomic.Bool{}},
 	}
 
 	if src.Subscriptions != nil {
@@ -195,10 +196,22 @@ const OtherTenants = "~other"
 func (m *Metrics) Tenant(id string) string { return m.tenants.label(id) }
 
 // tenantLabels hands out label values until it has handed out max.
+//
+// label runs on every publish and every delivery, from every connection's
+// goroutine at once, and the set of tenants it knows only grows. That is
+// the shape sync.Map serves without a lock: under an RWMutex the readers
+// alone contend on its reader count, which is what the bridge's tenant map
+// moved away from for the same reason. full lets a tenant past the bound
+// be answered without the lock as well.
 type tenantLabels struct {
 	max   int
-	mu    sync.RWMutex
-	known map[string]struct{}
+	known sync.Map
+
+	// mu serialises admitting a new tenant, which count and full need to be
+	// exact about.
+	mu    sync.Mutex
+	count int
+	full  atomic.Bool
 }
 
 func (t *tenantLabels) label(id string) string {
@@ -206,30 +219,28 @@ func (t *tenantLabels) label(id string) string {
 		return id
 	}
 
-	t.mu.RLock()
-	_, ok := t.known[id]
-	full := len(t.known) >= t.max
-	t.mu.RUnlock()
-
-	switch {
-	case ok:
+	if _, ok := t.known.Load(id); ok {
 		return id
-	case full:
+	}
+
+	if t.full.Load() {
 		return OtherTenants
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if _, ok := t.known[id]; ok {
+	if _, ok := t.known.Load(id); ok {
 		return id
 	}
 
-	if len(t.known) >= t.max {
+	if t.count >= t.max {
 		return OtherTenants
 	}
 
-	t.known[id] = struct{}{}
+	t.known.Store(id, struct{}{})
+	t.count++
+	t.full.Store(t.count >= t.max)
 
 	return id
 }

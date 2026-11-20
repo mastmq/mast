@@ -91,3 +91,38 @@ func expect(t *testing.T, url string, status int, body string) {
 		t.Errorf("GET %s = %d %q, want %d containing %q", url, resp.StatusCode, got, status, body)
 	}
 }
+
+// TestTenantLabelsAreBounded holds Metrics.Tenant to its promise: the first
+// tenants keep their own label for good, and every one past the bound shares
+// the overflow, however many goroutines ask at once.
+func TestTenantLabelsAreBounded(t *testing.T) {
+	m := obs.NewMetrics(prometheus.NewRegistry(), obs.Sources{}, 2)
+
+	if got := m.Tenant("acme"); got != "acme" {
+		t.Fatalf("the first tenant was labelled %q", got)
+	}
+
+	// Many goroutines racing to be the second tenant: exactly one wins.
+	names := []string{"b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7"}
+	labels := make(chan string, len(names))
+
+	for _, name := range names {
+		go func() { labels <- m.Tenant(name) }()
+	}
+
+	own := 0
+
+	for range names {
+		if <-labels != obs.OtherTenants {
+			own++
+		}
+	}
+
+	if own != 1 {
+		t.Errorf("%d tenants won the one free label, want 1", own)
+	}
+
+	if got := m.Tenant("acme"); got != "acme" {
+		t.Errorf("the first tenant lost its label to %q", got)
+	}
+}
