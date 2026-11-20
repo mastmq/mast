@@ -194,6 +194,7 @@ Two traps that cost real time:
 | `docker.yaml` | multi-tag ghcr image for linux/amd64 and linux/arm64, cross-compiled in the build stage rather than emulated, with an SBOM and `mode=max` provenance, and the pushed digest signed keylessly with cosign. PRs build but do not publish |
 | `release.yaml` | linux amd64/arm64 tarballs and a checksum file on the GitHub release, for `mastmq/ansible`, each with a GitHub build-provenance attestation. The file names are that collection's interface |
 | `codeql.yml` | weekly security scan |
+| `conformance.yaml` | the Eclipse Paho interoperability suite, MQTT 3.1.1 and 5, against an all-in-one node, on push, PRs and weekly; `just conformance` runs the same script. Known failures are expected failures in `test/conformance/run.py`, each with its issue, and one that starts passing turns the run red until its entry goes |
 
 `govulncheck` runs on every push, not only on dependency bumps — a dependency can become vulnerable without a line of our code changing. It fails only on *reachable* vulnerabilities; treating unreachable ones as failure is how a red pipeline stops meaning anything.
 
