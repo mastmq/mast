@@ -1,0 +1,37 @@
+---
+name: conformance
+
+# The Eclipse Paho interoperability suite, MQTT 3.1.1 and 5, against one
+# all-in-one node. parity_test.go checks what mast promises; this checks what
+# a client written against someone else's reading of the spec expects, which
+# is where the EMQX migration finds surprises.
+#
+# Tests mast is known to fail are listed in test/conformance/run.py, each
+# with its issue. Weekly as well as on push, because the suite is pinned but
+# Go, Python and the runner image are not.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  paho:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: go build -o mast ./cmd/mast
+      - run: ./test/conformance/run.sh ./mast
