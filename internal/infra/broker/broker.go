@@ -565,7 +565,7 @@ func (b *Broker) startTracing(cfg config.Config) (trace.TracerProvider, error) {
 
 	b.tracing = p
 
-	b.log.Info("tracing the message path over otlp", "endpoint", cfg.Tracing.Endpoint, "sampler", cfg.Tracing.Sampler)
+	b.log.Info("tracing the message path over otlp", "endpoint", cfg.Tracing.Endpoint, "sampler", p.Sampler())
 
 	return p.TracerProvider(), nil
 }

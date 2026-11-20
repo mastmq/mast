@@ -171,5 +171,7 @@ endpoint = ""
 # parentbased_always_on, parentbased_always_off, parentbased_traceidratio.
 # Empty: OTEL_TRACES_SAMPLER, then parentbased_always_on.
 sampler = ""
-# The ratio for the traceidratio samplers, e.g. "0.01". Empty means 1.
+# The ratio for the traceidratio samplers, e.g. "0.01". Empty:
+# OTEL_TRACES_SAMPLER_ARG, then 1. Each key defers on its own, so either one
+# may come from the environment. A client's sampled flag never decides.
 sampler_arg = ""

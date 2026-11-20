@@ -28,6 +28,13 @@ import (
 // "traceparent" user property is delivered with it pointing at that
 // delivery span, so a subscriber continues the same trace.
 //
+// The client's sampled flag is not a decision. The tracing package's
+// sampler decides a server span with a remote parent — which is only ever
+// "mqtt.publish" under a client's traceparent — as if it had no parent, so
+// a client can neither force its messages to be traced on every node nor
+// hide them. That is why the publish span must stay of kind server and the
+// delivery span must not be.
+//
 // The tracer is nil when tracing is off, and every path below checks that
 // first. A no-op tracer would have been tidier and is not free: extracting a
 // parent and wrapping it in a context allocates whether or not anything
@@ -189,8 +196,9 @@ func endSpan(span trace.Span, err error) {
 
 // startDeliver opens the span for injecting a message from the fabric, as a
 // child of the publish that sent it, and points a "traceparent" user
-// property the message carries at it. It must only be called with a
-// tracer.
+// property the message carries at it. A message that crossed the fabric
+// with no trace context keeps its property as it was. It must only be
+// called with a tracer.
 //
 // It takes the user properties and returns them rather than taking a
 // pointer to the packet's properties: a pointer stored in the carrier made
@@ -203,13 +211,37 @@ func (h *Hook) startDeliver(
 	header nats.Header, user []packets.UserProperty, tenantID, mqttTopic, queue, via string,
 ) (trace.Span, []packets.UserProperty) {
 	parent := w3c.Extract(context.Background(), natsCarrier(header))
-
-	ctx, span := h.tracer.Start(parent, "mqtt.deliver", trace.WithSpanKind(trace.SpanKindConsumer))
+	carrier := userCarrier{props: &user}
 
 	// Only a message that already carried one. Adding the property to
 	// every message would change what every MQTT 5 subscriber receives, and
 	// grow every delivery, for a client that never asked to be traced.
-	if carrier := (userCarrier{props: &user}); carrier.Get(keyTraceparent) != "" {
+	rewrite := carrier.Get(keyTraceparent) != ""
+
+	opts := []trace.SpanStartOption{trace.WithSpanKind(trace.SpanKindConsumer)}
+
+	// No trace context on the fabric message: a will, a message from an
+	// edge that has tracing off, or a NATS-native publisher. The delivery
+	// span is then a root, and pointing the property at it would hand the
+	// subscriber a trace of ours in place of the publisher's, cutting the
+	// client's trace at the broker without a word. So the property passes
+	// through, as on a node with tracing off, and the span links to the
+	// client's context so the two can still be found together. Parenting
+	// the span on the property instead would let a client's sampled flag
+	// decide sampling here, which the ingress is careful not to allow.
+	if !trace.SpanContextFromContext(parent).IsValid() {
+		if rewrite {
+			if client := trace.SpanContextFromContext(w3c.Extract(context.Background(), carrier)); client.IsValid() {
+				opts = append(opts, trace.WithLinks(trace.Link{SpanContext: client, Attributes: nil}))
+			}
+		}
+
+		rewrite = false
+	}
+
+	ctx, span := h.tracer.Start(parent, "mqtt.deliver", opts...)
+
+	if rewrite {
 		w3c.Inject(ctx, carrier)
 	}
 

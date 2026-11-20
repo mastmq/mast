@@ -124,7 +124,9 @@ type Tracing struct {
 	// variable, then to parentbased_always_on.
 	Sampler string `json:"sampler" koanf:"sampler"`
 	// SamplerArg is the ratio for the traceidratio samplers, as
-	// OTEL_TRACES_SAMPLER_ARG spells it. Empty means 1.
+	// OTEL_TRACES_SAMPLER_ARG spells it. Empty defers to that variable,
+	// then to 1. Each of the two keys defers on its own, so a sampler set
+	// here takes its ratio from the environment and the other way round.
 	SamplerArg string `json:"sampler_arg" koanf:"sampler_arg"`
 }
 

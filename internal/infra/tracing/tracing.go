@@ -21,9 +21,14 @@ package tracing
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
+	"os"
 	"strconv"
+	"strings"
 
 	"github.com/carlmjohnson/versioninfo"
 	"github.com/mastmq/mast/internal/infra/config"
@@ -42,8 +47,13 @@ const serviceName = "mast"
 
 // Provider is a running tracer provider and the exporter behind it.
 type Provider struct {
-	tp *sdktrace.TracerProvider
+	tp      *sdktrace.TracerProvider
+	sampler string
 }
+
+// Sampler describes the sampler in use, for the startup log: with the keys
+// empty it came from the environment, which the config does not show.
+func (p *Provider) Sampler() string { return p.sampler }
 
 // Start builds a provider from cfg, whether or not cfg.Enabled is set: the
 // caller decides that, because only it knows whether there is anything on
@@ -54,6 +64,14 @@ type Provider struct {
 // collector that is down at startup costs dropped spans, never a broker
 // that will not start.
 func Start(ctx context.Context, cfg config.Tracing, log *slog.Logger, attrs ...attribute.KeyValue) (*Provider, error) {
+	// Always one of ours, never the SDK's reading of the environment:
+	// Sampler reads the same variables, key by key, and wraps the result so
+	// that a client cannot choose to be sampled.
+	sampler, err := Sampler(cfg, os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+
 	var opts []otlptracehttp.Option
 	if cfg.Endpoint != "" {
 		opts = append(opts, otlptracehttp.WithEndpointURL(cfg.Endpoint))
@@ -84,12 +102,7 @@ func Start(ctx context.Context, cfg config.Tracing, log *slog.Logger, attrs ...a
 		// the publish path. OTEL_BSP_* tune it.
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
-	}
-
-	// With no sampler of our own the SDK reads OTEL_TRACES_SAMPLER and
-	// OTEL_TRACES_SAMPLER_ARG itself, which is the point of leaving it empty.
-	if sampler, ok := Sampler(cfg); ok {
-		providerOpts = append(providerOpts, sdktrace.WithSampler(sampler))
+		sdktrace.WithSampler(sampler),
 	}
 
 	// The SDK reports export failures through a process-wide handler, which
@@ -99,7 +112,7 @@ func Start(ctx context.Context, cfg config.Tracing, log *slog.Logger, attrs ...a
 		log.Warn("exporting traces", "error", err)
 	}))
 
-	return &Provider{tp: sdktrace.NewTracerProvider(providerOpts...)}, nil
+	return &Provider{tp: sdktrace.NewTracerProvider(providerOpts...), sampler: sampler.Description()}, nil
 }
 
 // TracerProvider is what the bridge creates its tracer from.
@@ -116,37 +129,148 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// Sampler builds the sampler cfg names. ok is false when cfg names none, in
-// which case the SDK's own reading of OTEL_TRACES_SAMPLER applies.
+// The standard variables a sampler key left empty defers to.
+const (
+	envSampler    = "OTEL_TRACES_SAMPLER"
+	envSamplerArg = "OTEL_TRACES_SAMPLER_ARG"
+)
+
+// defaultSampler is the SDK's own default, kept so that a node with nothing
+// configured samples exactly as it would have had the SDK chosen.
+const defaultSampler = "parentbased_always_on"
+
+// ErrSamplerEnv is returned for an OTEL_TRACES_SAMPLER or
+// OTEL_TRACES_SAMPLER_ARG that config.Validate never saw. The SDK would log
+// it and sample everything; a typo in a ratio meant to be 0.01 should not
+// be found by the collector falling over.
+var ErrSamplerEnv = errors.New("tracing: invalid sampler in the environment")
+
+// Sampler builds the sampler for cfg. A key cfg leaves empty is read from
+// its standard variable through getenv, each key on its own: a sampler
+// named in the file takes its ratio from OTEL_TRACES_SAMPLER_ARG, and a
+// ratio in the file applies to a sampler named by OTEL_TRACES_SAMPLER.
+//
+// It used to hand the environment to the SDK whenever the sampler key was
+// empty, and the SDK reads the two variables only as a pair: a sampler from
+// the file ignored the ratio in the environment, and a ratio from the file
+// was ignored under a sampler from the environment. Both sampled 100%.
 //
 // The names and their meaning are OTEL_TRACES_SAMPLER's, so one vocabulary
 // serves both the file and the environment. config.Validate has already
-// refused anything else, and a ratio it could not parse.
+// refused a bad value in the file; a bad one in the environment is refused
+// here.
+//
+// Whatever is configured is wrapped by [ingressSampler], so that no client
+// decides what is sampled.
 //
 //nolint:ireturn // sdktrace.Sampler is an interface by design
-func Sampler(cfg config.Tracing) (sdktrace.Sampler, bool) {
-	ratio := 1.0
+func Sampler(cfg config.Tracing, getenv func(string) string) (sdktrace.Sampler, error) {
+	name, nameFrom := cfg.Sampler, "tracing.sampler"
+	if name == "" {
+		name, nameFrom = getenv(envSampler), envSampler
+	}
 
-	if cfg.SamplerArg != "" {
-		if parsed, err := strconv.ParseFloat(cfg.SamplerArg, 64); err == nil {
-			ratio = parsed
+	if name == "" {
+		name = defaultSampler
+	}
+
+	ratio, err := samplerRatio(cfg, getenv)
+	if err != nil {
+		return nil, err
+	}
+
+	var root sdktrace.Sampler
+
+	switch name {
+	case "always_on", "parentbased_always_on":
+		root = sdktrace.AlwaysSample()
+	case "always_off", "parentbased_always_off":
+		root = sdktrace.NeverSample()
+	case "traceidratio", "parentbased_traceidratio":
+		root = sdktrace.TraceIDRatioBased(ratio)
+	default:
+		return nil, fmt.Errorf("%w: %s = %q is not one of %v", ErrSamplerEnv, nameFrom, name, config.Samplers())
+	}
+
+	configured := root
+	if strings.HasPrefix(name, "parentbased_") {
+		configured = sdktrace.ParentBased(root)
+	}
+
+	return ingressSampler{configured: configured, root: root}, nil
+}
+
+// samplerRatio is the ratio cfg or else OTEL_TRACES_SAMPLER_ARG names, and 1
+// when neither does.
+func samplerRatio(cfg config.Tracing, getenv func(string) string) (float64, error) {
+	arg, argFrom := cfg.SamplerArg, "tracing.sampler_arg"
+	if arg == "" {
+		arg, argFrom = getenv(envSamplerArg), envSamplerArg
+	}
+
+	if arg == "" {
+		return 1, nil
+	}
+
+	ratio, err := strconv.ParseFloat(arg, 64)
+	if err != nil || ratio < 0 || ratio > 1 {
+		return 0, fmt.Errorf("%w: %s = %q is not a ratio between 0 and 1", ErrSamplerEnv, argFrom, arg)
+	}
+
+	return ratio, nil
+}
+
+// ingressSampler keeps the sampling decision on the broker.
+//
+// A span of kind server with a remote parent is a client's PUBLISH that
+// named a trace in its "traceparent" user property: the bridge opens no
+// other server span. A parent-based sampler would let that client's sampled
+// flag decide, and the decision then rides the fabric to every node that
+// delivers the message. So any MQTT 5 client could have every one of its
+// messages traced on every node — the +97 allocations of a traced publish,
+// times every edge, and a full span queue that drops other tenants' spans —
+// or hide its traffic from tracing with a flag of 00. For those spans the
+// configured root sampler decides instead, as if the span had no parent.
+//
+// It decides on a trace id of its own rather than the client's: a ratio
+// sampler compares the trace id with its ratio, and a client picks its
+// trace id as freely as its flag. The span itself keeps the client's trace
+// id, so the trace still joins up.
+//
+// Every other span goes to the configured sampler. A delivery span's remote
+// parent is the publish span, whose context the ingress wrote onto the
+// fabric message, and following it is what keeps a trace whole across
+// nodes.
+type ingressSampler struct {
+	configured sdktrace.Sampler
+	root       sdktrace.Sampler
+}
+
+// ShouldSample implements [sdktrace.Sampler].
+func (s ingressSampler) ShouldSample(p sdktrace.SamplingParameters) sdktrace.SamplingResult {
+	if p.Kind == trace.SpanKindServer {
+		if psc := trace.SpanContextFromContext(p.ParentContext); psc.IsValid() && psc.IsRemote() {
+			p.TraceID = randomTraceID()
+
+			return s.root.ShouldSample(p)
 		}
 	}
 
-	switch cfg.Sampler {
-	case "always_on":
-		return sdktrace.AlwaysSample(), true
-	case "always_off":
-		return sdktrace.NeverSample(), true
-	case "traceidratio":
-		return sdktrace.TraceIDRatioBased(ratio), true
-	case "parentbased_always_on":
-		return sdktrace.ParentBased(sdktrace.AlwaysSample()), true
-	case "parentbased_always_off":
-		return sdktrace.ParentBased(sdktrace.NeverSample()), true
-	case "parentbased_traceidratio":
-		return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio)), true
-	default:
-		return nil, false
-	}
+	return s.configured.ShouldSample(p)
+}
+
+// Description implements [sdktrace.Sampler].
+func (s ingressSampler) Description() string {
+	return "MQTTIngress{client:" + s.root.Description() + ",otherwise:" + s.configured.Description() + "}"
+}
+
+// randomTraceID is the id a client's publish is sampled on. It never names
+// a span, so it needs to be uniform, not unguessable.
+func randomTraceID() trace.TraceID {
+	var id trace.TraceID
+
+	binary.BigEndian.PutUint64(id[:8], rand.Uint64()) //nolint:gosec // a sampling roll, not a secret
+	binary.BigEndian.PutUint64(id[8:], rand.Uint64()) //nolint:gosec // a sampling roll, not a secret
+
+	return id
 }
