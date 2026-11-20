@@ -233,6 +233,10 @@ func (h *Hook) Attach(server *mqtt.Server) {
 
 	h.listenForNotices()
 
+	if h.nodeID != "" {
+		go h.beat()
+	}
+
 	if h.store != nil && h.sessionExpiry > 0 {
 		go h.refreshSessions()
 	}
@@ -253,6 +257,8 @@ func (h *Hook) Stop() error {
 			// The connection is closing with the server regardless.
 			_ = h.noticeSub.Unsubscribe()
 		}
+
+		h.sayGoodbye()
 	})
 
 	return nil

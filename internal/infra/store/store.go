@@ -122,6 +122,13 @@ type Session struct {
 	// token of its session claim. A node noticing a disconnect late must not
 	// mark away a session another node's connection already holds.
 	Owner string `json:"owner,omitempty"`
+	// Node is the node whose connection holds the session, by its embedded
+	// server's id, written with Present. The cores watch every node's
+	// heartbeat, and a node that stops beating without having recorded its
+	// sessions as away — killed outright — has its sessions queued for as
+	// if it had. A record without it, from a node older than the field, is
+	// never judged that way.
+	Node string `json:"node,omitempty"`
 }
 
 // Store is the durable state of a mast cluster.
@@ -355,9 +362,53 @@ func (s *Store) OpenDurable(ctx context.Context, replicas int, maxAge time.Durat
 		Replicas:   replicas,
 		MaxAge:     maxAge,
 		Duplicates: min(durableDedupWindow, maxAge),
+		// Read back by time when a node dies without saying so: the queuer
+		// replays what was published since the node was last heard from,
+		// with batched direct gets any replica answers, rather than a
+		// consumer.
+		AllowDirect: true,
 	})
 	if err != nil {
 		return fmt.Errorf("store: stream %s: %w", streamDurable, err)
+	}
+
+	return nil
+}
+
+// ReplayDurable calls fn with every message the durable stream stored at or
+// after since, oldest first, in the same form [DurableHandler] receives a
+// message from the consumer: the subject as stored, the headers with
+// [nats.JSTimeStamp] set to when it was stored, and the payload.
+//
+// It reads with batched direct gets, not a consumer. It runs when a node
+// is declared dead, to queue what was published between its last
+// heartbeat and the moment the cores noticed, which no live reader can go
+// back for.
+func (s *Store) ReplayDurable(ctx context.Context, since time.Time, fn DurableHandler) (int, error) {
+	read := 0
+
+	err := s.direct.eachSince(ctx, s.apiPrefix, streamDurable, DurablePrefix+">", since,
+		func(m *nats.Msg, _ uint64) bool {
+			read++
+
+			fn(m.Header.Get(nats.JSSubject), m.Header, m.Data)
+
+			return true
+		})
+	if err != nil {
+		return read, fmt.Errorf("store: replaying %s: %w", streamDurable, err)
+	}
+
+	return read, nil
+}
+
+// Reachable reports whether the sessions bucket's stream has a leader this
+// node can reach. A node cut off from the rest of the cluster cannot, and
+// it is the one node whose opinion of who else is alive must not be acted
+// on: every other node would look dead to it.
+func (s *Store) Reachable(ctx context.Context) error {
+	if _, err := s.js.Stream(ctx, kvStreamPrefix+bucketSessions); err != nil {
+		return fmt.Errorf("store: reaching the sessions stream: %w", err)
 	}
 
 	return nil

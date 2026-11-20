@@ -40,6 +40,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mastmq/mast/internal/domain/liveness"
 	"github.com/mastmq/mast/internal/domain/topic"
 	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
@@ -94,7 +95,25 @@ type Queuer struct {
 	// can leave the index.
 	reached time.Time
 
+	// live follows every node's heartbeat. held is the node each held
+	// session's record names, left the node a session most recently moved
+	// off, and orphans the held records that arrived naming a node already
+	// declared dead. Together they are what lets the queuer take over the
+	// sessions of a node that died without recording them as away; see
+	// nodes.go. All are guarded by mu.
+	live    *liveness.Tracker
+	held    map[string]string
+	left    map[string]departure
+	orphans map[string]string
+	// farewell is when each node that shut down cleanly said so.
+	farewell map[string]time.Time
+
+	// reachable is asked before a node is declared dead, so that a core cut
+	// off from the cluster does not declare every node dead at once.
+	reachable func(context.Context) error
+
 	watcher jetstream.KeyWatcher
+	beats   *nats.Subscription
 	stop    func()
 	done    chan struct{}
 	once    sync.Once
@@ -122,6 +141,11 @@ type absentSession struct {
 	// back is when the session's record said it was held again; zero while
 	// it is away. See [Queuer.apply].
 	back time.Time
+
+	// reapedFrom is the node whose death put the session here, empty for a
+	// session its record says is away. Should that node beat again, it was
+	// not dead, and the session is held after all.
+	reapedFrom string
 }
 
 // clockSlack widens the comparison of a message's stream time with a
@@ -144,14 +168,27 @@ const pruneEvery = 10 * time.Second
 func Start(
 	ctx context.Context,
 	st *store.Store,
+	nc *nats.Conn,
 	expiry time.Duration,
 	metrics *obs.Metrics,
 	log *slog.Logger,
 ) (*Queuer, error) {
 	q := newQueuer(st, expiry, metrics, log)
+	q.reachable = st.Reachable
+
+	// Listening before the sessions load, so that every live node has been
+	// heard from by the time the first check could judge it.
+	beats, err := nc.Subscribe(liveness.Wildcard, q.onBeat)
+	if err != nil {
+		return nil, fmt.Errorf("offline: listening for node heartbeats: %w", err)
+	}
+
+	q.beats = beats
 
 	watcher, err := st.WatchSessions(ctx)
 	if err != nil {
+		_ = beats.Unsubscribe()
+
 		return nil, err
 	}
 
@@ -180,6 +217,7 @@ func Start(
 	q.stop = stop
 
 	go q.sweep()
+	go q.watchNodes(ctx)
 
 	q.mu.RLock()
 	away := len(q.absent)
@@ -200,14 +238,23 @@ func newQueuer(st *store.Store, expiry time.Duration, metrics *obs.Metrics, log 
 		index:   newIndex(),
 		absent:  make(map[string]absentSession),
 		reached: time.Time{},
-		watcher: nil,
-		stop:    nil,
-		done:    make(chan struct{}),
-		once:    sync.Once{},
+		live:    liveness.NewTracker(liveness.DeadAfter),
+		held:    make(map[string]string),
+		left:    make(map[string]departure),
+		orphans: make(map[string]string),
+
+		farewell: make(map[string]time.Time),
+		watcher:  nil,
+		beats:    nil,
+		stop:     nil,
+		done:     make(chan struct{}),
+		once:     sync.Once{},
 
 		inflightMu: sync.Mutex{},
 		inflight:   nil,
 		flushMu:    sync.Mutex{},
+
+		reachable: func(context.Context) error { return nil },
 	}
 }
 
@@ -218,6 +265,10 @@ func (q *Queuer) Stop() {
 
 		if q.stop != nil {
 			q.stop()
+		}
+
+		if q.beats != nil {
+			_ = q.beats.Unsubscribe()
 		}
 
 		_ = q.watcher.Stop()
@@ -293,6 +344,7 @@ func (q *Queuer) apply(entry jetstream.KeyValueEntry) {
 
 	if entry.Operation() != jetstream.KeyValuePut {
 		q.removeLocked(key)
+		q.unhold(key)
 
 		return
 	}
@@ -301,11 +353,18 @@ func (q *Queuer) apply(entry jetstream.KeyValueEntry) {
 	if err != nil {
 		q.log.Warn("ignoring an unreadable session record", "key", key, "error", err)
 		q.removeLocked(key)
+		q.unhold(key)
 
 		return
 	}
 
 	if sess.Present {
+		// A record naming a node already declared dead is not a device
+		// coming back: it is that node's last write, arriving late.
+		if !q.hold(key, sess.Node, entry.Created()) {
+			return
+		}
+
 		if away, ok := q.absent[key]; ok && away.back.IsZero() {
 			away.back = entry.Created()
 			q.absent[key] = away
@@ -314,11 +373,24 @@ func (q *Queuer) apply(entry jetstream.KeyValueEntry) {
 		return
 	}
 
+	q.unhold(key)
 	q.removeLocked(key)
 
-	away := absentSession{filters: make([]string, 0, len(sess.Subscriptions)), since: sess.UpdatedAt, back: time.Time{}}
-	if away.since.IsZero() {
-		away.since = entry.Created()
+	since := sess.UpdatedAt
+	if since.IsZero() {
+		since = entry.Created()
+	}
+
+	q.indexAway(key, sess, since, "")
+}
+
+// indexAway puts a session in the index as away. Called with q.mu held.
+func (q *Queuer) indexAway(key string, sess store.Session, since time.Time, reapedFrom string) {
+	away := absentSession{
+		filters:    make([]string, 0, len(sess.Subscriptions)),
+		since:      since,
+		back:       time.Time{},
+		reapedFrom: reapedFrom,
 	}
 
 	for _, sub := range sess.Subscriptions {

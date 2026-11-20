@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -60,6 +61,10 @@ type directRequest struct {
 	Seq     uint64 `json:"seq,omitempty"`
 	NextFor string `json:"next_by_subj"`
 	Batch   int    `json:"batch"`
+
+	// StartTime starts the read at the first message stored at or after
+	// it, in place of Seq. The server refuses both at once.
+	StartTime *time.Time `json:"start_time,omitempty"`
 }
 
 // each calls fn with every message on stream whose subject matches filter,
@@ -70,13 +75,37 @@ func (d *directReader) each(
 	from uint64,
 	fn func(m *nats.Msg, seq uint64) bool,
 ) error {
+	return d.eachFrom(ctx, apiPrefix, stream, filter, from, nil, fn)
+}
+
+// eachSince is [directReader.each] from the first message stored at or
+// after since.
+func (d *directReader) eachSince(
+	ctx context.Context,
+	apiPrefix, stream, filter string,
+	since time.Time,
+	fn func(m *nats.Msg, seq uint64) bool,
+) error {
+	return d.eachFrom(ctx, apiPrefix, stream, filter, 0, &since, fn)
+}
+
+func (d *directReader) eachFrom(
+	ctx context.Context,
+	apiPrefix, stream, filter string,
+	from uint64,
+	since *time.Time,
+	fn func(m *nats.Msg, seq uint64) bool,
+) error {
 	for {
-		last, more, err := d.page(ctx, apiPrefix+"DIRECT.GET."+stream, filter, from, fn)
+		last, more, err := d.page(ctx, apiPrefix+"DIRECT.GET."+stream, directRequest{
+			Seq: from, NextFor: filter, Batch: directPage, StartTime: since,
+		}, fn)
 		if err != nil || !more {
 			return err
 		}
 
-		from = last + 1
+		// Only the first page starts by time; the rest follow on.
+		from, since = last+1, nil
 	}
 }
 
@@ -84,8 +113,8 @@ func (d *directReader) each(
 // read past last.
 func (d *directReader) page(
 	ctx context.Context,
-	subject, filter string,
-	from uint64,
+	subject string,
+	req directRequest,
 	fn func(m *nats.Msg, seq uint64) bool,
 ) (uint64, bool, error) {
 	reply, replies, err := d.register()
@@ -94,7 +123,7 @@ func (d *directReader) page(
 	}
 	defer d.unregister(reply)
 
-	if err := d.request(subject, reply, filter, from); err != nil {
+	if err := d.request(subject, reply, req); err != nil {
 		return 0, false, err
 	}
 
@@ -142,8 +171,8 @@ func next(ctx context.Context, subject string, replies <-chan *nats.Msg) (*nats.
 	}
 }
 
-func (d *directReader) request(subject, reply, filter string, from uint64) error {
-	body, err := json.Marshal(directRequest{Seq: from, NextFor: filter, Batch: directPage})
+func (d *directReader) request(subject, reply string, req directRequest) error {
+	body, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("store: encoding direct get: %w", err)
 	}

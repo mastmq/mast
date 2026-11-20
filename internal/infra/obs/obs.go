@@ -78,6 +78,18 @@ type Metrics struct {
 	// QueuerAway is how many sessions this node's queuer is keeping
 	// messages for. It should match on every core.
 	QueuerAway prometheus.Gauge
+
+	// QueuerNodesDead counts nodes this core declared dead because their
+	// heartbeats stopped. Each one was killed outright, or was cut off or
+	// stalled for longer than the threshold — in which case its devices may
+	// receive what was queued for them twice.
+	QueuerNodesDead prometheus.Counter
+	// QueuerReaped counts sessions this core took over from dead nodes.
+	QueuerReaped prometheus.Counter
+	// QueuerReplayed counts messages queued by replaying the durable stream
+	// for them: what was published between a node's death and its
+	// detection.
+	QueuerReplayed prometheus.Counter
 }
 
 // NATSCounts is what the NATS client's asynchronous handlers have observed.
@@ -149,6 +161,12 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 			Name:      "queuer_away_sessions",
 			Help:      "Sessions this node's queuer keeps messages for, because no connection holds them.",
 		}),
+		QueuerNodesDead: counter(reg, "queuer_nodes_dead_total",
+			"Nodes declared dead because their heartbeats stopped."),
+		QueuerReaped: counter(reg, "queuer_reaped_sessions_total",
+			"Sessions taken over from nodes declared dead."),
+		QueuerReplayed: counter(reg, "queuer_replayed_total",
+			"Messages queued by replaying the durable stream after a node was declared dead."),
 	}
 
 	if src.Subscriptions != nil {
@@ -164,6 +182,20 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 	registerNATSCounts(reg, src.NATS)
 
 	return m
+}
+
+// counter registers one unlabelled counter.
+//
+//nolint:ireturn // the client library offers a counter only as an interface
+func counter(reg prometheus.Registerer, name, help string) prometheus.Counter {
+	c := prometheus.NewCounter(prometheus.CounterOpts{ //nolint:exhaustruct_v5 // defaults are right
+		Namespace: namespace,
+		Name:      name,
+		Help:      help,
+	})
+	reg.MustRegister(c)
+
+	return c
 }
 
 // registerNATSCounts publishes the fabric's asynchronous tallies.

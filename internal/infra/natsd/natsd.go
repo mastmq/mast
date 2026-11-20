@@ -223,6 +223,23 @@ func (s *Server) WaitForLeaf(ctx context.Context) error {
 	}
 }
 
+// Kill stops the server at once, without draining anything: the node's
+// side of a SIGKILL. Whatever the node's own connection had not yet sent is
+// lost, and the cluster sees its leaf connection close.
+//
+// It exists to rehearse a node dying without a word, which a clean
+// [Server.Shutdown] cannot: the node records its sessions as away on the
+// way down. Tests use it, as they use [Server.DropLeaf].
+func (s *Server) Kill() {
+	s.closing.Store(true)
+	s.ns.Shutdown()
+	s.ns.WaitForShutdown()
+
+	if s.nc != nil {
+		s.nc.Close()
+	}
+}
+
 // Shutdown drains the client connection and stops the server.
 func (s *Server) Shutdown() {
 	s.closing.Store(true)
