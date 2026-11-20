@@ -72,11 +72,21 @@ type Death struct {
 }
 
 // node is what a tracker knows about one node.
+//
+// Two times, because they answer two questions. heard is when the node
+// last gave a sign of life — a beat, or the first record naming it — and it
+// is what a death reports, because the caller replays from there. clock is
+// what the threshold is measured from: heard, or later when the caller
+// could not trust its own view and restarted every clock. One field did
+// both once, and an excused check then moved a dead node's last sign of
+// life to the moment of the excuse, so the replay started after the death
+// and the seconds between were queued by nobody.
 type node struct {
-	name     string
-	lastSeen time.Time
-	dead     bool
-	diedAt   time.Time
+	name   string
+	heard  time.Time
+	clock  time.Time
+	dead   bool
+	diedAt time.Time
 }
 
 // Tracker follows the nodes of a cluster. It is not safe for concurrent
@@ -100,7 +110,8 @@ func NewTracker(deadAfter time.Duration) *Tracker {
 // been declared dead: a false positive, which the caller has to undo.
 func (t *Tracker) Beat(name string, now time.Time) bool {
 	n := t.lookup(name, now)
-	n.lastSeen = later(n.lastSeen, now)
+	n.heard = later(n.heard, now)
+	n.clock = later(n.clock, now)
 
 	revived := n.dead
 	n.dead, n.diedAt = false, time.Time{}
@@ -129,7 +140,20 @@ func (t *Tracker) Dead(name string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 
-	return n.lastSeen, true
+	return n.heard, true
+}
+
+// Alive reports whether a node is known and not declared dead, and when it
+// last gave a sign of life. Its sign of life only moves forward while it is
+// alive, so a caller can tell when something it remembers about the node
+// has fallen out of reach of any replay its death could start.
+func (t *Tracker) Alive(name string) (time.Time, bool) {
+	n, ok := t.nodes[name]
+	if !ok || n.dead {
+		return time.Time{}, false
+	}
+
+	return n.heard, true
 }
 
 // Check declares dead every node silent for longer than the threshold and
@@ -140,7 +164,9 @@ func (t *Tracker) Dead(name string) (time.Time, bool) {
 // itself stalled — a GC pause, a starved process, a laptop lid — would see
 // the whole cluster silent at once and declare everyone dead. Instead it
 // restarts every node's clock: the heartbeats that piled up in the meantime
-// are what will tell the truth, a moment later.
+// are what will tell the truth, a moment later. Only the threshold's clock
+// restarts: a node that does die is still reported with its last real sign
+// of life.
 func (t *Tracker) Check(now time.Time) []Death {
 	late := !t.checked.IsZero() && now.Sub(t.checked) > t.deadAfter/2
 	t.checked = now
@@ -154,10 +180,10 @@ func (t *Tracker) Check(now time.Time) []Death {
 				delete(t.nodes, name)
 			}
 		case late:
-			n.lastSeen = later(n.lastSeen, now)
-		case now.Sub(n.lastSeen) > t.deadAfter:
+			n.clock = later(n.clock, now)
+		case now.Sub(n.clock) > t.deadAfter:
 			n.dead, n.diedAt = true, now
-			deaths = append(deaths, Death{Node: n.name, LastSeen: n.lastSeen})
+			deaths = append(deaths, Death{Node: n.name, LastSeen: n.heard})
 		}
 	}
 
@@ -174,7 +200,7 @@ func (t *Tracker) Overdue(now time.Time) bool {
 	}
 
 	for _, n := range t.nodes {
-		if !n.dead && now.Sub(n.lastSeen) > t.deadAfter {
+		if !n.dead && now.Sub(n.clock) > t.deadAfter {
 			return true
 		}
 	}
@@ -183,13 +209,14 @@ func (t *Tracker) Overdue(now time.Time) bool {
 }
 
 // Excuse restarts every live node's clock without declaring anyone dead:
-// what a caller does when it cannot trust its own view of the cluster.
+// what a caller does when it cannot trust its own view of the cluster. As
+// with a late check, when each node was last heard from does not move.
 func (t *Tracker) Excuse(now time.Time) {
 	t.checked = now
 
 	for _, n := range t.nodes {
 		if !n.dead {
-			n.lastSeen = later(n.lastSeen, now)
+			n.clock = later(n.clock, now)
 		}
 	}
 }
@@ -197,7 +224,7 @@ func (t *Tracker) Excuse(now time.Time) {
 func (t *Tracker) lookup(name string, now time.Time) *node {
 	n, ok := t.nodes[name]
 	if !ok {
-		n = &node{name: name, lastSeen: now, dead: false, diedAt: time.Time{}}
+		n = &node{name: name, heard: now, clock: now, dead: false, diedAt: time.Time{}}
 		t.nodes[name] = n
 	}
 

@@ -143,6 +143,74 @@ func TestExcuseRestartsTheClock(t *testing.T) {
 	}
 }
 
+// An excuse delays the verdict, and must not move where the replay starts.
+// It once did: the node died at the epoch, the core could not reach the
+// sessions leader eleven seconds later and excused everyone, and the death
+// was then reported as last seen at the excuse, so the replay began after
+// the seconds it existed to recover.
+func TestExcuseKeepsTheLastSignOfLife(t *testing.T) {
+	t.Parallel()
+
+	tr := liveness.NewTracker(liveness.DeadAfter)
+	tr.Beat("edge-a", epoch)
+	tick(tr, 0, liveness.DeadAfter, nil)
+
+	excused := epoch.Add(liveness.DeadAfter + liveness.Interval)
+	tr.Excuse(excused)
+
+	early := tick(tr, liveness.DeadAfter+2*liveness.Interval, 2*liveness.DeadAfter+liveness.Interval, nil)
+	if deaths := early; len(deaths) != 0 {
+		t.Fatalf("declared dead within the threshold after the excuse: %v", deaths)
+	}
+
+	deaths := tick(tr, 2*liveness.DeadAfter+2*liveness.Interval, 3*liveness.DeadAfter, nil)
+	if len(deaths) != 1 || !deaths[0].LastSeen.Equal(epoch) {
+		t.Fatalf("deaths = %v, want edge-a last seen at the epoch, not at the excuse", deaths)
+	}
+
+	if last, dead := tr.Dead("edge-a"); !dead || !last.Equal(epoch) {
+		t.Errorf("Dead(edge-a) = %v, %v; want the epoch", last, dead)
+	}
+}
+
+// A late check is an excuse too, and the same holds.
+func TestALateCheckKeepsTheLastSignOfLife(t *testing.T) {
+	t.Parallel()
+
+	tr := liveness.NewTracker(liveness.DeadAfter)
+	tr.Beat("edge-a", epoch)
+	tr.Check(epoch)
+	tr.Check(epoch.Add(liveness.DeadAfter)) // late: restarts the clock
+
+	deaths := tick(tr, liveness.DeadAfter+liveness.Interval, 3*liveness.DeadAfter, nil)
+	if len(deaths) != 1 || !deaths[0].LastSeen.Equal(epoch) {
+		t.Fatalf("deaths = %v, want edge-a last seen at the epoch", deaths)
+	}
+}
+
+func TestAliveReportsTheLastSignOfLife(t *testing.T) {
+	t.Parallel()
+
+	tr := liveness.NewTracker(liveness.DeadAfter)
+
+	if _, alive := tr.Alive("edge-a"); alive {
+		t.Error("a node never heard of is alive")
+	}
+
+	tr.Beat("edge-a", epoch)
+	tr.Excuse(epoch.Add(liveness.Interval))
+
+	if last, alive := tr.Alive("edge-a"); !alive || !last.Equal(epoch) {
+		t.Errorf("Alive(edge-a) = %v, %v; want the epoch", last, alive)
+	}
+
+	tick(tr, 2*liveness.Interval, 3*liveness.DeadAfter, nil)
+
+	if _, alive := tr.Alive("edge-a"); alive {
+		t.Error("a dead node is alive")
+	}
+}
+
 func TestSubjectRoundTrips(t *testing.T) {
 	t.Parallel()
 

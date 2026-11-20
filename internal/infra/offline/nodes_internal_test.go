@@ -9,9 +9,11 @@ import (
 	"time"
 
 	"github.com/mastmq/mast/internal/domain/liveness"
+	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // heldOn is a record of the session held by node.
@@ -276,4 +278,142 @@ func TestGoodbyeSparesTheReplayOfSessionsThatMoved(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A verdict postponed because the core could not reach the cluster — the
+// sessions leader moving after a core kill, at the moment an edge is
+// killed — still replays from the dead node's last beat, and still covers
+// the session that moved off it, however long the postponement. Both were
+// lost once: the excuse moved the last beat forward, and the move was
+// forgotten after a fixed twenty-five seconds.
+func TestPostponedVerdictStillReplaysFromTheLastBeat(t *testing.T) {
+	t.Parallel()
+
+	q := quietQueuer()
+	start := time.Now()
+	moved := start.Add(time.Second)
+
+	q.apply(heldOn(t, "edge-a", start))
+	q.apply(heldOn(t, "edge-b", moved))
+
+	unreachable := true
+	q.reachable = func(context.Context) error {
+		if unreachable {
+			return errNoLeader
+		}
+
+		return nil
+	}
+
+	var work []reaping
+
+	// Checked every interval, as watchNodes does; the cluster is out of
+	// reach from just before the threshold until well past the old memory.
+	for at := liveness.Interval; at <= 45*time.Second; at += liveness.Interval {
+		now := start.Add(at)
+		unreachable = at >= liveness.DeadAfter && at < 30*time.Second
+
+		q.live.Beat("edge-b", now)
+
+		work = append(work, q.checkNodes(t.Context(), now)...)
+	}
+
+	if len(work) != 1 || work[0].node != "edge-a" {
+		t.Fatalf("work = %+v, want edge-a once", work)
+	}
+
+	// The record was heard a moment after start, on the queuer's own clock.
+	if got := work[0].since.Sub(start); got < -replayLead || got > -replayLead+time.Second {
+		t.Errorf("the replay starts at %v from the last beat, want about %v: before the beat, not the excuse",
+			got, -replayLead)
+	}
+
+	if len(work[0].keys) != 1 || !work[0].keys[0].until.Equal(moved) {
+		t.Errorf("targets = %+v, want the session that moved, up to %v", work[0].keys, moved)
+	}
+}
+
+// A move off a node that keeps beating is forgotten once no death of the
+// node could replay back to it.
+func TestDepartureFromALiveNodeIsForgotten(t *testing.T) {
+	t.Parallel()
+
+	q := quietQueuer()
+	start := time.Now()
+
+	q.apply(heldOn(t, "edge-a", start))
+	q.apply(heldOn(t, "edge-b", start.Add(time.Second)))
+
+	for at := liveness.Interval; at <= 2*replayLead; at += liveness.Interval {
+		now := start.Add(at)
+		q.live.Beat("edge-a", now)
+		q.live.Beat("edge-b", now)
+		q.checkNodes(t.Context(), now)
+	}
+
+	q.mu.Lock()
+	left := len(q.left)
+	q.mu.Unlock()
+
+	if left != 0 {
+		t.Errorf("%d departures remembered from a node still beating well past the move", left)
+	}
+}
+
+// A node that said goodbye is taken over like a dead one, but not counted
+// as a death: a rolling deploy is not a string of kills.
+func TestGoodbyeIsNotCountedAsADeath(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	q := newQueuer(nil, time.Hour, obs.NewMetrics(reg, obs.Sources{}), slog.New(slog.DiscardHandler))
+	start := time.Now()
+
+	q.apply(heldOn(t, "edge-a", start))
+	q.onBeat(&nats.Msg{Subject: liveness.Subject("edge-a"), Data: []byte(liveness.Goodbye)})
+
+	work := q.checkNodes(t.Context(), pastThreshold(start))
+	if len(work) != 1 || len(work[0].keys) != 1 {
+		t.Fatalf("work = %+v, want the session it still held taken over", work)
+	}
+
+	if n := counterValue(t, reg, "mast_queuer_nodes_dead_total"); n != 0 {
+		t.Errorf("a node that said goodbye was counted dead %v times", n)
+	}
+
+	q.mu.Lock()
+	remembered := len(q.farewell)
+	q.mu.Unlock()
+
+	if remembered != 0 {
+		t.Errorf("the goodbye is still remembered after its node was judged")
+	}
+
+	// A node killed outright is counted.
+	q.apply(heldOn(t, "edge-c", start))
+	q.checkNodes(t.Context(), pastThreshold(start).Add(liveness.Interval))
+	q.checkNodes(t.Context(), pastThreshold(pastThreshold(start)))
+
+	if n := counterValue(t, reg, "mast_queuer_nodes_dead_total"); n != 1 {
+		t.Errorf("a killed node was counted %v times, want once", n)
+	}
+}
+
+func counterValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
+	t.Helper()
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, f := range families {
+		if f.GetName() == name {
+			return f.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+
+	t.Fatalf("no metric %s", name)
+
+	return 0
 }

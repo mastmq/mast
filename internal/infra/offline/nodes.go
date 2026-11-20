@@ -47,9 +47,9 @@ import (
 // or two, nearly always before the threshold has passed; it is restored on
 // another node with nothing queued, and the messages published while it was
 // between the two were queued by nobody. The queuer remembers where each
-// session was last held for long enough to recognise that, and the edge's
-// straggler check thirty seconds after a connect delivers what the replay
-// queued.
+// session was last held for as long as a death of that node could still
+// replay the move, and the edge's straggler check thirty seconds after a
+// connect delivers what the replay queued.
 //
 // The memory this costs is a node name and a key per held session: about
 // a hundred bytes each, thirty megabytes per core at the 300k-device target.
@@ -58,11 +58,6 @@ import (
 // starts. Whatever the node had delivered in that time is delivered again
 // at reconnect, which at-least-once allows.
 const replayLead = 5 * time.Second
-
-// departureMemory is how long the queuer remembers the node a session moved
-// off. The node is declared dead at most DeadAfter and a check after its
-// last beat, and a move matters only if it came after the replay's start.
-const departureMemory = 2*liveness.DeadAfter + replayLead
 
 // reachTimeout bounds asking the sessions stream's leader whether this core
 // can reach it, before declaring a node dead.
@@ -263,11 +258,22 @@ func (q *Queuer) checkNodes(ctx context.Context, now time.Time) []reaping {
 	for _, d := range q.live.Check(now) {
 		r := q.collectLocked(d)
 
-		q.log.Warn("a node stopped beating without recording its sessions as away; queueing for them",
-			"node", d.Node, "last_seen", d.LastSeen, "sessions", len(r.keys))
+		// A node that said goodbye goes silent too, and is judged the same
+		// way so that what it still holds on record is taken over. It is not
+		// a crash, though: counted as one, every rolling deploy would look
+		// like a string of kills to anyone alerting on the counter.
+		if _, bye := q.farewell[d.Node]; bye {
+			if len(r.keys) > 0 {
+				q.log.Info("a node that shut down cleanly left sessions on record as held; queueing for them",
+					"node", d.Node, "sessions", len(r.keys))
+			}
+		} else {
+			q.log.Warn("a node stopped beating without recording its sessions as away; queueing for them",
+				"node", d.Node, "last_seen", d.LastSeen, "sessions", len(r.keys))
 
-		if q.metrics != nil {
-			q.metrics.QueuerNodesDead.Inc()
+			if q.metrics != nil {
+				q.metrics.QueuerNodesDead.Inc()
+			}
 		}
 
 		work = append(work, r)
@@ -275,19 +281,35 @@ func (q *Queuer) checkNodes(ctx context.Context, now time.Time) []reaping {
 
 	work = append(work, q.orphansLocked()...)
 
+	q.forgetLocked()
+
+	return work
+}
+
+// forgetLocked drops the departures and goodbyes no death can need any
+// more. Called with q.mu held, after the deaths of this check are
+// collected.
+//
+// A departure is kept until its node is judged, or until the node has given
+// a sign of life more than replayLead after the move: a replay starts
+// replayLead before the last sign of life, so from then on no death of the
+// node reaches back to the move. A fixed memory was used once, and it was
+// shorter than a verdict can take — every check the core could not trust
+// postpones it — so a device that left a killed edge lost its gap whenever
+// the verdict came late. Departures pile up only behind a node that has
+// gone quiet and not yet been judged, and only one per session.
+func (q *Queuer) forgetLocked() {
 	for key, dep := range q.left {
-		if now.Sub(dep.at) > departureMemory {
+		if last, alive := q.live.Alive(dep.node); !alive || !dep.at.After(last.Add(-replayLead)) {
 			delete(q.left, key)
 		}
 	}
 
-	for node, at := range q.farewell {
-		if now.Sub(at) > departureMemory {
+	for node := range q.farewell {
+		if _, alive := q.live.Alive(node); !alive {
 			delete(q.farewell, node)
 		}
 	}
-
-	return work
 }
 
 // collectLocked lists the sessions a dead node held, and those that moved

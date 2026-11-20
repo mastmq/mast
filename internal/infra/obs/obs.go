@@ -82,7 +82,9 @@ type Metrics struct {
 	// QueuerNodesDead counts nodes this core declared dead because their
 	// heartbeats stopped. Each one was killed outright, or was cut off or
 	// stalled for longer than the threshold — in which case its devices may
-	// receive what was queued for them twice.
+	// receive what was queued for them twice. A node that said goodbye
+	// before going silent is not counted, so a rolling deploy does not
+	// move it.
 	QueuerNodesDead prometheus.Counter
 	// QueuerReaped counts sessions this core took over from dead nodes.
 	QueuerReaped prometheus.Counter
