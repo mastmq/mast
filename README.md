@@ -36,7 +36,7 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 
 - **Per-tenant limits** — a connection limit counted across the cluster, a publish rate per node, and the size of each absent session's queue, with defaults in config, overrides per tenant, and overrides from the authentication backend. Over the limit a client is told with MQTT 5 reason codes, or the nearest thing MQTT 3.1.1 has; see [tenant limits](#tenant-limits)
 
-Not yet: a cap on the rate of new connections, full QoS for shared subscriptions whose members span nodes, and queueing for a connected device between its edge being killed outright and its reconnecting elsewhere.
+Not yet: per-tenant caps on the rate of new connections, on inbound bytes and on stored sessions and retained messages, full QoS for shared subscriptions whose members span nodes, and queueing for a connected device between its edge being killed outright and its reconnecting elsewhere. Each of these has an issue, and the [roadmap](ROADMAP.md) lists them with the rest of what comes next.
 
 ## Why
 
@@ -186,6 +186,8 @@ $ just test       # go test -race with coverage
 $ just fuzz 60s   # fuzz the topic codec
 $ just lint       # golangci-lint
 ```
+
+Questions go to [Discussions](https://github.com/mastmq/mast/discussions). [CONTRIBUTING.md](https://github.com/mastmq/.github/blob/main/CONTRIBUTING.md) covers building and testing every repository in the org, commits and style; [SECURITY.md](https://github.com/mastmq/.github/blob/main/SECURITY.md) covers reporting a vulnerability privately. What is planned is in the [roadmap](ROADMAP.md).
 
 ## License
 
