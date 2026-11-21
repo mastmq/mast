@@ -5,11 +5,13 @@ import (
 	"maps"
 	"strings"
 
+	"github.com/mastmq/mast/internal/domain/tenant"
 	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mastmq/mochi/v2"
 	"github.com/mastmq/mochi/v2/packets"
 	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -122,4 +124,26 @@ func (h *Hook) onDurable(subject string, header nats.Header, data []byte) {
 
 	fabric := fabricPrefix + strings.TrimPrefix(subject, store.DurablePrefix)
 	h.inject(fabric, header, data, "", "", viaStream)
+}
+
+// storeDurable writes a QoS 1 or 2 publish to the durable stream and marks
+// the fabric copy as stored, and reports false when the publish has to be
+// refused because the stream could not take it. QoS 0, and a node with the
+// durable fabric off, store nothing and always succeed.
+func (h *Hook) storeDurable(ctx context.Context, cl *mqtt.Client, id tenant.ID, pk packets.Packet, msg *nats.Msg) bool {
+	if pk.FixedHeader.Qos == 0 || !h.durable.Load() {
+		return true
+	}
+
+	if err := h.publishDurable(ctx, msg); err != nil {
+		trace.SpanFromContext(ctx).SetStatus(codes.Error, "refused: the durable stream could not store it")
+		h.log.Warn("refusing a publish the fabric could not store",
+			"client", cl.ID, "tenant", string(id), "error", err)
+
+		return false
+	}
+
+	msg.Header.Set(headerDurable, "1")
+
+	return true
 }

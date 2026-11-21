@@ -31,7 +31,8 @@ Litmus test for `domain`: can the package be tested with no network, no filesyst
 | Package | Job |
 | --- | --- |
 | `domain/topic` | the MQTT-topic ↔ NATS-subject codec. The most safety-critical package in the repo |
-| `domain/tenant` | `ID`, `Credentials`, `Identity`, and the `Resolver` / `Policy` interfaces |
+| `domain/tenant` | `ID`, `Credentials`, `Identity`, the `Resolver` / `Policy` interfaces, and `Limits` / `Overrides` |
+| `domain/quota` | the token bucket and the census that adds up a tenant's connections across nodes |
 | `domain/admin` | the admin API's view types, its control-plane subjects, and the merge that pages a tenant's sessions across nodes and the store |
 | `infra/bridge` | the mochi-mqtt hook that is the whole broker. `bridge.go` is ~770 lines; `subs.go` is the refcounted NATS subscription registry |
 | `infra/broker` | assembles a node from natsd + store + bridge + mqttd. Home of the end-to-end tests |
@@ -43,6 +44,7 @@ Litmus test for `domain`: can the package be tested with no network, no filesyst
 | `infra/httpauth` | the callback backend, with a TTL cache. Speaks both the mast wire and the EMQX v5 wire |
 | `infra/jwtauth` | local token verification |
 | `infra/config` | koanf: defaults → TOML → env → flags |
+| `infra/limits` | per-tenant limits on one node, and the `mast.limits.connections` reports that make the connection limit cluster-wide |
 | `infra/obs` | Prometheus metrics, `/healthz` (liveness), `/readyz` (readiness: an edge's leaf link, a core's JetStream), pprof |
 | `infra/admin` | the admin HTTP API: bearer token from a file, scatter and gather over `mast.admin.>`, the stored half from `store` |
 | `infra/tracing` | builds the OpenTelemetry tracer provider and OTLP/HTTP exporter. The spans themselves are in `bridge/trace.go` |
@@ -66,7 +68,9 @@ These are properties the tests and the docs both depend on. Breaking one is a da
 
 **Tracing off costs a comparison.** The bridge's tracer is nil when `tracing.enabled` is false, and every traced path checks for nil before it does anything else. Do not replace that with a no-op tracer: extracting a parent and building a context allocate whether or not anything records them, and the QoS 0 path is judged in allocations. `BenchmarkPublishQoS0` against the previous build is the proof, and `BenchmarkPublishQoS0Traced` is what turning it on costs.
 
-**Metric cardinality is per tenant, never per device.** 300k label series will take down Prometheus before they take down the broker.
+**Metric cardinality is per tenant, never per device.** 300k label series will take down Prometheus before they take down the broker. And per tenant is bounded too: every tenant label goes through `Metrics.Tenant`, which folds every tenant past `obs.max_tenant_labels` into `~other`. A new per-tenant metric that skips it is unbounded again.
+
+**A tenant limit never touches storage on a hot path.** The connection count crosses nodes as core NATS reports, not as a KV counter; the publish rate is a per-node token bucket. "Tenant limits" in `docs/ARCHITECTURE.md` says why each scope is what it is.
 
 ## Delivery guarantees — the current truth
 

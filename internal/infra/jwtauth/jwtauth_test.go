@@ -274,3 +274,66 @@ func TestHMACSecretFromFile(t *testing.T) {
 		t.Errorf("a secret read from file did not verify: %v", err)
 	}
 }
+
+func TestLimitsClaim(t *testing.T) {
+	t.Parallel()
+
+	v := verifier(t, func(o *jwtauth.Options) { o.LimitsClaim = "limits" })
+
+	cases := []struct {
+		name  string
+		claim any
+		want  *int
+	}{
+		{"object", map[string]any{"offline_queue": 20}, new(20)},
+		// Whoever signed the token is trusted with the tenant; a malformed
+		// limit is their bug and costs the override, not the connection.
+		{"not an object", "lots", nil},
+		{"negative", map[string]any{"offline_queue": -5}, nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			token := sign(t, jwt.SigningMethodHS512, []byte(secret), jwt.MapClaims{"tenant": "acme", "limits": tc.claim})
+
+			got, err := v.Resolve(context.Background(), tenant.Credentials{Username: token})
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+
+			switch {
+			case tc.want == nil && !got.Limits.Empty():
+				t.Errorf("limits = %+v, want none", got.Limits)
+			case tc.want != nil && (got.Limits.OfflineQueue == nil || *got.Limits.OfflineQueue != *tc.want):
+				t.Errorf("offline_queue = %v, want %d", got.Limits.OfflineQueue, *tc.want)
+			}
+		})
+	}
+}
+
+// TestLimitsClaimIsDated carries the token's iat with its limits, which is
+// what lets a node tell a token from before a tenant's plan changed from
+// one after.
+func TestLimitsClaimIsDated(t *testing.T) {
+	t.Parallel()
+
+	v := verifier(t, func(o *jwtauth.Options) { o.LimitsClaim = "limits" })
+
+	issued := time.Now().Add(-time.Minute).Truncate(time.Second)
+	token := sign(t, jwt.SigningMethodHS512, []byte(secret), jwt.MapClaims{
+		"tenant": "acme",
+		"limits": map[string]any{"max_connections": 10},
+		"iat":    issued.Unix(),
+	})
+
+	got, err := v.Resolve(context.Background(), tenant.Credentials{Username: token})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if !got.Limits.IssuedAt.Equal(issued) {
+		t.Errorf("IssuedAt = %v, want the token's iat %v", got.Limits.IssuedAt, issued)
+	}
+}

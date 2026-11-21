@@ -6,7 +6,7 @@ A gap listed here is still a gap. [Delivery guarantees](https://github.com/mastm
 
 ## The broker
 
-**Per-tenant limits** ([#25](https://github.com/mastmq/mast/issues/25)). Tenants are isolated but not limited: one tenant can take more than its share of a node in connections, publish rate or stored state. Limits per tenant, enforced without consensus state per tenant, are what make the multi-tenant claim complete.
+**The rest of per-tenant limits** ([#25](https://github.com/mastmq/mast/issues/25)). Connections (cluster-wide), publish rate (per node) and each absent session's queue are limited per tenant. Still unlimited: the rate of new connections, inbound bytes, and how many persistent sessions and retained messages a tenant holds. Each has to be enforced without consensus state per tenant, as the first three are.
 
 **Dead-edge detection** ([#26](https://github.com/mastmq/mast/issues/26)). When an edge is killed outright, the sessions of its devices stay recorded as present, so nothing queues for them until each reconnects elsewhere, and what is published in that second or so is lost. The core tier should notice the edge's leaf connection dropping and treat its sessions as away.
 

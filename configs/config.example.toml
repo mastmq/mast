@@ -132,6 +132,9 @@ public_key_file = ""
 tenant_claim = ""
 # A boolean claim that bypasses authorization, as EMQX's is_superuser does.
 superuser_claim = ""
+# An object claim overriding the tenant's limits, with the keys of a
+# [limits.tenants.<id>] entry: {"max_connections":500,"publish_rate":50}.
+limits_claim = ""
 # Checked against the token when set.
 issuer = ""
 audience = ""
@@ -155,6 +158,41 @@ durable_max_age = "5m"
 
 [obs]
 addr = "127.0.0.1:9090"  # /metrics, /healthz, /readyz and net/http/pprof
+# How many tenants get a metric label of their own on a node. The rest are
+# counted together under tenant="~other". 0 is unbounded, which is fine
+# for a handful of tenants and a Prometheus outage for ten thousand.
+max_tenant_labels = 1000
+
+[limits]
+# Every tenant's limits. A tenant's entry under [limits.tenants] overrides
+# them field by field, and the authentication backend can override both: the
+# "limits" object in an HTTP reply, or auth.jwt.limits_claim. The newest
+# statement wins (a JWT's iat, an HTTP reply's arrival), and one that names
+# no limits leaves the tenant's overrides as they were.
+#
+# Cluster-wide. Nodes exchange counts every sync_interval on core NATS, so
+# connections arriving on several nodes at once can overshoot by what they
+# accept within one interval. Refused with CONNACK 0x97 Quota exceeded on
+# MQTT 5 and 0x03 Server unavailable on 3.1.1. 0 is unlimited.
+max_connections = 0
+# PUBLISH packets per second per tenant, enforced per node. QoS 0 past it is
+# dropped; MQTT 5 QoS 1 gets PUBACK 0x96 Message rate too high; MQTT 5 QoS 2
+# and MQTT 3.1.1 QoS 1/2 are disconnected. 0 is unlimited.
+publish_rate = 0
+# Publishes that may arrive at once before the rate applies. 0 is one
+# second's worth.
+publish_burst = 0
+# QoS 1/2 messages kept for one absent session, newest first. The largest
+# value configured here or under [limits.tenants] is what the offline stream
+# keeps per session; an authentication override can only lower it. It also
+# bounds what a device returning to the node it left is resent, which before
+# limits was everything mochi held, up to thousands.
+offline_queue = 100
+sync_interval = "2s"
+
+# [limits.tenants.acme]
+# max_connections = 5000
+# publish_rate = 200
 
 [admin]
 # The administrative HTTP API: list a tenant's sessions, read one, disconnect

@@ -258,6 +258,10 @@ type authnRequest struct {
 type authnResponse struct {
 	Allow  bool   `json:"allow"`
 	Tenant string `json:"tenant"`
+	// Limits overrides the configured limits of the tenant for as long as
+	// this connection's authentication is the latest one the node has seen
+	// for it. Optional, and each field in it is.
+	Limits tenant.Overrides `json:"limits"`
 }
 
 // authzRequest is the body posted to AuthzURL.
@@ -337,7 +341,25 @@ func (c *Client) Resolve(ctx context.Context, creds tenant.Credentials) (tenant.
 		return tenant.Identity{}, ErrNoTenant
 	}
 
-	return tenant.Identity{Tenant: tenant.ID(reply.Tenant), Superuser: false}, nil
+	// A negative limit is a bug in the service, not a decision. Refusing
+	// the connection over it would turn that bug into an outage, so the
+	// configured limits apply instead and the log says why.
+	limits := reply.Limits
+	if err := limits.Validate(); err != nil {
+		c.log.Warn("ignoring the limits in an authentication reply",
+			"client", creds.ClientID, "tenant", reply.Tenant, "error", err)
+
+		var none tenant.Overrides
+
+		limits = none
+	}
+
+	// Authentication replies are never cached, so each is the service's
+	// word as of now, and orders against the tenant's earlier ones by when
+	// it arrived.
+	limits.IssuedAt = time.Now()
+
+	return tenant.Identity{Tenant: tenant.ID(reply.Tenant), Superuser: false, Limits: limits}, nil
 }
 
 // Allows implements [tenant.Policy].
@@ -475,7 +497,10 @@ func (c *Client) resolveEMQX(ctx context.Context, creds tenant.Credentials) (ten
 		return tenant.Identity{}, ErrDenied
 	}
 
-	return tenant.Identity{Tenant: c.opts.Tenant, Superuser: reply.IsSuperuser}, nil
+	// EMQX's reply has no place for limits, so the configured ones apply.
+	var none tenant.Overrides
+
+	return tenant.Identity{Tenant: c.opts.Tenant, Superuser: reply.IsSuperuser, Limits: none}, nil
 }
 
 // ask puts one authorization question to the service in the configured wire

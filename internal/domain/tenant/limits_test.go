@@ -1,0 +1,111 @@
+package tenant_test
+
+import (
+	"encoding/json"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/mastmq/mast/internal/domain/tenant"
+)
+
+func TestLimitsWithOverridesOnlyWhatIsSet(t *testing.T) {
+	t.Parallel()
+
+	base := tenant.Limits{MaxConnections: 10, PublishRate: 5, PublishBurst: 0, OfflineQueue: 100}
+	queue := 20
+
+	got := base.With(tenant.Overrides{OfflineQueue: &queue})
+
+	want := tenant.Limits{MaxConnections: 10, PublishRate: 5, PublishBurst: 0, OfflineQueue: 20}
+	if got != want {
+		t.Errorf("With = %+v, want %+v", got, want)
+	}
+}
+
+func TestOverridesWireFormat(t *testing.T) {
+	t.Parallel()
+
+	var o tenant.Overrides
+	if err := json.Unmarshal([]byte(`{"max_connections":0,"publish_rate":2.5}`), &o); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+
+	// An explicit zero is "unlimited", which is a decision, and must not be
+	// confused with a field the service left out.
+	if o.MaxConnections == nil || *o.MaxConnections != 0 {
+		t.Errorf("max_connections = %v, want an explicit 0", o.MaxConnections)
+	}
+
+	if o.PublishRate == nil || *o.PublishRate != 2.5 {
+		t.Errorf("publish_rate = %v, want 2.5", o.PublishRate)
+	}
+
+	if o.OfflineQueue != nil {
+		t.Errorf("offline_queue = %v, want unset", *o.OfflineQueue)
+	}
+}
+
+func TestOverridesValidate(t *testing.T) {
+	t.Parallel()
+
+	negative := -1
+	if err := (tenant.Overrides{PublishBurst: &negative}).Validate(); !errors.Is(err, tenant.ErrBadLimit) {
+		t.Errorf("a negative burst validated: %v", err)
+	}
+
+	if err := (tenant.Overrides{}).Validate(); err != nil {
+		t.Errorf("no overrides failed to validate: %v", err)
+	}
+}
+
+func TestBurstDefaultsToOneSecond(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		limits tenant.Limits
+		want   float64
+	}{
+		{tenant.Limits{PublishRate: 50}, 50},
+		{tenant.Limits{PublishRate: 50, PublishBurst: 7}, 7},
+		// Below one a second, a one-second bucket would never hold a whole
+		// token and would refuse everything.
+		{tenant.Limits{PublishRate: 0.2}, 1},
+	}
+
+	for _, tc := range cases {
+		if got := tc.limits.Burst(); got != tc.want {
+			t.Errorf("Burst(%+v) = %v, want %v", tc.limits, got, tc.want)
+		}
+	}
+}
+
+func TestSupersedes(t *testing.T) {
+	t.Parallel()
+
+	early, late := time.Unix(1_700_000_000, 0), time.Unix(1_700_000_600, 0)
+	queue := func(at time.Time) tenant.Overrides {
+		return tenant.Overrides{OfflineQueue: new(5), IssuedAt: at}
+	}
+
+	cases := []struct {
+		name          string
+		next, current tenant.Overrides
+		want          bool
+	}{
+		{"the first statement", queue(early), tenant.Overrides{}, true},
+		{"a newer one", queue(late), queue(early), true},
+		// A device still holding a token from before the plan changed.
+		{"an older one", queue(early), queue(late), false},
+		// Saying nothing is not saying "unlimited".
+		{"an empty one", tenant.Overrides{IssuedAt: late}, queue(early), false},
+		{"an undated one over a dated one", queue(time.Time{}), queue(early), false},
+		{"an undated one over an undated one", queue(time.Time{}), queue(time.Time{}), true},
+	}
+
+	for _, tc := range cases {
+		if got := tc.next.Supersedes(tc.current); got != tc.want {
+			t.Errorf("%s: Supersedes = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

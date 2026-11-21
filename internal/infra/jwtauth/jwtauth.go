@@ -17,6 +17,7 @@ package jwtauth
 import (
 	"context"
 	"crypto"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -90,6 +91,10 @@ type Options struct {
 	// SuperuserClaim names a boolean claim that bypasses authorization, the
 	// same way EMQX's is_superuser does.
 	SuperuserClaim string
+
+	// LimitsClaim names an object claim carrying the tenant's limits, in the
+	// same shape an HTTP authentication reply carries them. Empty ignores it.
+	LimitsClaim string
 
 	// Issuer and Audience, when set, must match the token.
 	Issuer   string
@@ -179,7 +184,53 @@ func (v *Verifier) Resolve(_ context.Context, creds tenant.Credentials) (tenant.
 		return tenant.Identity{}, err
 	}
 
-	return tenant.Identity{Tenant: id, Superuser: v.superuserFrom(claims)}, nil
+	return tenant.Identity{Tenant: id, Superuser: v.superuserFrom(claims), Limits: v.limitsFrom(claims)}, nil
+}
+
+// limitsFrom reads the limits claim. A claim that is not an object of the
+// expected shape, or that names a negative limit, is ignored rather than
+// refused: whoever signed the token is trusted with the tenant, and a
+// malformed limit is a bug of theirs that should cost the tenant its
+// override, not its connection.
+func (v *Verifier) limitsFrom(claims jwt.MapClaims) tenant.Overrides {
+	var none tenant.Overrides
+
+	raw, ok := claims[v.opts.LimitsClaim]
+	if v.opts.LimitsClaim == "" || !ok {
+		return none
+	}
+
+	// The claim arrives as a generic map. A round trip through JSON reads
+	// it with the same field names and types the HTTP backend uses, rather
+	// than a second decoder that could disagree with it.
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return none
+	}
+
+	var limits tenant.Overrides
+
+	if err := json.Unmarshal(encoded, &limits); err != nil {
+		v.log.Warn("ignoring a limits claim that is not an object of limits", "error", err)
+
+		return none
+	}
+
+	if err := limits.Validate(); err != nil {
+		v.log.Warn("ignoring a limits claim", "error", err)
+
+		return none
+	}
+
+	// The token's iat orders it against the tenant's other devices' tokens,
+	// so one issued before the tenant's plan changed cannot restore the old
+	// limits. A token without one is undated, which the limiter treats as
+	// older than any dated one.
+	if iat, err := claims.GetIssuedAt(); err == nil && iat != nil {
+		limits.IssuedAt = iat.Time
+	}
+
+	return limits
 }
 
 // tenantFrom reads the tenant claim, falling back to the configured tenant.

@@ -53,6 +53,19 @@ const defaultConnectTimeout = 10 * time.Second
 // is the main driver of memory at high connection counts.
 const defaultMaxWritesPending = 1024
 
+// defaultOfflineQueue is how many messages an absent session keeps unless
+// configured otherwise. It was a constant of the store before it was a
+// limit, and stays what it was.
+const defaultOfflineQueue = 100
+
+// defaultLimitsSync is how often nodes exchange connection counts. Shorter
+// tightens a cluster-wide connection limit and costs a message per node per
+// interval to every other node.
+const defaultLimitsSync = 2 * time.Second
+
+// defaultMaxTenantLabels bounds per-tenant metric series per node.
+const defaultMaxTenantLabels = 1000
+
 // Role selects which job a mast process does in a cluster.
 //
 // The split exists because the two jobs have opposite operational shapes. An
@@ -103,6 +116,7 @@ type Config struct {
 	Auth    Auth    `json:"auth"    koanf:"auth"`
 	Session Session `json:"session" koanf:"session"`
 	Fabric  Fabric  `json:"fabric"  koanf:"fabric"`
+	Limits  Limits  `json:"limits"  koanf:"limits"`
 	Admin   Admin   `json:"admin"   koanf:"admin"`
 	Tracing Tracing `json:"tracing" koanf:"tracing"`
 }
@@ -166,6 +180,70 @@ func Samplers() []string {
 		"always_on", "always_off", "traceidratio",
 		"parentbased_always_on", "parentbased_always_off", "parentbased_traceidratio",
 	}
+}
+
+// Limits configures what each tenant may use. The fields at the top are
+// every tenant's defaults; Tenants overrides them for named tenants, and an
+// authentication backend may override both for the tenant it names.
+//
+// Each limit has the scope it can be enforced at cheaply, which is why they
+// differ; docs/ARCHITECTURE.md has the reasons.
+type Limits struct {
+	// MaxConnections caps a tenant's open connections across the cluster.
+	// The count is exchanged between nodes every SyncInterval, so a burst of
+	// connections spread over several nodes can overshoot it by what they
+	// accept within one interval. Zero is unlimited.
+	MaxConnections int `json:"max_connections" koanf:"max_connections"`
+	// PublishRate is how many PUBLISH packets per second one tenant may send
+	// through one node. Per node, not per cluster: see ARCHITECTURE.md. Zero
+	// is unlimited.
+	PublishRate float64 `json:"publish_rate" koanf:"publish_rate"`
+	// PublishBurst is how many publishes may arrive at once before the rate
+	// applies. Zero is one second's worth.
+	PublishBurst int `json:"publish_burst" koanf:"publish_burst"`
+	// OfflineQueue is how many QoS 1 and 2 messages are kept for one absent
+	// session. The largest value in the configuration is also what the core
+	// configures the offline stream to keep per session, so an override from
+	// the authentication backend can lower a tenant's queue but never raise
+	// it past that.
+	OfflineQueue int `json:"offline_queue" koanf:"offline_queue"`
+	// SyncInterval is how often a node tells the others how many connections
+	// it holds for each tenant.
+	SyncInterval time.Duration `json:"sync_interval" koanf:"sync_interval"`
+	// Tenants overrides the defaults above for individual tenants. A field
+	// left out keeps the default.
+	Tenants map[string]TenantLimits `json:"tenants" koanf:"tenants"`
+}
+
+// TenantLimits overrides some of the default [Limits] for one tenant. A nil
+// field is one the tenant's entry did not set.
+type TenantLimits struct {
+	MaxConnections *int     `json:"max_connections" koanf:"max_connections"`
+	PublishRate    *float64 `json:"publish_rate"    koanf:"publish_rate"`
+	PublishBurst   *int     `json:"publish_burst"   koanf:"publish_burst"`
+	OfflineQueue   *int     `json:"offline_queue"   koanf:"offline_queue"`
+}
+
+// valid reports whether every limit t sets can mean something.
+func (t TenantLimits) valid() bool {
+	return (t.MaxConnections == nil || *t.MaxConnections >= 0) &&
+		(t.PublishRate == nil || *t.PublishRate >= 0) &&
+		(t.PublishBurst == nil || *t.PublishBurst >= 0) &&
+		(t.OfflineQueue == nil || *t.OfflineQueue >= 1)
+}
+
+// QueueCeiling is the most messages any session's queue may need: the
+// default, or a tenant's override when one is larger.
+func (l Limits) QueueCeiling() int {
+	ceiling := l.OfflineQueue
+
+	for _, t := range l.Tenants {
+		if t.OfflineQueue != nil {
+			ceiling = max(ceiling, *t.OfflineQueue)
+		}
+	}
+
+	return ceiling
 }
 
 // Fabric configures how messages cross between nodes.
@@ -249,6 +327,10 @@ type AuthJWTConfig struct {
 	// SuperuserClaim names a boolean claim that bypasses authorization, the
 	// same way EMQX's is_superuser does.
 	SuperuserClaim string `json:"superuser_claim" koanf:"superuser_claim"`
+
+	// LimitsClaim names an object claim overriding the tenant's limits, with
+	// the keys of [TenantLimits].
+	LimitsClaim string `json:"limits_claim" koanf:"limits_claim"`
 
 	// Issuer and Audience, when set, must match the token.
 	Issuer   string `json:"issuer"   koanf:"issuer"`
@@ -363,6 +445,11 @@ type Observ struct {
 	// Addr serves /metrics and, because it costs nothing and pays for itself
 	// the first time a goroutine leaks, net/http/pprof.
 	Addr string `json:"addr" koanf:"addr"`
+	// MaxTenantLabels bounds how many tenants get a label value of their own
+	// on a node; every tenant after that is counted under "~other". A
+	// deployment with tens of thousands of tenants would otherwise multiply
+	// every per-tenant metric by that many series.
+	MaxTenantLabels int `json:"max_tenant_labels" koanf:"max_tenant_labels"`
 }
 
 // Default returns the configuration mast uses when nothing overrides it: a
@@ -400,7 +487,8 @@ func Default() Config {
 			Credentials: "",
 		},
 		Obs: Observ{
-			Addr: "127.0.0.1:9090",
+			Addr:            "127.0.0.1:9090",
+			MaxTenantLabels: defaultMaxTenantLabels,
 		},
 		Tenant: Tenant{
 			Default: "default",
@@ -412,7 +500,8 @@ func Default() Config {
 			DurableQoS:    true,
 			DurableMaxAge: defaultDurableMaxAge,
 		},
-		Auth: defaultAuth(),
+		Auth:   defaultAuth(),
+		Limits: defaultLimits(),
 		Admin: Admin{
 			Addr:      "",
 			TokenFile: "",
@@ -424,6 +513,19 @@ func Default() Config {
 			Sampler:    "",
 			SamplerArg: "",
 		},
+	}
+}
+
+// defaultLimits is split out of [Default], like [defaultAuth], only for
+// length.
+func defaultLimits() Limits {
+	return Limits{
+		MaxConnections: 0,
+		PublishRate:    0,
+		PublishBurst:   0,
+		OfflineQueue:   defaultOfflineQueue,
+		SyncInterval:   defaultLimitsSync,
+		Tenants:        nil,
 	}
 }
 
@@ -451,6 +553,7 @@ func defaultAuth() Auth {
 			PublicKeyFile:  "",
 			TenantClaim:    "",
 			SuperuserClaim: "",
+			LimitsClaim:    "",
 			Issuer:         "",
 			Audience:       "",
 		},
@@ -553,6 +656,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("%w: got %v", ErrBadDurableMaxAge, c.Fabric.DurableMaxAge)
 	}
 
+	if err := c.validateLimits(); err != nil {
+		return err
+	}
+
 	if err := c.validateAdmin(); err != nil {
 		return err
 	}
@@ -562,6 +669,38 @@ func (c Config) Validate() error {
 	}
 
 	return c.validateAuth()
+}
+
+// validateLimits checks that every limit can mean something.
+func (c Config) validateLimits() error {
+	l := c.Limits
+
+	if l.MaxConnections < 0 || l.PublishRate < 0 || l.PublishBurst < 0 {
+		return fmt.Errorf("%w: limits.max_connections, publish_rate and publish_burst", ErrBadLimit)
+	}
+
+	// A queue of nothing is not a limit, it is a broker that drops every
+	// message for an absent device; session.expiry zero is how to ask for
+	// that honestly.
+	if l.OfflineQueue < 1 {
+		return fmt.Errorf("%w: limits.offline_queue must be at least 1, got %d", ErrBadLimit, l.OfflineQueue)
+	}
+
+	if l.SyncInterval <= 0 {
+		return fmt.Errorf("%w: limits.sync_interval must be positive", ErrBadLimit)
+	}
+
+	for name, t := range l.Tenants {
+		if !t.valid() {
+			return fmt.Errorf("%w: limits.tenants.%s", ErrBadLimit, name)
+		}
+	}
+
+	if c.Obs.MaxTenantLabels < 0 {
+		return fmt.Errorf("%w: obs.max_tenant_labels", ErrBadLimit)
+	}
+
+	return nil
 }
 
 // validateAdmin refuses an admin API that would be open, or that could

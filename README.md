@@ -33,16 +33,17 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 - **Portable sessions** — subscriptions live in a shared bucket and the offline queue on a shared stream, filled by the core tier, so a device that reconnects to a different node finds its session and whatever QoS 1 or 2 traffic it missed, even when the edge it last used has since been restarted. Verified by a cluster test and by killing cores and edges under load in a three-core, three-edge cluster
 - **Tracing, when asked for** — OpenTelemetry spans for a publish, its durable store, its NATS hop and every node's delivery of it, exported over OTLP/HTTP. Trace context crosses nodes in W3C headers on the NATS message, and an MQTT 5 client that sends a `traceparent` user property has its publish traced inside its own trace and its subscribers handed the span that delivered to them. Off by default, and off it costs the publish path a comparison; see [Tracing](#tracing)
 - **Cross-node takeover** — a second connection with an existing client id disconnects the first wherever in the cluster it is, which MQTT requires and a single node cannot do alone. Client ids are scoped to their tenant, so one tenant cannot displace another's device by reusing an id
+- **Per-tenant limits** — a connection limit counted across the cluster, a publish rate per node, and the size of each absent session's queue, with defaults in config, overrides per tenant, and overrides from the authentication backend. Over the limit a client is told with MQTT 5 reason codes, or the nearest thing MQTT 3.1.1 has; see [tenant limits](#tenant-limits)
 
 An [admin API](#admin-api), off by default, lists and disconnects a tenant's sessions across the cluster. End-to-end tests cover it; the fire drills have not run against it yet.
 
-Not yet: per-tenant quotas, connection rate limiting, full QoS for shared subscriptions whose members span nodes, and queueing for a connected device between its edge being killed outright and its reconnecting elsewhere. Each of these has an issue, and the [roadmap](ROADMAP.md) lists them with the rest of what comes next.
+Not yet: per-tenant caps on the rate of new connections, on inbound bytes and on stored sessions and retained messages, full QoS for shared subscriptions whose members span nodes, and queueing for a connected device between its edge being killed outright and its reconnecting elsewhere. Each of these has an issue, and the [roadmap](ROADMAP.md) lists them with the rest of what comes next.
 
 ## Why
 
 Every open-source MQTT broker that does real multi-tenancy makes you give something up. EMQX adopted the Business Source License in 5.9, and forming a cluster from multiple nodes now requires a paid license key. BifroMQ has genuine native multi-tenancy but runs on the JVM. VerneMQ's source is Apache 2.0 while its official packages and Docker images are governed by a EULA that charges for commercial use. RabbitMQ gives you vhosts but supports neither QoS 2 nor shared subscriptions. Mosquitto, NanoMQ, FlashMQ and mochi-mqtt do not cluster at all.
 
-mast is the combination that does not currently exist off the shelf: MQTT 5 with shared subscriptions, tenant isolation, free clustering, no JVM, and a single binary you can also run standalone at a customer site. Per-tenant limits are the piece still missing: tenants cannot see each other's traffic, but one tenant can still use more than its share of a node (see [what works](#what-works)).
+mast is the combination that does not currently exist off the shelf: MQTT 5 with shared subscriptions, tenant isolation with per-tenant limits, free clustering, no JVM, and a single binary you can also run standalone at a customer site.
 
 ## Design
 
@@ -126,6 +127,28 @@ The tenant comes from `auth.jwt.tenant_claim`, and `auth.jwt.superuser_claim` by
 ### Both
 
 Two things worth knowing before you point this at production. Authorization is asked **on every publish**, so it is cached with a TTL — set `cache_ttl = "0s"` if decisions must take effect instantly, and accept a network round trip per message. And authentication **always fails closed** whatever `on_error` says, because admitting a connection whose tenant is unknown would mean inventing an isolation boundary; `on_error` governs authorization only.
+
+## Tenant limits
+
+Three limits, under `[limits]` in the config. Each one's scope is where it can be enforced without a storage write on the hot path:
+
+| Limit | Scope | Over the limit |
+| --- | --- | --- |
+| `max_connections` | cluster-wide, approximate | CONNACK 0x97 Quota exceeded (MQTT 5), 0x03 Server unavailable (3.1.1) |
+| `publish_rate`, `publish_burst` | per tenant, per node | QoS 0 dropped; MQTT 5 QoS 1 gets PUBACK 0x96 Message rate too high; MQTT 5 QoS 2 and 3.1.1 QoS 1/2 are disconnected |
+| `offline_queue` | per absent session | the oldest queued messages are discarded |
+
+`offline_queue` defaults to 100 and applies with no `[limits]` section at all. Before limits existed, a device that came back to the node it left was resent everything mochi held for it, up to mochi's inflight maximum of thousands, while a device that came back on another node got the stream's newest 100. Now both get the newest 100. Set `offline_queue` higher, under `[limits]` or for one tenant, to keep more.
+
+The connection count is shared by every node publishing its per-tenant counts on core NATS every `sync_interval` (2s), so connections arriving on several nodes within one interval can overshoot the limit by that many. Nothing goes through JetStream: a strict count would put a replicated write on every CONNECT, which is what a reconnect storm cannot pay. A device taking over its own client id on the same node is always admitted.
+
+`[limits.tenants.<id>]` overrides the defaults field by field. The authentication backend can override both, because it is the system that knows what each tenant has paid for: a `limits` object in the HTTP reply, or the JWT claim named by `auth.jwt.limits_claim`, with the same keys:
+
+```json
+{"allow": true, "tenant": "acme", "limits": {"max_connections": 5000, "publish_rate": 200, "offline_queue": 50}}
+```
+
+The newest statement wins, per tenant per node. A reply or token that says nothing about limits leaves the tenant's overrides as they were; it is not a statement that the tenant has none. A JWT's `iat` orders it against the tenant's other devices' tokens, so a device still holding a token from before the tenant's plan changed cannot put the old limits back; a token without `iat` never replaces one with it. An HTTP reply is dated when it arrives. Once set, an override from authentication stays until a newer one replaces it, so lifting it takes a newer token or reply that states the configured value. Because each node keeps what it last heard, two nodes can enforce different limits for a tenant until each has seen a connection with the newest token. An override can lower a tenant's offline queue but not raise it past the largest value in the config, which is what the core tells the stream to keep per session. `mast_limit_exceeded_total{tenant, limit}` counts what each limit refused, and `obs.max_tenant_labels` (1000) bounds how many tenants get a label of their own; the rest are counted as `~other`.
 
 ## Admin API
 

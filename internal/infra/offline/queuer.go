@@ -469,7 +469,7 @@ func (q *Queuer) flush() error {
 		stored, err := q.settle(p)
 
 		if stored > 0 && q.metrics != nil {
-			q.metrics.OfflineQueued.WithLabelValues(p.tenant).Add(float64(stored))
+			q.metrics.OfflineQueued.WithLabelValues(q.metrics.Tenant(p.tenant)).Add(float64(stored))
 		}
 
 		if err != nil {

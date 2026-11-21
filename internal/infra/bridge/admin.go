@@ -168,7 +168,7 @@ func (h *Hook) connected(id tenant.ID, clientID string) (*mqtt.Client, bool) {
 	owner, open := h.open[cl]
 	h.mu.Unlock()
 
-	return cl, open && owner == id
+	return cl, open && owner.tenant == id
 }
 
 // windowIn describes this node's clients in a tenant after the cursor, in

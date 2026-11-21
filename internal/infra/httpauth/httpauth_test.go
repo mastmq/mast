@@ -599,3 +599,46 @@ func TestEMQXSuperuserSkipsAuthz(t *testing.T) {
 		t.Errorf("authentication made %d authorization calls", authzCalls.Load())
 	}
 }
+
+// TestResolveCarriesLimits covers the service naming a tenant's limits in
+// its reply, and a malformed limit costing the tenant its override rather
+// than its connection.
+func TestResolveCarriesLimits(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		limits map[string]any
+		want   *int
+	}{
+		{"named", map[string]any{"max_connections": 7, "publish_rate": 1.5}, new(7)},
+		{"negative", map[string]any{"max_connections": -1}, nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newServer(t, func(map[string]any) (int, any) {
+				return http.StatusOK, map[string]any{"allow": true, "tenant": "acme", "limits": tc.limits}
+			})
+
+			c, err := httpauth.New(httpauth.Options{AuthnURL: srv.URL, Timeout: time.Second}, discard())
+			if err != nil {
+				t.Fatalf("building client: %v", err)
+			}
+
+			got, err := c.Resolve(context.Background(), tenant.Credentials{ClientID: "dev-1"})
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+
+			switch {
+			case tc.want == nil && !got.Limits.Empty():
+				t.Errorf("limits = %+v, want none", got.Limits)
+			case tc.want != nil && (got.Limits.MaxConnections == nil || *got.Limits.MaxConnections != *tc.want):
+				t.Errorf("max_connections = %v, want %d", got.Limits.MaxConnections, *tc.want)
+			}
+		})
+	}
+}

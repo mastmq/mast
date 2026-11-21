@@ -33,6 +33,9 @@ var (
 	// on nothing, which is the failure the stream exists to prevent.
 	ErrBadDurableMaxAge = errors.New("config: fabric.durable_max_age must be positive when fabric.durable_qos is on")
 
+	// ErrBadLimit is returned for a tenant limit that cannot mean anything.
+	ErrBadLimit = errors.New("config: invalid limit")
+
 	// ErrAdminNeedsToken guards against an admin API anyone who can reach
 	// it may use: it lists every tenant's devices and disconnects them.
 	ErrAdminNeedsToken = errors.New("config: admin.addr requires admin.token_file")

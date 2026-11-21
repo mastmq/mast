@@ -19,6 +19,7 @@ import (
 	"github.com/mastmq/mast/internal/infra/admin"
 	"github.com/mastmq/mast/internal/infra/bridge"
 	"github.com/mastmq/mast/internal/infra/config"
+	"github.com/mastmq/mast/internal/infra/limits"
 	"github.com/mastmq/mast/internal/infra/mqttd"
 	"github.com/mastmq/mast/internal/infra/natsd"
 	"github.com/mastmq/mast/internal/infra/obs"
@@ -42,6 +43,7 @@ const storeOpenTimeout = 30 * time.Second
 type Broker struct {
 	nats   *natsd.Server
 	hook   *bridge.Hook
+	limits *limits.Limiter
 	server *mqtt.Server
 	store  *store.Store
 	obs    *obs.Server
@@ -114,7 +116,7 @@ func Start(
 	life, shutdown := context.WithCancel(context.WithoutCancel(ctx))
 
 	b := &Broker{
-		nats: nats, hook: nil, server: nil, store: nil, obs: nil, admin: nil, log: log, tracing: nil,
+		nats: nats, hook: nil, limits: nil, server: nil, store: nil, obs: nil, admin: nil, log: log, tracing: nil,
 		serving: atomic.Bool{}, closeOnce: sync.Once{},
 		life: life, shutdown: shutdown, wg: sync.WaitGroup{},
 		queueMu: sync.Mutex{}, queuer: nil, queueStore: nil,
@@ -123,7 +125,7 @@ func Start(
 	// The subscription gauge reads through the hook, so the registry is
 	// built before it and handed the accessor.
 	registry := newRegistry()
-	metrics := obs.NewMetrics(registry, sources(b, nats))
+	metrics := obs.NewMetrics(registry, sources(b, nats), cfg.Obs.MaxTenantLabels)
 
 	// Before the role check, because every role needs it. It used to come
 	// after, so a core — the node holding Raft and every bucket — served no
@@ -247,7 +249,8 @@ func open(ctx context.Context, cfg config.Config, nats *natsd.Server) (*store.St
 		return st, err
 	}
 
-	st, err := store.Open(ctx, nats.Conn(), natsd.JetStreamDomain, cfg.Core.Replicas, cfg.Session.Expiry)
+	st, err := store.Open(ctx, nats.Conn(), natsd.JetStreamDomain, cfg.Core.Replicas, cfg.Session.Expiry,
+		store.WithQueueLimit(cfg.Limits.QueueCeiling()))
 	if err == nil && cfg.Fabric.DurableQoS {
 		err = st.OpenDurable(ctx, cfg.Core.Replicas, cfg.Fabric.DurableMaxAge)
 	}
@@ -342,6 +345,10 @@ func (b *Broker) close() {
 	b.wg.Wait()
 	b.stopQueuer()
 	b.stopTracing(b.life)
+
+	if b.limits != nil {
+		b.limits.Stop()
+	}
 
 	if b.store != nil {
 		b.store.Close()
@@ -513,6 +520,10 @@ func (b *Broker) abort() {
 	b.shutdown()
 	b.stopTracing(b.life)
 
+	if b.limits != nil {
+		b.limits.Stop()
+	}
+
 	if b.store != nil {
 		b.store.Close()
 	}
@@ -528,6 +539,11 @@ func (b *Broker) serveMQTT(
 	policy tenant.Policy,
 	metrics *obs.Metrics,
 ) error {
+	b.limits = limits.New(b.nats.Conn(), limitOptions(cfg, b.nats.ID()), b.log)
+	if err := b.limits.Start(); err != nil {
+		return fmt.Errorf("broker: starting tenant limits: %w", err)
+	}
+
 	tp, err := b.startTracing(cfg)
 	if err != nil {
 		return err
@@ -543,6 +559,7 @@ func (b *Broker) serveMQTT(
 		NodeID:         b.nats.ID(),
 		SessionExpiry:  cfg.Session.Expiry,
 		DurableQoS:     cfg.Fabric.DurableQoS,
+		Limits:         b.limits,
 		TracerProvider: tp,
 	}, b.log)
 
@@ -559,6 +576,39 @@ func (b *Broker) serveMQTT(
 	}
 
 	return nil
+}
+
+// limitOptions turns the limits section of the configuration into what the
+// limiter enforces.
+func limitOptions(cfg config.Config, nodeID string) limits.Options {
+	l := cfg.Limits
+
+	tenants := make(map[tenant.ID]tenant.Overrides, len(l.Tenants))
+	for name, t := range l.Tenants {
+		tenants[tenant.ID(name)] = tenant.Overrides{
+			MaxConnections: t.MaxConnections,
+			PublishRate:    t.PublishRate,
+			PublishBurst:   t.PublishBurst,
+			OfflineQueue:   t.OfflineQueue,
+			IssuedAt:       time.Time{}, // configured, not stated by authentication
+		}
+	}
+
+	return limits.Options{
+		Defaults: tenant.Limits{
+			MaxConnections: l.MaxConnections,
+			PublishRate:    l.PublishRate,
+			PublishBurst:   l.PublishBurst,
+			OfflineQueue:   l.OfflineQueue,
+		},
+		Tenants: tenants,
+		// An edge does not provision the stream, so it can only assume the
+		// cores were given the same configuration it was. The chart and the
+		// Ansible role render one file for both.
+		Ceiling:  l.QueueCeiling(),
+		Interval: l.SyncInterval,
+		NodeID:   nodeID,
+	}
 }
 
 // tracingShutdown bounds the flush of the spans still queued when a node
