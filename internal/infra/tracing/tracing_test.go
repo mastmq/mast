@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/mastmq/mast/internal/infra/config"
@@ -272,5 +274,64 @@ func TestStartDialsNothing(t *testing.T) {
 
 	if p.TracerProvider() == nil {
 		t.Fatal("no tracer provider")
+	}
+}
+
+// TestEndpointIsTheCollectorsAddress covers the documented form of
+// tracing.endpoint, a collector's address with no path. It used to be
+// passed to the exporter as the whole traces URL, so spans were posted to
+// "/", the collector answered 404, and tracing turned on as the README,
+// the chart and the Ansible role show it exported nothing at all.
+func TestEndpointIsTheCollectorsAddress(t *testing.T) {
+	t.Parallel()
+
+	paths := make(chan string, 16)
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(collector.Close)
+
+	p, err := tracing.Start(t.Context(), config.Tracing{
+		Enabled: true, Endpoint: collector.URL, Sampler: "always_on", SamplerArg: "",
+	}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	_, span := p.TracerProvider().Tracer("test").Start(t.Context(), "probe")
+	span.End()
+
+	// Shutdown flushes the batch, so the export has happened when it returns.
+	if err := p.Shutdown(t.Context()); err != nil {
+		t.Fatalf("Shutdown, which flushes the span: %v", err)
+	}
+
+	select {
+	case got := <-paths:
+		if got != "/v1/traces" {
+			t.Errorf("spans were posted to %q, want /v1/traces", got)
+		}
+	default:
+		t.Fatal("the collector received nothing")
+	}
+}
+
+// TestTracesURL keeps a full URL as it is and gives an address the
+// standard path, the way the SDK reads its two endpoint variables.
+func TestTracesURL(t *testing.T) {
+	t.Parallel()
+
+	for in, want := range map[string]string{
+		"http://otel-collector:4318":              "http://otel-collector:4318/v1/traces",
+		"http://otel-collector:4318/":             "http://otel-collector:4318/v1/traces",
+		"https://collector.example.com":           "https://collector.example.com/v1/traces",
+		"http://otel-collector:4318/v1/traces":    "http://otel-collector:4318/v1/traces",
+		"https://gateway.example.com/otlp/traces": "https://gateway.example.com/otlp/traces",
+	} {
+		if got := tracing.TracesURL(in); got != want {
+			t.Errorf("TracesURL(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
