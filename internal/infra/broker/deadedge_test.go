@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mastmq/mast/internal/domain/liveness"
+	"github.com/mastmq/mast/internal/infra/config"
 )
 
 // deathSettle bounds how long a test waits for the cores to notice a node
@@ -179,6 +180,60 @@ func TestClusterDeviceLeavingAKilledEdgeGetsTheGap(t *testing.T) {
 	if !waitUntil(45*time.Second, func() bool { return count(back.messages(), cmd) >= gap }) {
 		t.Fatalf("%d of %d messages published while the device moved off a killed edge reached it: %v",
 			count(back.messages(), cmd), gap, back.messages())
+	}
+}
+
+// TestClusterKilledEdgeQueueIsBounded holds the replay to the tenant's
+// offline queue limit. The two arrived in separate changes and meet only
+// here: the replay writes straight to the queue stream, past the live
+// path, so the bound has to come from the drain like any other queue's. A
+// replay that bypassed it would hand a device every message of the gap
+// however little its tenant may keep.
+func TestClusterKilledEdgeQueueIsBounded(t *testing.T) {
+	const (
+		tenantName = "acme"
+		cmd        = "fleet/bounded/cmd"
+		keep, gap  = 3, 10
+	)
+
+	c := startCluster(t, func(cfg *config.Config) {
+		cfg.Limits.Tenants = map[string]config.TenantLimits{tenantName: {OfflineQueue: new(keep)}}
+	})
+
+	sleepOnEdgeZero(t, c, "bounded", tenantName, cmd)
+
+	c.edges[0].Kill()
+	c.edges[0] = nil
+
+	pub := connect(t, c.addrs[1], "dispatcher", tenantName)
+	publishQoS1(t, pub, cmd, "gap-", gap)
+
+	if !waitUntil(deathSettle, func() bool {
+		return readMetric(t, c.core.ObsAddr(), "mast_queuer_replayed_total ") >= gap
+	}) {
+		t.Fatalf("the replay queued %v of the %d messages published before the edge was declared dead",
+			readMetric(t, c.core.ObsAddr(), "mast_queuer_replayed_total "), gap)
+	}
+
+	back := persistent(t, c.addrs[1], "bounded", tenantName)
+
+	limit := `mast_limit_exceeded_total{limit="offline_queue",tenant="` + tenantName + `"} `
+	if !awaitMetric(t, c.obs[1], limit, gap-keep) {
+		t.Errorf("the edge discarded %v replayed messages, want %d", readMetric(t, c.obs[1], limit), gap-keep)
+	}
+
+	waitForLeaf(func() bool { return count(back.messages(), cmd) >= keep })
+
+	want := make([]string, 0, keep)
+	for i := gap - keep; i < gap; i++ {
+		want = append(want, cmd+"=gap-"+strconv.Itoa(i))
+	}
+
+	got := slices.DeleteFunc(back.messages(), func(m string) bool { return !strings.HasPrefix(m, cmd+"=") })
+	slices.Sort(got)
+
+	if !slices.Equal(got, want) {
+		t.Errorf("a device whose edge was killed was sent %v, want the newest %d: %v", got, keep, want)
 	}
 }
 
