@@ -46,15 +46,19 @@ type cluster struct {
 // isolation holding across the fabric, session ownership — is invisible to a
 // single node, so before this existed those were verified by hand against
 // three processes and then not verified again.
-func startCluster(t *testing.T) *cluster {
+//
+// Each option adjusts every node's configuration, core and edges alike,
+// before it starts.
+func startCluster(t *testing.T, options ...func(*config.Config)) *cluster {
 	t.Helper()
 
-	return startClusterWith(t, func(*config.Config) {})
+	return startClusterWith(t, nil, options...)
 }
 
-// startClusterWith is [startCluster] with every node's configuration passed
-// through mutate first, as a deployment renders one file for every node.
-func startClusterWith(t *testing.T, mutate func(*config.Config)) *cluster {
+// startClusterWith is startCluster with a hook that adjusts each edge's
+// configuration before it starts, after the options every node takes. A nil
+// hook changes nothing.
+func startClusterWith(t *testing.T, edgeConfig func(*config.Config), options ...func(*config.Config)) *cluster {
 	t.Helper()
 
 	log := slog.New(slog.DiscardHandler)
@@ -72,7 +76,10 @@ func startClusterWith(t *testing.T, mutate func(*config.Config)) *cluster {
 	coreCfg.Core.StoreDir = t.TempDir()
 	coreCfg.Core.LeafAddr = leafAddr
 	coreCfg.MQTT.Addr = "" // a core terminates no MQTT
-	mutate(&coreCfg)
+
+	for _, option := range options {
+		option(&coreCfg)
+	}
 
 	core, err := broker.Start(t.Context(), coreCfg, byUsername{}, tenant.AllowAll{}, log)
 	if err != nil {
@@ -108,7 +115,14 @@ func startClusterWith(t *testing.T, mutate func(*config.Config)) *cluster {
 		cfg.Obs.Addr = anyPort
 		cfg.MQTT.Addr = freeAddr(t)
 		cfg.Edge.CoreURLs = []string{"nats-leaf://" + leafAddr}
-		mutate(&cfg)
+
+		for _, option := range options {
+			option(&cfg)
+		}
+
+		if edgeConfig != nil {
+			edgeConfig(&cfg)
+		}
 
 		edge, err := broker.Start(t.Context(), cfg, byUsername{}, tenant.AllowAll{}, log)
 		if err != nil {

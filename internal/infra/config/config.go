@@ -4,6 +4,8 @@ package config
 
 import (
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,6 +117,69 @@ type Config struct {
 	Session Session `json:"session" koanf:"session"`
 	Fabric  Fabric  `json:"fabric"  koanf:"fabric"`
 	Limits  Limits  `json:"limits"  koanf:"limits"`
+	Admin   Admin   `json:"admin"   koanf:"admin"`
+	Tracing Tracing `json:"tracing" koanf:"tracing"`
+}
+
+// defaultAdminGather is how long the admin API waits for nodes to answer a
+// question every node answers. Inside a cluster a reply takes milliseconds;
+// the rest is room for a node busy with a reconnect storm.
+const defaultAdminGather = 500 * time.Millisecond
+
+// MaxAdminGather bounds the admin API's gather window. Every list and stats
+// request waits the whole window, so a window of seconds is already a slow
+// API; one longer than this is a typo or a cluster too far apart for this
+// design, not a setting to accept quietly.
+const MaxAdminGather = 5 * time.Second
+
+// Admin configures the administrative HTTP API: listing a tenant's sessions,
+// reading one, disconnecting a client, and a tenant's counts.
+type Admin struct {
+	// Addr is the API's own listener. Empty, the default, serves no API.
+	// It is separate from obs.addr because that one is scraped by anything
+	// with network access to it, and this one can disconnect devices.
+	Addr string `json:"addr" koanf:"addr"`
+	// TokenFile holds the bearer token every request must present. There
+	// is no setting for the token itself: a secret in a config file ends
+	// up in version control, and a secret in an environment variable ends
+	// up in a process listing.
+	TokenFile string `json:"token_file" koanf:"token_file"`
+	// Gather is how long to wait for every node's answer. A node that
+	// answers later is missing from that response.
+	Gather time.Duration `json:"gather" koanf:"gather"`
+}
+
+// Tracing configures OpenTelemetry tracing of the message path.
+//
+// Every field that has a standard OTEL_* counterpart defers to it when left
+// empty, so a deployment that already sets the OpenTelemetry environment for
+// its other services configures mast the same way. A value set here wins.
+type Tracing struct {
+	// Enabled turns tracing on. Off, the broker builds no tracer at all and
+	// the publish path pays one branch per message.
+	Enabled bool `json:"enabled" koanf:"enabled"`
+	// Endpoint is the OTLP/HTTP collector URL, such as
+	// "http://otel-collector:4318". An http scheme means plain text. Empty
+	// defers to OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, then
+	// OTEL_EXPORTER_OTLP_ENDPOINT, then http://localhost:4318.
+	Endpoint string `json:"endpoint" koanf:"endpoint"`
+	// Sampler is one of the OTEL_TRACES_SAMPLER names. Empty defers to that
+	// variable, then to parentbased_always_on.
+	Sampler string `json:"sampler" koanf:"sampler"`
+	// SamplerArg is the ratio for the traceidratio samplers, as
+	// OTEL_TRACES_SAMPLER_ARG spells it. Empty defers to that variable,
+	// then to 1. Each of the two keys defers on its own, so a sampler set
+	// here takes its ratio from the environment and the other way round.
+	SamplerArg string `json:"sampler_arg" koanf:"sampler_arg"`
+}
+
+// Samplers lists the sampler names [Tracing.Sampler] accepts: the ones
+// OTEL_TRACES_SAMPLER defines that need nothing beyond the SDK.
+func Samplers() []string {
+	return []string{
+		"always_on", "always_off", "traceidratio",
+		"parentbased_always_on", "parentbased_always_off", "parentbased_traceidratio",
+	}
 }
 
 // Limits configures what each tenant may use. The fields at the top are
@@ -435,15 +500,32 @@ func Default() Config {
 			DurableQoS:    true,
 			DurableMaxAge: defaultDurableMaxAge,
 		},
-		Auth: defaultAuth(),
-		Limits: Limits{
-			MaxConnections: 0,
-			PublishRate:    0,
-			PublishBurst:   0,
-			OfflineQueue:   defaultOfflineQueue,
-			SyncInterval:   defaultLimitsSync,
-			Tenants:        nil,
+		Auth:   defaultAuth(),
+		Limits: defaultLimits(),
+		Admin: Admin{
+			Addr:      "",
+			TokenFile: "",
+			Gather:    defaultAdminGather,
 		},
+		Tracing: Tracing{
+			Enabled:    false,
+			Endpoint:   "",
+			Sampler:    "",
+			SamplerArg: "",
+		},
+	}
+}
+
+// defaultLimits is split out of [Default], like [defaultAuth], only for
+// length.
+func defaultLimits() Limits {
+	return Limits{
+		MaxConnections: 0,
+		PublishRate:    0,
+		PublishBurst:   0,
+		OfflineQueue:   defaultOfflineQueue,
+		SyncInterval:   defaultLimitsSync,
+		Tenants:        nil,
 	}
 }
 
@@ -578,6 +660,14 @@ func (c Config) Validate() error {
 		return err
 	}
 
+	if err := c.validateAdmin(); err != nil {
+		return err
+	}
+
+	if err := c.validateTracing(); err != nil {
+		return err
+	}
+
 	return c.validateAuth()
 }
 
@@ -608,6 +698,45 @@ func (c Config) validateLimits() error {
 
 	if c.Obs.MaxTenantLabels < 0 {
 		return fmt.Errorf("%w: obs.max_tenant_labels", ErrBadLimit)
+	}
+
+	return nil
+}
+
+// validateAdmin refuses an admin API that would be open, or that could
+// never hear from another node.
+func (c Config) validateAdmin() error {
+	if c.Admin.Addr == "" {
+		return nil
+	}
+
+	if c.Admin.TokenFile == "" {
+		return ErrAdminNeedsToken
+	}
+
+	if c.Admin.Gather <= 0 || c.Admin.Gather > MaxAdminGather {
+		return fmt.Errorf("%w: got %v", ErrBadAdminGather, c.Admin.Gather)
+	}
+
+	return nil
+}
+
+// validateTracing checks the sampler eagerly, even with tracing off, so that
+// turning it on later cannot be what reveals a typo.
+func (c Config) validateTracing() error {
+	t := c.Tracing
+
+	if t.Sampler != "" && !slices.Contains(Samplers(), t.Sampler) {
+		return fmt.Errorf("%w: %q is not one of %v", ErrInvalidSampler, t.Sampler, Samplers())
+	}
+
+	if t.SamplerArg == "" {
+		return nil
+	}
+
+	ratio, err := strconv.ParseFloat(t.SamplerArg, 64)
+	if err != nil || ratio < 0 || ratio > 1 {
+		return fmt.Errorf("%w: got %q", ErrBadSamplerArg, t.SamplerArg)
 	}
 
 	return nil

@@ -302,7 +302,7 @@ func offlineQueueLimit(t *testing.T, keep, sent int) {
 // with one connection on each of two edges is at a limit of two everywhere,
 // though neither edge holds two itself.
 func TestClusterConnectionLimit(t *testing.T) {
-	c := startClusterWith(t, func(cfg *config.Config) {
+	c := startCluster(t, func(cfg *config.Config) {
 		cfg.Limits.MaxConnections = 2
 		cfg.Limits.SyncInterval = 100 * time.Millisecond
 	})
@@ -333,7 +333,7 @@ func TestClusterConnectionLimit(t *testing.T) {
 func TestClusterOfflineQueueLimit(t *testing.T) {
 	const keep, sent = 3, 10
 
-	c := startClusterWith(t, func(cfg *config.Config) {
+	c := startCluster(t, func(cfg *config.Config) {
 		cfg.Limits.Tenants = map[string]config.TenantLimits{"acme": {OfflineQueue: new(keep)}}
 	})
 

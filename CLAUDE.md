@@ -33,6 +33,7 @@ Litmus test for `domain`: can the package be tested with no network, no filesyst
 | `domain/topic` | the MQTT-topic ↔ NATS-subject codec. The most safety-critical package in the repo |
 | `domain/tenant` | `ID`, `Credentials`, `Identity`, the `Resolver` / `Policy` interfaces, and `Limits` / `Overrides` |
 | `domain/quota` | the token bucket and the census that adds up a tenant's connections across nodes |
+| `domain/admin` | the admin API's view types, its control-plane subjects, and the merge that pages a tenant's sessions across nodes and the store |
 | `infra/bridge` | the mochi-mqtt hook that is the whole broker. `bridge.go` is ~770 lines; `subs.go` is the refcounted NATS subscription registry |
 | `infra/broker` | assembles a node from natsd + store + bridge + mqttd. Home of the end-to-end tests |
 | `infra/natsd` | the embedded `nats-server` and the in-process `nats.Conn` |
@@ -45,6 +46,8 @@ Litmus test for `domain`: can the package be tested with no network, no filesyst
 | `infra/config` | koanf: defaults → TOML → env → flags |
 | `infra/limits` | per-tenant limits on one node, and the `mast.limits.connections` reports that make the connection limit cluster-wide |
 | `infra/obs` | Prometheus metrics, `/healthz` (liveness), `/readyz` (readiness: an edge's leaf link, a core's JetStream), pprof |
+| `infra/admin` | the admin HTTP API: bearer token from a file, scatter and gather over `mast.admin.>`, the stored half from `store` |
+| `infra/tracing` | builds the OpenTelemetry tracer provider and OTLP/HTTP exporter. The spans themselves are in `bridge/trace.go` |
 | `infra/memlimit` | sets GOMEMLIMIT from the container's cgroup limit, which Go does not read by itself |
 
 `deployments/fire` is the Docker cluster and the chaos drills: three cores, three edges, SIGKILLs. A change to delivery or storage is not done until it has been through it, at least four runs against a baseline build; its README says how.
@@ -62,6 +65,8 @@ These are properties the tests and the docs both depend on. Breaking one is a da
 **Authentication always fails closed**, whatever `auth.http.on_error` says. Admitting a connection whose tenant is unknown means inventing an isolation boundary. `on_error` governs authorization only.
 
 **The hot QoS 0 publish path does zero storage operations.** `OnPublish` on a non-retained QoS 0 message touches only `EncodeTopic` and `nc.PublishMsg`. QoS 1 and 2 are the one deliberate exception: they are written to the durable stream before they are acknowledged, because that acknowledgement is a promise core NATS alone cannot keep (#11). Adding a store call to the QoS 0 path would change the cost model the whole design rests on — if you think one is needed, raise it rather than adding it.
+
+**Tracing off costs a comparison.** The bridge's tracer is nil when `tracing.enabled` is false, and every traced path checks for nil before it does anything else. Do not replace that with a no-op tracer: extracting a parent and building a context allocate whether or not anything records them, and the QoS 0 path is judged in allocations. `BenchmarkPublishQoS0` against the previous build is the proof, and `BenchmarkPublishQoS0Traced` is what turning it on costs.
 
 **Metric cardinality is per tenant, never per device.** 300k label series will take down Prometheus before they take down the broker. And per tenant is bounded too: every tenant label goes through `Metrics.Tenant`, which folds every tenant past `obs.max_tenant_labels` into `~other`. A new per-tenant metric that skips it is unbounded again.
 
@@ -105,7 +110,7 @@ Return codes on `OnPublish` are not interchangeable:
 
 mast imports `github.com/mastmq/mochi/v2`, not `github.com/mochi-mqtt/server/v2`. [`mastmq/mochi`](https://github.com/mastmq/mochi) is a detached fork of mochi-mqtt/server, MIT, republished under our own module path because upstream stopped merging: `main` has not moved since 2025-03-01 and 47 pull requests are open, including four that fix the deadlock in #9.
 
-mast is on `v2.7.14`: upstream `v2.7.9` plus the short list in `FORK.md` — the deadlock, the listener fixes, user properties on a PUBLISH surviving a client's Request Problem Information = 0, and acks coalesced into one write while more input is buffered (upstream #552). That last one is #18: mochi wrote every PUBACK, PUBREC, PUBREL and PUBCOMP with a syscall of its own, and QoS 2 at 100k deliveries a second fell seconds behind on it. What it cannot batch is a subscriber receiving sparsely, so a QoS 2 delivery still costs about 1.6× the broker CPU of QoS 1 and QoS 2's fan-out ceiling is about half of QoS 1's — the protocol's two-packets-per-delivery, not something to fix here. **Keep the list short.** A patch to MQTT behaviour belongs in `mastmq/mochi` with a line in its `FORK.md`, not as a workaround here, and every line we do not have to carry is a line that costs nothing when upstream revives.
+mast is on `v2.7.15`: upstream `v2.7.9` plus the short list in `FORK.md` — the deadlock, the listener fixes, user properties on a PUBLISH surviving a client's Request Problem Information = 0, acks coalesced into one write while more input is buffered (upstream #552), `OnDisconnect` on a failed CONNACK or resend, and `Options.ClientNetWriteTimeout` (upstream #531). **mast does not set `ClientNetWriteTimeout` yet**, so it still has no write deadline: a client that stops reading holds its client lock, which blocks QoS 1 deliveries to it and a takeover of its session, until the connection dies. Setting it is a config field, so it moves across the chart and the role too. That last one is #18: mochi wrote every PUBACK, PUBREC, PUBREL and PUBCOMP with a syscall of its own, and QoS 2 at 100k deliveries a second fell seconds behind on it. What it cannot batch is a subscriber receiving sparsely, so a QoS 2 delivery still costs about 1.6× the broker CPU of QoS 1 and QoS 2's fan-out ceiling is about half of QoS 1's — the protocol's two-packets-per-delivery, not something to fix here. **Keep the list short.** A patch to MQTT behaviour belongs in `mastmq/mochi` with a line in its `FORK.md`, not as a workaround here, and every line we do not have to carry is a line that costs nothing when upstream revives.
 
 Two consequences worth remembering. `go get -u ./...` will not pull mochi-mqtt updates any more, because we no longer depend on that path — watch upstream by hand. And `.golangci.yml`'s `exhaustruct_v5` ignore pattern is `^github\.com/mastmq/mochi/.*`; it has to move with the module path or every mochi struct literal starts reporting.
 
@@ -140,6 +145,8 @@ Both tokens go through `topic.EncodeToken`, which is the single-token form of th
 A notice carries the **connection's** owner token, not the node's. The node that publishes is also subscribed, so it has to recognise its own notice, and identifying by node would make two connections on one node indistinguishable. `NodeID` exists only so a log line can say where a client went, and it is the embedded server's id rather than the configured name — the name defaults to the role, so every edge pod would answer to `mast-edge`.
 
 **A node holds one subscription to the control plane, `mast.session.>`, not one per client.** The per-client version was the obvious shape and cost a goroutine, a SUB round trip and a cluster-wide interest update per CONNECT, held for as long as the session lived — an edge with 25k sleeping persistent sessions held 25k subscriptions for them. Now every notice in the cluster reaches every node and a map lookup on the subject decides whether it matters, before the JSON is even decoded. `BenchmarkConnect` reports `nats-subs/client`; it must stay at zero. The bench repo's RESULTS.md once recorded this design as 6.5× slower in a two-edge storm; the 2026-10-05 entry there shows that was the harness, and that a storm comparison needs exact-name kills of the previous brokers and a minute of idle between runs before its numbers mean anything.
+
+`mast.admin.>` is the admin API's control plane, under the same rule: outside `t.`, one subscription per node (`bridge/admin.go`), tenant and client id in the body rather than the subject. A list or stats request waits `admin.gather` for every node; a get or a disconnect is answered only by the node holding the client. An admin disconnect is `DisconnectClient` with *administrative action*, deliberately not a session notice — a takeover empties the session for a new owner that here does not exist. Every answer is one NATS message, so it must fit `max_payload`: a list reply is filled to the budget and marked truncated (`admin.EncodeList`), `admin.Merge` ends the page at the lowest cut, and an answer that cannot be sent becomes an `admin.Failure`. A refused reply is indistinguishable from an absent node, which is how a page once lost a node's clients for good. See `docs/ARCHITECTURE.md`.
 
 A failed claim logs and continues rather than refusing the connection. Without it a client can end up live in two places, which is the bug this prevents; refusing outright would turn duplicate delivery into an outage.
 
@@ -198,6 +205,7 @@ Two traps that cost real time:
 | `docker.yaml` | multi-tag ghcr image for linux/amd64 and linux/arm64, cross-compiled in the build stage rather than emulated, with an SBOM and `mode=max` provenance, and the pushed digest signed keylessly with cosign. PRs build but do not publish |
 | `release.yaml` | linux amd64/arm64 tarballs and a checksum file on the GitHub release, for `mastmq/ansible`, each with a GitHub build-provenance attestation. The file names are that collection's interface |
 | `codeql.yml` | weekly security scan |
+| `conformance.yaml` | the Eclipse Paho interoperability suite, MQTT 3.1.1 and 5, against an all-in-one node, on push, PRs and weekly; `just conformance` runs the same script. Known failures are expected failures in `test/conformance/run.py`, each with its issue, and one that starts passing turns the run red until its entry goes |
 
 `govulncheck` runs on every push, not only on dependency bumps — a dependency can become vulnerable without a line of our code changing. It fails only on *reachable* vulnerabilities; treating unreachable ones as failure is how a red pipeline stops meaning anything.
 

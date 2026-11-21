@@ -28,13 +28,14 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 - **Shared subscriptions** — `$share/<group>/<filter>` maps onto a NATS queue group, and each message reaches exactly one member. Note that a queue group serves a local member first, so work stays on the producer's node rather than spreading round-robin across the group; see [ARCHITECTURE.md](docs/ARCHITECTURE.md) for why and what to do if that matters
 - One NATS subscription per distinct filter rather than per device, released when the last subscriber disconnects
 - **Cross-node delivery** — edges join the core as leaf nodes, and a message published on one edge reaches a subscriber on another, with tenant isolation holding across the boundary. QoS 0 crosses on core NATS; QoS 1 and 2 are stored on one replicated JetStream stream before the publisher is acknowledged, and each node reads it through one consumer of its own, so a node cut off from the core for a moment catches up rather than losing what was published for its clients. [Delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md) sets out exactly what each QoS promises and where it still does not
-
 - **MQTT 5 message properties** — content type, response topic, correlation data, payload format, user properties and message expiry travel with the message across the fabric and through retained messages and offline queues, so MQTT 5 request/response works between nodes. An expired retained or queued message is not delivered
 - **HTTP authentication and authorization** — post the MQTT fields to your own service and let it name the tenant and rule on each topic
 - **Portable sessions** — subscriptions live in a shared bucket and the offline queue on a shared stream, filled by the core tier, so a device that reconnects to a different node finds its session and whatever QoS 1 or 2 traffic it missed, even when the edge it last used has since been restarted. Verified by a cluster test and by killing cores and edges under load in a three-core, three-edge cluster
+- **Tracing, when asked for** — OpenTelemetry spans for a publish, its durable store, its NATS hop and every node's delivery of it, exported over OTLP/HTTP. Trace context crosses nodes in W3C headers on the NATS message, and an MQTT 5 client that sends a `traceparent` user property has its publish traced inside its own trace and its subscribers handed the span that delivered to them. Off by default, and off it costs the publish path a comparison; see [Tracing](#tracing)
 - **Cross-node takeover** — a second connection with an existing client id disconnects the first wherever in the cluster it is, which MQTT requires and a single node cannot do alone. Client ids are scoped to their tenant, so one tenant cannot displace another's device by reusing an id
-
 - **Per-tenant limits** — a connection limit counted across the cluster, a publish rate per node, and the size of each absent session's queue, with defaults in config, overrides per tenant, and overrides from the authentication backend. Over the limit a client is told with MQTT 5 reason codes, or the nearest thing MQTT 3.1.1 has; see [tenant limits](#tenant-limits)
+
+An [admin API](#admin-api), off by default, lists and disconnects a tenant's sessions across the cluster. End-to-end tests cover it; the fire drills have not run against it yet.
 
 Not yet: per-tenant caps on the rate of new connections, on inbound bytes and on stored sessions and retained messages, full QoS for shared subscriptions whose members span nodes, and queueing for a connected device between its edge being killed outright and its reconnecting elsewhere. Each of these has an issue, and the [roadmap](ROADMAP.md) lists them with the rest of what comes next.
 
@@ -149,6 +150,24 @@ The connection count is shared by every node publishing its per-tenant counts on
 
 The newest statement wins, per tenant per node. A reply or token that says nothing about limits leaves the tenant's overrides as they were; it is not a statement that the tenant has none. A JWT's `iat` orders it against the tenant's other devices' tokens, so a device still holding a token from before the tenant's plan changed cannot put the old limits back; a token without `iat` never replaces one with it. An HTTP reply is dated when it arrives. Once set, an override from authentication stays until a newer one replaces it, so lifting it takes a newer token or reply that states the configured value. Because each node keeps what it last heard, two nodes can enforce different limits for a tenant until each has seen a connection with the newest token. An override can lower a tenant's offline queue but not raise it past the largest value in the config, which is what the core tells the stream to keep per session. `mast_limit_exceeded_total{tenant, limit}` counts what each limit refused, and `obs.max_tenant_labels` (1000) bounds how many tenants get a label of their own; the rest are counted as `~other`.
 
+## Admin API
+
+An HTTP API for operators, off until `admin.addr` is set. It has its own listener, apart from the metrics one, because it can disconnect devices. Every request carries `Authorization: Bearer <token>`, where the token is read once at startup from `admin.token_file`; there is no setting for the token itself, so it cannot end up in a config file or an environment listing. The comparison is constant-time.
+
+| Request | Answers |
+| --- | --- |
+| `GET /v1/tenants/{tenant}/sessions?limit=&cursor=` | a page of the tenant's sessions, connected or stored, in client id order; `next` is the cursor for the following page |
+| `GET /v1/tenants/{tenant}/sessions/{client}` | one session: where it is connected, its subscriptions, what is in flight and what is queued |
+| `POST /v1/tenants/{tenant}/sessions/{client}/disconnect` | disconnects the client with MQTT 5's *administrative action* reason, on whichever node holds it; a persistent session is kept, as if the device had gone by itself |
+| `GET /v1/tenants/{tenant}/stats` | connections, subscriptions, stored sessions and queued messages |
+
+Any node answers for the cluster, a core included. Connected clients are known only to the node holding them, so the API asks every node over the control plane and waits `admin.gather` for answers; a list or stats request always waits that long, and says in `nodes` how many answered. A get or a disconnect returns as soon as the holding node replies. A client id containing `/` is sent escaped, as `%2F`. A node's answer crosses the cluster as one NATS message, so a page stops early when a node's clients and their filters would not fit in one, and `next` carries on from there; a client whose filters alone do not fit comes back with the first of them and `subscriptions_truncated` set, while `stats` still counts them all.
+
+```console
+$ curl -H "Authorization: Bearer $(cat /run/secrets/mast-admin)" localhost:9091/v1/tenants/acme/stats
+{"tenant":"acme","connections":2,"subscriptions":3,"stored_sessions":2,"queued_messages":1,"nodes":2}
+```
+
 ## Configuration
 
 Defaults, then an optional TOML file, then environment variables, then explicitly-set flags. See [`configs/config.example.toml`](configs/config.example.toml) — every value in it is the built-in default, so an empty file behaves exactly like no file.
@@ -160,6 +179,24 @@ Environment variables are prefixed `MAST__` and nest with a double underscore, s
 The observability listener (`obs.addr`, `127.0.0.1:9090` by default) serves `/metrics`, `/healthz`, `/readyz` and `/debug/pprof`.
 
 `/healthz` is liveness: it answers 200 for as long as the process runs and answers. `/readyz` answers 200 only when the node can serve, and 503 with the reason when it cannot. An edge is ready when it is serving MQTT and its leaf connection to the core is up; a core or an all-in-one node is ready when its embedded nats-server and JetStream are, by nats-server's own health check. Point a readiness probe at `/readyz` and a liveness probe at `/healthz`, never the other way round: an edge whose core is away is not fixed by a restart, and a liveness probe on `/readyz` would restart every edge in the fleet whenever the core tier is.
+
+## Tracing
+
+Off by default. Turn it on with `tracing.enabled = true` (or `MAST__TRACING__ENABLED=true`) and point it at a collector's OTLP/HTTP port:
+
+```toml
+[tracing]
+enabled = true
+endpoint = "http://otel-collector:4318"
+sampler = "parentbased_traceidratio"
+sampler_arg = "0.01"
+```
+
+Each key left empty defers to its standard variable — `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` — and `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_BSP_*` work as they do for any OpenTelemetry SDK. With nothing set, every trace is sampled and goes to `http://localhost:4318`.
+
+A publish opens `mqtt.publish` on the node it arrives at, with `mast.store.durable`, `mast.store.retained` and `nats.publish` under it, and every node that delivers it opens `mqtt.deliver` under the publish. An MQTT 5 client that sends a `traceparent` user property (and optionally `tracestate`) puts that publish inside its own trace, and a subscriber receives the message with `traceparent` rewritten to the delivery span, so it can carry the same trace on. A message without one is not given one, and a message whose publish was not traced (a will, or one that came through an edge with tracing off) keeps the client's `traceparent` as it was sent. The client's sampled flag is not obeyed: the configured sampler decides for every publish, on a trace id of its own, so a client can neither force its messages to be traced on every node nor hide them. Choose `parentbased_traceidratio` to keep a trace whole across nodes; plain `traceidratio` decides again on each delivering node from the trace id, which the client chose. Spans are batched and dropped, never queued without bound, when a collector is slow or away.
+
+Not traced yet: the replay of an offline queue or a retained message, wills, and the core's queuer.
 
 ## Verifying a release
 

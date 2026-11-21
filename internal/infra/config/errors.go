@@ -35,4 +35,20 @@ var (
 
 	// ErrBadLimit is returned for a tenant limit that cannot mean anything.
 	ErrBadLimit = errors.New("config: invalid limit")
+
+	// ErrAdminNeedsToken guards against an admin API anyone who can reach
+	// it may use: it lists every tenant's devices and disconnects them.
+	ErrAdminNeedsToken = errors.New("config: admin.addr requires admin.token_file")
+
+	// ErrBadAdminGather guards against a gather window that closes before
+	// any other node can answer, which would report a cluster as one node,
+	// and one so long that every list and stats request waits it out.
+	ErrBadAdminGather = errors.New("config: admin.gather must be positive and at most 5s")
+
+	// ErrInvalidSampler guards against a typo that would otherwise fall
+	// back to sampling everything, or nothing, without a word.
+	ErrInvalidSampler = errors.New("config: invalid tracing.sampler")
+
+	// ErrBadSamplerArg is returned for a sampling ratio outside [0, 1].
+	ErrBadSamplerArg = errors.New("config: tracing.sampler_arg must be a ratio between 0 and 1")
 )
