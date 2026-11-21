@@ -20,6 +20,12 @@ bench PKG="./...":
 fuzz TIME="60s":
     go test -run='^$' -fuzz=FuzzRoundTrip -fuzztime={{ TIME }} ./internal/domain/topic/
 
+# Needs python3 and git, uses port 18830 to 18833, takes about 7 minutes.
+# Known failures and their issues are listed in test/conformance/run.py.
+# The Eclipse Paho interoperability suite, MQTT 3.1.1 and 5, on a fresh node
+conformance:
+    ./test/conformance/run.sh
+
 image:
     docker build -f build/package/Dockerfile -t mast:dev .
 

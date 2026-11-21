@@ -16,18 +16,24 @@ import (
 	"time"
 
 	"github.com/mastmq/mast/internal/domain/tenant"
+	"github.com/mastmq/mast/internal/infra/admin"
 	"github.com/mastmq/mast/internal/infra/bridge"
 	"github.com/mastmq/mast/internal/infra/config"
+	"github.com/mastmq/mast/internal/infra/limits"
 	"github.com/mastmq/mast/internal/infra/mqttd"
 	"github.com/mastmq/mast/internal/infra/natsd"
 	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/offline"
 	"github.com/mastmq/mast/internal/infra/store"
+	"github.com/mastmq/mast/internal/infra/tracing"
 	mqtt "github.com/mastmq/mochi/v2"
 	natsgo "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // storeOpenTimeout bounds bucket creation at startup.
@@ -37,10 +43,14 @@ const storeOpenTimeout = 30 * time.Second
 type Broker struct {
 	nats   *natsd.Server
 	hook   *bridge.Hook
+	limits *limits.Limiter
 	server *mqtt.Server
 	store  *store.Store
 	obs    *obs.Server
+	admin  *admin.Server
 	log    *slog.Logger
+	// tracing exports the bridge's spans, and is nil when tracing is off.
+	tracing *tracing.Provider
 
 	// serving is set once the node does everything its role does: on an
 	// edge or an all-in-one node, once MQTT is being served over an open
@@ -67,6 +77,9 @@ type Broker struct {
 // which is the only way to learn it when the configured address asked for
 // port zero.
 func (b *Broker) ObsAddr() string { return b.obs.Addr() }
+
+// AdminAddr reports where the admin API is served, empty when it is off.
+func (b *Broker) AdminAddr() string { return b.admin.Addr() }
 
 // Store exposes the durable state, for tests and for administrative tools.
 func (b *Broker) Store() *store.Store { return b.store }
@@ -103,7 +116,7 @@ func Start(
 	life, shutdown := context.WithCancel(context.WithoutCancel(ctx))
 
 	b := &Broker{
-		nats: nats, hook: nil, server: nil, store: nil, obs: nil, log: log,
+		nats: nats, hook: nil, limits: nil, server: nil, store: nil, obs: nil, admin: nil, log: log, tracing: nil,
 		serving: atomic.Bool{}, closeOnce: sync.Once{},
 		life: life, shutdown: shutdown, wg: sync.WaitGroup{},
 		queueMu: sync.Mutex{}, queuer: nil, queueStore: nil,
@@ -112,7 +125,7 @@ func Start(
 	// The subscription gauge reads through the hook, so the registry is
 	// built before it and handed the accessor.
 	registry := newRegistry()
-	metrics := obs.NewMetrics(registry, sources(b, nats))
+	metrics := obs.NewMetrics(registry, sources(b, nats), cfg.Obs.MaxTenantLabels)
 
 	// Before the role check, because every role needs it. It used to come
 	// after, so a core — the node holding Raft and every bucket — served no
@@ -131,13 +144,18 @@ func Start(
 	// the peers it is waiting for.
 	if cfg.Role == config.RoleCore {
 		b.wg.Go(func() { b.runCore(b.life, cfg, metrics) })
-		b.serving.Store(true)
+	} else if err := b.startMQTTSide(ctx, cfg, resolver, policy, metrics); err != nil {
+		b.abort()
 
-		return b, nil
+		return nil, err
 	}
 
-	if err := b.startMQTTSide(ctx, cfg, resolver, policy, metrics); err != nil {
-		b.abort()
+	// Last, so that on an edge the store it reads is already open and set:
+	// the handlers read b.store from their own goroutines, and starting
+	// them before it was written would be a race.
+	b.admin, err = admin.Serve(ctx, cfg.Admin, nats.Conn(), b.sharedStore, log)
+	if err != nil {
+		b.Close()
 
 		return nil, err
 	}
@@ -231,7 +249,8 @@ func open(ctx context.Context, cfg config.Config, nats *natsd.Server) (*store.St
 		return st, err
 	}
 
-	st, err := store.Open(ctx, nats.Conn(), natsd.JetStreamDomain, cfg.Core.Replicas, cfg.Session.Expiry)
+	st, err := store.Open(ctx, nats.Conn(), natsd.JetStreamDomain, cfg.Core.Replicas, cfg.Session.Expiry,
+		store.WithQueueLimit(cfg.Limits.QueueCeiling()))
 	if err == nil && cfg.Fabric.DurableQoS {
 		err = st.OpenDurable(ctx, cfg.Core.Replicas, cfg.Fabric.DurableMaxAge)
 	}
@@ -313,6 +332,7 @@ func (b *Broker) Close() {
 }
 
 func (b *Broker) close() {
+	b.admin.Close()
 	b.obs.Close()
 
 	if b.server != nil {
@@ -324,6 +344,11 @@ func (b *Broker) close() {
 	b.shutdown()
 	b.wg.Wait()
 	b.stopQueuer()
+	b.stopTracing(b.life)
+
+	if b.limits != nil {
+		b.limits.Stop()
+	}
 
 	if b.store != nil {
 		b.store.Close()
@@ -336,6 +361,20 @@ func (b *Broker) close() {
 	b.queueMu.Unlock()
 
 	b.nats.Shutdown()
+}
+
+// sharedStore is the store this node reads the cluster's durable state
+// through: its own on a node that serves MQTT, the queuer's on a core once
+// it has provisioned, nil until then.
+func (b *Broker) sharedStore() *store.Store {
+	if b.store != nil {
+		return b.store
+	}
+
+	b.queueMu.Lock()
+	defer b.queueMu.Unlock()
+
+	return b.queueStore
 }
 
 // openAttempt bounds one attempt to open the store, inside the overall
@@ -479,6 +518,11 @@ func (b *Broker) startMQTTSide(
 func (b *Broker) abort() {
 	b.stopQueuer()
 	b.shutdown()
+	b.stopTracing(b.life)
+
+	if b.limits != nil {
+		b.limits.Stop()
+	}
 
 	if b.store != nil {
 		b.store.Close()
@@ -495,6 +539,16 @@ func (b *Broker) serveMQTT(
 	policy tenant.Policy,
 	metrics *obs.Metrics,
 ) error {
+	b.limits = limits.New(b.nats.Conn(), limitOptions(cfg, b.nats.ID()), b.log)
+	if err := b.limits.Start(); err != nil {
+		return fmt.Errorf("broker: starting tenant limits: %w", err)
+	}
+
+	tp, err := b.startTracing(cfg)
+	if err != nil {
+		return err
+	}
+
 	b.hook = bridge.New(b.nats.Conn(), b.store, resolver, policy, bridge.Options{
 		Metrics:          metrics,
 		InternalListener: mqttd.InternalListenerID,
@@ -502,9 +556,11 @@ func (b *Broker) serveMQTT(
 		// The embedded server's id rather than the configured name: the
 		// name defaults to the role, so every edge pod would answer to
 		// "mast-edge" and a log line naming one would name them all.
-		NodeID:        b.nats.ID(),
-		SessionExpiry: cfg.Session.Expiry,
-		DurableQoS:    cfg.Fabric.DurableQoS,
+		NodeID:         b.nats.ID(),
+		SessionExpiry:  cfg.Session.Expiry,
+		DurableQoS:     cfg.Fabric.DurableQoS,
+		Limits:         b.limits,
+		TracerProvider: tp,
 	}, b.log)
 
 	server, err := mqttd.New(cfg, b.hook, b.log)
@@ -520,4 +576,90 @@ func (b *Broker) serveMQTT(
 	}
 
 	return nil
+}
+
+// limitOptions turns the limits section of the configuration into what the
+// limiter enforces.
+func limitOptions(cfg config.Config, nodeID string) limits.Options {
+	l := cfg.Limits
+
+	tenants := make(map[tenant.ID]tenant.Overrides, len(l.Tenants))
+	for name, t := range l.Tenants {
+		tenants[tenant.ID(name)] = tenant.Overrides{
+			MaxConnections: t.MaxConnections,
+			PublishRate:    t.PublishRate,
+			PublishBurst:   t.PublishBurst,
+			OfflineQueue:   t.OfflineQueue,
+			IssuedAt:       time.Time{}, // configured, not stated by authentication
+		}
+	}
+
+	return limits.Options{
+		Defaults: tenant.Limits{
+			MaxConnections: l.MaxConnections,
+			PublishRate:    l.PublishRate,
+			PublishBurst:   l.PublishBurst,
+			OfflineQueue:   l.OfflineQueue,
+		},
+		Tenants: tenants,
+		// An edge does not provision the stream, so it can only assume the
+		// cores were given the same configuration it was. The chart and the
+		// Ansible role render one file for both.
+		Ceiling:  l.QueueCeiling(),
+		Interval: l.SyncInterval,
+		NodeID:   nodeID,
+	}
+}
+
+// tracingShutdown bounds the flush of the spans still queued when a node
+// stops. A collector that is down must not hold up a rolling restart.
+const tracingShutdown = 5 * time.Second
+
+// startTracing builds the tracer provider when tracing is on. It returns nil
+// when it is off, and the bridge then builds no tracer at all.
+//
+// Only the MQTT side is traced: a core has no bridge, and so no message
+// path of its own to trace.
+//
+//nolint:ireturn // the bridge takes the interface, and nil means off
+func (b *Broker) startTracing(cfg config.Config) (trace.TracerProvider, error) {
+	if !cfg.Tracing.Enabled {
+		return nil, nil //nolint:nilnil // a nil provider is tracing off, which is not an error
+	}
+
+	p, err := tracing.Start(b.life, cfg.Tracing, b.log,
+		attribute.String("mast.role", string(cfg.Role)),
+		// The embedded server's id, as in the session notices: the
+		// configured name defaults to the role and would name every edge
+		// alike.
+		semconv.ServiceInstanceID(b.nats.ID()),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	b.tracing = p
+
+	b.log.Info("tracing the message path over otlp", "endpoint", cfg.Tracing.Endpoint, "sampler", p.Sampler())
+
+	return p.TracerProvider(), nil
+}
+
+// stopTracing flushes and stops the exporter, if there is one. ctx is the
+// node's lifetime, whose values it keeps and whose cancellation it does not.
+func (b *Broker) stopTracing(ctx context.Context) {
+	if b.tracing == nil {
+		return
+	}
+
+	// The node's lifetime has usually ended by now, which is exactly when
+	// the last spans need flushing, so its cancellation is not inherited.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tracingShutdown)
+	defer cancel()
+
+	if err := b.tracing.Shutdown(ctx); err != nil {
+		b.log.Warn("flushing traces", "error", err)
+	}
+
+	b.tracing = nil
 }

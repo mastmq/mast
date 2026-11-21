@@ -366,7 +366,7 @@ func TestGoodbyeIsNotCountedAsADeath(t *testing.T) {
 	t.Parallel()
 
 	reg := prometheus.NewRegistry()
-	q := newQueuer(nil, time.Hour, obs.NewMetrics(reg, obs.Sources{}), slog.New(slog.DiscardHandler))
+	q := newQueuer(nil, time.Hour, obs.NewMetrics(reg, obs.Sources{}, 0), slog.New(slog.DiscardHandler))
 	start := time.Now()
 
 	q.apply(heldOn(t, "edge-a", start))

@@ -6,15 +6,15 @@ A gap listed here is still a gap. [Delivery guarantees](https://github.com/mastm
 
 ## The broker
 
-**Per-tenant limits** ([#25](https://github.com/mastmq/mast/issues/25)). Tenants are isolated but not limited: one tenant can take more than its share of a node in connections, publish rate or stored state. Limits per tenant, enforced without consensus state per tenant, are what make the multi-tenant claim complete.
+**The rest of per-tenant limits** ([#25](https://github.com/mastmq/mast/issues/25)). Connections (cluster-wide), publish rate (per node) and each absent session's queue are limited per tenant, on main for the next release ([#32](https://github.com/mastmq/mast/pull/32)), and the Helm chart (`limits.*`) and the Ansible role (`mast_limits_*`) can set them; [Tenant limits](README.md#tenant-limits) has the scopes and the reason codes. Still unlimited: the rate of new connections, inbound bytes, and how many persistent sessions and retained messages a tenant holds. Each has to be enforced without consensus state per tenant, as the first three are.
 
 **Dead-edge detection** ([#26](https://github.com/mastmq/mast/issues/26)). Done, not yet in a release: every node beats on the control plane, the cores declare an edge dead after ten silent seconds and queue for the sessions it held, and what was published since its last heartbeat is replayed into their queues — for a device that has already moved to another edge too. [ARCHITECTURE.md](docs/ARCHITECTURE.md#a-node-that-dies-without-a-word) has the design.
 
 **Shared subscriptions across nodes** ([#27](https://github.com/mastmq/mast/issues/27)). A `$share` group whose members span nodes is served on core NATS, so the cross-node hop is at-most-once and distribution is local-first. Serving groups from the replicated stream needs a consumer per group, bounded, which is a different design.
 
-**Admin API** ([#28](https://github.com/mastmq/mast/issues/28)). An HTTP API, off by default, to list and inspect a tenant's sessions, disconnect a client and read a tenant's counts from any node.
+**Admin API** ([#28](https://github.com/mastmq/mast/issues/28)). An HTTP API, off by default, to list and inspect a tenant's sessions, disconnect a client and read a tenant's counts from any node. Done on main for the next release: the `[admin]` block serves it on its own listener with a bearer token read from a file, and the Helm chart (`admin.*`) and the Ansible role (`mast_admin_*`) can turn it on. [Admin API](README.md#admin-api) shows the endpoints.
 
-**OpenTelemetry tracing** ([#29](https://github.com/mastmq/mast/issues/29)). One trace for one message, from the publisher's listener through the fabric to the subscriber's session, at close to no cost when sampled out.
+**OpenTelemetry tracing** ([#29](https://github.com/mastmq/mast/issues/29)). One trace for one message, from the publisher's listener through the fabric to the subscriber's session, at close to no cost when sampled out. Done on main for the next release: the `[tracing]` block, off by default, exports spans over OTLP/HTTP and carries W3C trace context across nodes and through MQTT 5 user properties. [Tracing](README.md#tracing) shows how to turn it on.
 
 ## Releases and CI
 
@@ -36,6 +36,6 @@ A gap listed here is still a gap. [Delivery guarantees](https://github.com/mastm
 
 **Multi-pod load generation** ([bench#1](https://github.com/mastmq/bench/issues/1)). Every benchmark runs from one pod, which becomes the limit before the broker does. Until load comes from several pods, no result from the harness is mast's ceiling.
 
-**Website deploy through Actions** ([mastmq.github.io#2](https://github.com/mastmq/mastmq.github.io/issues/2)). The site is served from committed build output, a stopgap from when no token could write a workflow. Building it in Actions removes the output from git and the chance of it drifting from the source.
+**Website deploy through Actions** ([mastmq.github.io#2](https://github.com/mastmq/mastmq.github.io/issues/2)). Done: a push to `main` checks, builds and deploys the site through GitHub Actions, and the build output, once committed as a stopgap, is out of git.
 
 Something missing from this list? Open an issue, or start a thread in [Discussions](https://github.com/mastmq/mast/discussions/categories/ideas).

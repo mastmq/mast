@@ -23,6 +23,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -92,6 +94,15 @@ type Metrics struct {
 	// for them: what was published between a node's death and its
 	// detection.
 	QueuerReplayed prometheus.Counter
+
+	// LimitExceeded counts what a tenant's limits refused, by tenant and by
+	// limit: "connections", "publish_rate", or "offline_queue" for queued
+	// messages discarded on reconnect because the queue held more than the
+	// tenant may keep.
+	LimitExceeded *prometheus.CounterVec
+
+	// tenants bounds how many label values the tenant label takes.
+	tenants *tenantLabels
 }
 
 // NATSCounts is what the NATS client's asynchronous handlers have observed.
@@ -115,8 +126,9 @@ type Sources struct {
 	NATS func() NATSCounts
 }
 
-// NewMetrics registers mast's metrics on a registry.
-func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
+// NewMetrics registers mast's metrics on a registry. maxTenants bounds how
+// many tenants get a label value of their own; zero leaves it unbounded.
+func NewMetrics(reg prometheus.Registerer, src Sources, maxTenants int) *Metrics {
 	factory := func(name, help string, labels ...string) *prometheus.CounterVec {
 		c := prometheus.NewCounterVec(prometheus.CounterOpts{ //nolint:exhaustruct_v5 // defaults are right
 			Namespace: namespace,
@@ -152,11 +164,8 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 		OfflineQueued:    factory("offline_queued_total", "Messages stored for a client that was absent.", "tenant"),
 		OfflineDelivered: factory("offline_delivered_total", "Messages replayed to a client that came back.", "tenant"),
 		NATSSubs:         nil,
-		DurableFailures: prometheus.NewCounter(prometheus.CounterOpts{ //nolint:exhaustruct_v5 // defaults are right
-			Namespace: namespace,
-			Name:      "durable_publish_failures_total",
-			Help:      "QoS 1 and 2 publishes refused because the durable stream would not store them.",
-		}),
+		DurableFailures: counter(reg, "durable_publish_failures_total",
+			"QoS 1 and 2 publishes refused because the durable stream would not store them."),
 		DurableRead: factory("durable_read_total", "Messages read off the durable stream.", "reader"),
 		QueuerAway: prometheus.NewGauge(prometheus.GaugeOpts{ //nolint:exhaustruct_v5 // defaults are right
 			Namespace: namespace,
@@ -169,6 +178,9 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 			"Sessions taken over from nodes declared dead."),
 		QueuerReplayed: counter(reg, "queuer_replayed_total",
 			"Messages queued by replaying the durable stream after a node was declared dead."),
+		LimitExceeded: factory("limit_exceeded_total",
+			"Connections, publishes and queued messages refused or discarded by a tenant limit.", "tenant", "limit"),
+		tenants: &tenantLabels{max: maxTenants, known: sync.Map{}, mu: sync.Mutex{}, count: 0, full: atomic.Bool{}},
 	}
 
 	if src.Subscriptions != nil {
@@ -180,7 +192,7 @@ func NewMetrics(reg prometheus.Registerer, src Sources) *Metrics {
 		reg.MustRegister(m.NATSSubs)
 	}
 
-	reg.MustRegister(m.DurableFailures, m.QueuerAway)
+	reg.MustRegister(m.QueuerAway)
 	registerNATSCounts(reg, src.NATS)
 
 	return m
@@ -198,6 +210,70 @@ func counter(reg prometheus.Registerer, name, help string) prometheus.Counter {
 	reg.MustRegister(c)
 
 	return c
+}
+
+// OtherTenants is the label value every tenant past the bound shares. A
+// tenant id is restricted to [A-Za-z0-9_-], so no real tenant can be named
+// this and have its series mistaken for the overflow.
+const OtherTenants = "~other"
+
+// Tenant is the label value to record id under: id itself for the first
+// tenants this node sees, up to the configured bound, and [OtherTenants]
+// for the rest.
+//
+// The first come keep their labels for the life of the process. A tenant
+// that changes series halfway through would break every rate() over it,
+// which is worse than a late tenant being folded into the overflow.
+func (m *Metrics) Tenant(id string) string { return m.tenants.label(id) }
+
+// tenantLabels hands out label values until it has handed out max.
+//
+// label runs on every publish and every delivery, from every connection's
+// goroutine at once, and the set of tenants it knows only grows. That is
+// the shape sync.Map serves without a lock: under an RWMutex the readers
+// alone contend on its reader count, which is what the bridge's tenant map
+// moved away from for the same reason. full lets a tenant past the bound
+// be answered without the lock as well.
+type tenantLabels struct {
+	max   int
+	known sync.Map
+
+	// mu serialises admitting a new tenant, which count and full need to be
+	// exact about.
+	mu    sync.Mutex
+	count int
+	full  atomic.Bool
+}
+
+func (t *tenantLabels) label(id string) string {
+	if t.max == 0 {
+		return id
+	}
+
+	if _, ok := t.known.Load(id); ok {
+		return id
+	}
+
+	if t.full.Load() {
+		return OtherTenants
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if _, ok := t.known.Load(id); ok {
+		return id
+	}
+
+	if t.count >= t.max {
+		return OtherTenants
+	}
+
+	t.known.Store(id, struct{}{})
+	t.count++
+	t.full.Store(t.count >= t.max)
+
+	return id
 }
 
 // registerNATSCounts publishes the fabric's asynchronous tallies.

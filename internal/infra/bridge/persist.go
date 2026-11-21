@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/mastmq/mast/internal/domain/tenant"
-	"github.com/mastmq/mast/internal/domain/topic"
 	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mastmq/mochi/v2"
@@ -14,15 +13,10 @@ import (
 )
 
 // sessionKey is where a client's durable state lives in the key-value
-// buckets.
-//
-// Both tokens are escaped for the same reason the control-plane subject
-// escapes them, and because the codec's character set was chosen so that an
-// encoded token is also a valid JetStream key. A client id arrives from the
-// wire; unescaped it could collide with another client's key or fail to
-// store at all.
+// buckets. The format belongs to the store, which lists and counts by it;
+// see [store.SessionKey].
 func sessionKey(id tenant.ID, clientID string) string {
-	return topic.EncodeToken(string(id)) + "." + topic.EncodeToken(clientID)
+	return store.SessionKey(string(id), clientID)
 }
 
 // persistSession records what a connected client is subscribed to, so
@@ -348,6 +342,8 @@ func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string, 
 		return after, false
 	}
 
+	h.limitBacklog(id, &backlog)
+
 	through, legacy := backlog.Through, backlog.Legacy
 	sent := make([]sentBacklog, 0, len(backlog.Messages))
 
@@ -374,7 +370,7 @@ func (h *Hook) drainOffline(cl *mqtt.Client, id tenant.ID, bareClientID string, 
 
 	if len(sent) > 0 {
 		h.count(func(m *obs.Metrics) {
-			m.OfflineDelivered.WithLabelValues(string(id)).Add(float64(len(sent)))
+			m.OfflineDelivered.WithLabelValues(m.Tenant(string(id))).Add(float64(len(sent)))
 		})
 		h.log.Info("offline queue delivered",
 			"client", bareClientID, "tenant", string(id), "messages", len(sent))
@@ -568,12 +564,18 @@ func (h *Hook) discardOffline(id tenant.ID, bareClientID string) {
 // client, and persisting it would turn a fire-and-forget message into
 // storage that outlives the thing it described.
 func (h *Hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) {
-	if h.store == nil || !queuesForAbsence(cl) {
+	if !queuesForAbsence(cl) {
 		return
 	}
 
 	id, ok := h.tenantOf(cl)
 	if !ok {
+		return
+	}
+
+	h.limitInflight(cl, id)
+
+	if h.store == nil {
 		return
 	}
 
@@ -613,6 +615,6 @@ func (h *Hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) 
 		return
 	}
 
-	h.count(func(m *obs.Metrics) { m.OfflineQueued.WithLabelValues(string(id)).Inc() })
+	h.count(func(m *obs.Metrics) { m.OfflineQueued.WithLabelValues(m.Tenant(string(id))).Inc() })
 	h.log.Debug("queued for an absent client", "client", cl.ID, "topic", msg.Topic)
 }

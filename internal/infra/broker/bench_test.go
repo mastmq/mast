@@ -1,7 +1,10 @@
 package broker_test
 
 import (
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -18,11 +21,23 @@ import (
 func startNode(tb testing.TB) (*broker.Broker, string) {
 	tb.Helper()
 
+	return startNodeWith(tb, nil)
+}
+
+// startNodeWith is startNode with a hook that adjusts the configuration
+// before the node starts. A nil hook changes nothing.
+func startNodeWith(tb testing.TB, adjust func(*config.Config)) (*broker.Broker, string) {
+	tb.Helper()
+
 	cfg := config.Default()
 	cfg.MQTT.Addr = freeAddr(tb)
 	cfg.NATS.MonitorAddr = ""
 	cfg.Obs.Addr = anyPort
 	cfg.Core.StoreDir = tb.TempDir()
+
+	if adjust != nil {
+		adjust(&cfg)
+	}
 
 	node, err := broker.Start(tb.Context(), cfg, byUsername{}, tenant.AllowAll{}, slog.New(slog.DiscardHandler))
 	if err != nil {
@@ -70,6 +85,35 @@ func dialBench( //nolint:ireturn // paho's constructor returns the interface
 // design is judged by, so it is kept where every change runs it.
 func BenchmarkPublishQoS0(b *testing.B) {
 	_, addr := startNode(b)
+
+	benchPublishQoS0(b, addr)
+}
+
+// BenchmarkPublishQoS0Traced is the same path with every message sampled
+// and exported to a collector that accepts and discards, which is the most
+// tracing can cost: what a sampling ratio below one saves is measured from
+// here.
+func BenchmarkPublishQoS0Traced(b *testing.B) {
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	b.Cleanup(collector.Close)
+
+	_, addr := startNodeWith(b, func(cfg *config.Config) {
+		cfg.Tracing.Enabled = true
+		cfg.Tracing.Endpoint = collector.URL
+		cfg.Tracing.Sampler = "always_on"
+	})
+
+	benchPublishQoS0(b, addr)
+}
+
+// benchPublishQoS0 publishes from one client to another through the node
+// at addr, as fast as the publisher can write.
+func benchPublishQoS0(b *testing.B, addr string) {
+	b.Helper()
 
 	var received atomic.Int64
 

@@ -177,9 +177,75 @@ func TestValidate(t *testing.T) {
 			},
 			config.ErrBadAuthTimeout,
 		},
+		{"negative connection limit", func(c *config.Config) { c.Limits.MaxConnections = -1 }, config.ErrBadLimit},
+		{"empty offline queue", func(c *config.Config) { c.Limits.OfflineQueue = 0 }, config.ErrBadLimit},
+		{"no sync interval", func(c *config.Config) { c.Limits.SyncInterval = 0 }, config.ErrBadLimit},
+		{
+			"negative tenant rate",
+			func(c *config.Config) {
+				c.Limits.Tenants = map[string]config.TenantLimits{"acme": {PublishRate: new(-1.0)}}
+			},
+			config.ErrBadLimit,
+		},
 		{
 			"static auth ignores the http timeout",
 			func(c *config.Config) { c.Auth.HTTP.Timeout = 0 },
+			nil,
+		},
+		{
+			"an admin api with no token",
+			func(c *config.Config) { c.Admin.Addr = ":9091" },
+			config.ErrAdminNeedsToken,
+		},
+		{
+			"an admin api that waits for no node",
+			func(c *config.Config) {
+				c.Admin.Addr = ":9091"
+				c.Admin.TokenFile = "/run/secrets/admin"
+				c.Admin.Gather = 0
+			},
+			config.ErrBadAdminGather,
+		},
+		{
+			"an admin api that waits longer than any request should",
+			func(c *config.Config) {
+				c.Admin.Addr = ":9091"
+				c.Admin.TokenFile = "/run/secrets/admin"
+				c.Admin.Gather = 10 * time.Second
+			},
+			config.ErrBadAdminGather,
+		},
+		{
+			"an admin api at the longest gather",
+			func(c *config.Config) {
+				c.Admin.Addr = ":9091"
+				c.Admin.TokenFile = "/run/secrets/admin"
+				c.Admin.Gather = config.MaxAdminGather
+			},
+			nil,
+		},
+		{
+			"an admin api with a token file",
+			func(c *config.Config) {
+				c.Admin.Addr = ":9091"
+				c.Admin.TokenFile = "/run/secrets/admin"
+			},
+			nil,
+		},
+		{
+			"no admin api ignores its settings",
+			func(c *config.Config) { c.Admin.Gather = 0 },
+			nil,
+		},
+		{"unknown sampler", func(c *config.Config) { c.Tracing.Sampler = "ratio" }, config.ErrInvalidSampler},
+		{"sampling ratio above one", func(c *config.Config) { c.Tracing.SamplerArg = "1.5" }, config.ErrBadSamplerArg},
+		{"sampling ratio not a number", func(c *config.Config) { c.Tracing.SamplerArg = "1%" }, config.ErrBadSamplerArg},
+		{
+			"a ratio sampler",
+			func(c *config.Config) {
+				c.Tracing.Sampler = "parentbased_traceidratio"
+				c.Tracing.SamplerArg = "0.01"
+			},
 			nil,
 		},
 	}
@@ -195,6 +261,52 @@ func TestValidate(t *testing.T) {
 				t.Errorf("Validate error = %v, want %v", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestTenantLimitsLoad covers both ways an operator names a tenant's
+// limits, and the property that makes overrides worth having: a field an
+// entry leaves out is not read as zero, which would mean unlimited.
+// Not parallel: t.Setenv and t.Parallel are mutually exclusive.
+func TestTenantLimitsLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mast.toml")
+	if err := os.WriteFile(path, []byte(`
+[limits]
+max_connections = 10
+[limits.tenants.acme]
+max_connections = 500
+offline_queue = 1000
+`), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	t.Setenv("MAST__LIMITS__TENANTS__GLOBEX__PUBLISH_RATE", "2.5")
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	acme := cfg.Limits.Tenants["acme"]
+	if acme.MaxConnections == nil || *acme.MaxConnections != 500 {
+		t.Errorf("acme max_connections = %v, want 500", acme.MaxConnections)
+	}
+
+	if acme.PublishRate != nil {
+		t.Errorf("acme publish_rate = %v, want unset", *acme.PublishRate)
+	}
+
+	globex := cfg.Limits.Tenants["globex"]
+	if globex.PublishRate == nil || *globex.PublishRate != 2.5 {
+		t.Errorf("globex publish_rate from the environment = %v, want 2.5", globex.PublishRate)
+	}
+
+	if got := cfg.Limits.QueueCeiling(); got != 1000 {
+		t.Errorf("QueueCeiling = %d, want acme's 1000 over the default 100", got)
 	}
 }
 
@@ -231,7 +343,7 @@ func TestExampleIsExhaustiveDefaults(t *testing.T) {
 	for _, key := range defaults.Keys() {
 		// Headers are a map of arbitrary names with nothing to default, so
 		// the example can only show one commented out.
-		if key == "auth.http.headers" {
+		if key == "auth.http.headers" || key == "limits.tenants" {
 			continue
 		}
 
@@ -259,6 +371,11 @@ func TestExampleIsExhaustiveDefaults(t *testing.T) {
 		if len(*list) == 0 {
 			*list = nil
 		}
+	}
+
+	// Likewise an absent table of tenant overrides and an empty one.
+	if len(cfg.Limits.Tenants) == 0 {
+		cfg.Limits.Tenants = nil
 	}
 
 	if !reflect.DeepEqual(cfg, want) {

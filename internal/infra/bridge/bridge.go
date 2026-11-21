@@ -43,11 +43,13 @@ import (
 
 	"github.com/mastmq/mast/internal/domain/tenant"
 	"github.com/mastmq/mast/internal/domain/topic"
+	"github.com/mastmq/mast/internal/infra/limits"
 	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mastmq/mochi/v2"
 	"github.com/mastmq/mochi/v2/packets"
 	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // hookID names this hook in mochi's logs.
@@ -115,7 +117,10 @@ type Hook struct {
 	// by connection rather than by client id, so that a disconnect reported
 	// twice — once by a takeover, once by mochi — is released once, and a
 	// new connection with the same id is never mistaken for the old one.
-	open map[*mqtt.Client]tenant.ID
+	open map[*mqtt.Client]openConn
+	// openByTenant indexes open by tenant, so the admin API's list reads a
+	// tenant's connections without walking every tenant's under the lock.
+	openByTenant map[tenant.ID]map[*mqtt.Client]struct{}
 	// persistedAt is when each client's session was last written, so the
 	// refresher rewrites only what is about to age out of the bucket.
 	persistedAt map[string]time.Time
@@ -141,11 +146,22 @@ type Hook struct {
 	noticeSub *nats.Subscription
 	nodeID    string
 
+	// adminSub is the one subscription through which the admin API, on
+	// any node, asks this one about the clients it holds.
+	adminSub *nats.Subscription
+
 	// owners is each live connection's own claim token, keyed by the
 	// connection, for the session records it writes.
 	owners sync.Map
 
 	metrics *obs.Metrics
+
+	// limits enforces each tenant's limits. Nil enforces none.
+	limits *limits.Limiter
+
+	// tracer opens the message-path spans, and is nil when tracing is off.
+	// See trace.go.
+	tracer trace.Tracer
 
 	// internalListener is the mochi listener id whose connections skip
 	// authentication, and internalTenant is where they land.
@@ -175,6 +191,23 @@ type Options struct {
 	// DurableQoS carries QoS 1 and 2 across the fabric on the durable
 	// stream, which the store must already have opened.
 	DurableQoS bool
+
+	// Limits enforces per-tenant limits. Nil enforces none. Connections on
+	// the internal listener are never limited: they are the deployment's
+	// own services, and a tenant's devices filling its quota must not lock
+	// them out.
+
+	// TracerProvider traces the message path. Nil disables tracing, which
+	// then costs the publish and delivery paths one comparison each.
+	TracerProvider trace.TracerProvider
+	Limits         *limits.Limiter
+}
+
+// openConn is a connection the gauge counted: its tenant, and whether the
+// limiter counted it too and so has to be told when it goes.
+type openConn struct {
+	tenant  tenant.ID
+	limited bool
 }
 
 // New builds a bridge over an established NATS connection.
@@ -206,7 +239,9 @@ func New(
 		seen:             newSeen(),
 		ids:              newIDs(),
 		tenants:          sync.Map{},
-		open:             make(map[*mqtt.Client]tenant.ID),
+		open:             make(map[*mqtt.Client]openConn),
+		openByTenant:     make(map[tenant.ID]map[*mqtt.Client]struct{}),
+		limits:           opts.Limits,
 		persistedAt:      make(map[string]time.Time),
 		sessionExpiry:    opts.SessionExpiry,
 		stop:             make(chan struct{}),
@@ -217,7 +252,9 @@ func New(
 		sessions:         newSessions(),
 		owners:           sync.Map{},
 		noticeSub:        nil,
+		adminSub:         nil,
 		nodeID:           opts.NodeID,
+		tracer:           tracerFrom(opts.TracerProvider),
 	}
 	h.subs = newRegistry(nc, h.onNATSMessage)
 
@@ -232,6 +269,7 @@ func (h *Hook) Attach(server *mqtt.Server) {
 	h.injector = server.NewClient(nil, mqtt.LocalListener, mqtt.InlineClientId, true)
 
 	h.listenForNotices()
+	h.listenForAdmin()
 
 	if h.nodeID != "" {
 		go h.beat()
@@ -240,6 +278,8 @@ func (h *Hook) Attach(server *mqtt.Server) {
 	if h.store != nil && h.sessionExpiry > 0 {
 		go h.refreshSessions()
 	}
+
+	go h.reapLoop()
 
 	h.startDurable()
 }
@@ -256,6 +296,10 @@ func (h *Hook) Stop() error {
 		if h.noticeSub != nil {
 			// The connection is closing with the server regardless.
 			_ = h.noticeSub.Unsubscribe()
+		}
+
+		if h.adminSub != nil {
+			_ = h.adminSub.Unsubscribe()
 		}
 
 		h.sayGoodbye()
@@ -284,6 +328,7 @@ func (h *Hook) Provides(b byte) bool {
 		mqtt.OnWill,
 		mqtt.OnPacketEncode,
 		mqtt.OnQosPublish,
+		mqtt.OnSessionEstablish,
 		mqtt.OnSessionEstablished,
 		mqtt.OnSelectSubscribers,
 	}, b)
@@ -298,7 +343,10 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	if h.isInternal(cl) {
 		bare := cl.ID
 		cl.ID = mountClient(h.internalTenant, bare)
-		h.onConnected(cl, tenant.Identity{Tenant: h.internalTenant, Superuser: true})
+
+		var unlimited tenant.Overrides
+
+		h.onConnected(cl, tenant.Identity{Tenant: h.internalTenant, Superuser: true, Limits: unlimited}, false)
 		h.claimSession(h.internalTenant, bare, cl)
 
 		if pk.Connect.Clean {
@@ -329,9 +377,13 @@ func (h *Hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	bare := cl.ID
 	cl.ID = mountClient(identity.Tenant, bare)
 
+	if !h.admit(cl, identity) {
+		return false
+	}
+
 	h.log.Debug("client authenticated",
 		"client", cl.ID, "tenant", string(identity.Tenant), "superuser", identity.Superuser)
-	h.onConnected(cl, identity)
+	h.onConnected(cl, identity, h.limits != nil)
 
 	// Announce the claim so a copy of this client on another node stands
 	// down. mochi has already displaced any local copy by this point.
@@ -463,6 +515,10 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		return pk, packets.ErrNotAuthorized
 	}
 
+	if h.overRate(cl, id) {
+		return h.rateLimited(cl, pk, id)
+	}
+
 	subject, err := topic.EncodeTopic(string(id), unmount(id, pk.TopicName))
 	if err != nil {
 		h.log.Warn("dropping publish with unencodable topic",
@@ -473,34 +529,41 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 
 	msg := h.fabricMessage(subject, pk)
 
+	ctx := context.Background()
+
+	if h.tracer != nil {
+		var span trace.Span
+
+		ctx, span = h.startPublish(cl, id, pk, msg)
+		defer span.End()
+	}
+
 	// QoS 1 and 2 are stored before anything else happens, the retained
 	// copy included: mochi sends the PUBACK or PUBREC when this returns,
 	// and that acknowledgement is a promise the fabric alone cannot keep.
 	// Core NATS drops a message with nowhere to go, so a node cut off for
 	// a second lost everything published for its clients in that second,
 	// and the publishers had been told it was delivered (#11).
-	if pk.FixedHeader.Qos > 0 && h.durable.Load() {
-		if err := h.publishDurable(msg); err != nil {
-			h.log.Warn("refusing a publish the fabric could not store",
-				"client", cl.ID, "tenant", string(id), "error", err)
-
-			return h.refuse(cl, pk)
-		}
-
-		msg.Header.Set(headerDurable, "1")
+	if !h.storeDurable(ctx, cl, id, pk, msg) {
+		return h.refuse(cl, pk)
 	}
 
 	if pk.FixedHeader.Retain {
-		h.storeRetained(subject, unmount(id, pk.TopicName), pk)
+		h.storeRetained(ctx, subject, unmount(id, pk.TopicName), pk)
 	}
 
 	// Still published on core NATS: shared groups are served from the
 	// queue copy, and a node not reading the stream relies on the plain one.
-	if err := h.nc.PublishMsg(msg); err != nil {
+	_, span := h.startChild(ctx, "nats.publish", trace.SpanKindProducer)
+
+	err = h.nc.PublishMsg(msg)
+	if err != nil {
 		h.log.Error("forwarding publish to nats", "subject", subject, "error", err)
 	}
 
-	h.count(func(m *obs.Metrics) { m.MessagesIn.WithLabelValues(string(id)).Inc() })
+	endSpan(span, err)
+
+	h.count(func(m *obs.Metrics) { m.MessagesIn.WithLabelValues(m.Tenant(string(id))).Inc() })
 
 	return pk, packets.CodeSuccessIgnore
 }
@@ -617,7 +680,7 @@ func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 	props := packets.Properties{User: will.User}
 
 	if will.Retain {
-		h.storeRetained(subject, will.TopicName, packets.Packet{
+		h.storeRetained(context.Background(), subject, will.TopicName, packets.Packet{
 			FixedHeader: packets.FixedHeader{Qos: will.Qos, Retain: true},
 			Payload:     will.Payload,
 			Properties:  props,
@@ -636,7 +699,7 @@ func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 	// Nobody is waiting on an acknowledgement for a will, so a failed store
 	// falls back to the plain fabric rather than losing the will outright.
 	if will.Qos > 0 && h.durable.Load() {
-		if err := h.publishDurable(msg); err != nil {
+		if err := h.publishDurable(context.Background(), msg); err != nil {
 			h.log.Warn("storing a will on the durable stream", "client", cl.ID, "error", err)
 		} else {
 			msg.Header.Set(headerDurable, "1")
@@ -809,14 +872,15 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 		}
 	}
 
-	h.inject(msg.Subject, msg.Header, msg.Data, queue, queueSubject)
+	h.inject(msg.Subject, msg.Header, msg.Data, queue, queueSubject, viaCore)
 }
 
 // inject hands a message from the fabric — core NATS or the durable stream
 // — to mochi for this node's local subscribers. queue is empty for a plain
 // copy; for a queue copy it names the group NATS picked this node for, and
-// queueSubject the subscription it arrived on.
-func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, queueSubject string) {
+// queueSubject the subscription it arrived on. via says which of the two
+// paths it took, for its trace.
+func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, queueSubject, via string) {
 	tenantID, mqttTopic, err := topic.DecodeTopic(subject)
 	if err != nil {
 		h.log.Warn("undecodable subject from nats", "subject", subject, "error", err)
@@ -861,6 +925,11 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 		props.MessageExpiryInterval = carried.MessageExpiry
 	}
 
+	var span trace.Span
+	if h.tracer != nil {
+		span, props.User = h.startDeliver(header, props.User, tenantID, mqttTopic, queue, via)
+	}
+
 	err = h.server.InjectPacket(h.injector, packets.Packet{
 		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: qos},
 		TopicName:   mounted,
@@ -871,13 +940,16 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 		PacketID:   uint16(qos),
 		Properties: props,
 	})
+
+	endSpan(span, err)
+
 	if err != nil {
 		h.log.Error("injecting message from the fabric", "subject", subject, "error", err)
 
 		return
 	}
 
-	h.count(func(m *obs.Metrics) { m.MessagesOut.WithLabelValues(tenantID).Inc() })
+	h.count(func(m *obs.Metrics) { m.MessagesOut.WithLabelValues(m.Tenant(tenantID)).Inc() })
 }
 
 // route is what the bridge tells its own later hooks about a message it
@@ -1052,12 +1124,14 @@ func queueName(id tenant.ID, share string) string {
 
 // storeRetained records a retained publish, or clears it when the payload is
 // empty, which is what MQTT says a retained publish with no payload means.
-func (h *Hook) storeRetained(subject, bareTopic string, pk packets.Packet) {
+func (h *Hook) storeRetained(ctx context.Context, subject, bareTopic string, pk packets.Packet) {
 	if h.store == nil {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	ctx, span := h.startChild(ctx, "mast.store.retained", trace.SpanKindClient)
+
+	ctx, cancel := context.WithTimeout(ctx, storeTimeout)
 	defer cancel()
 
 	err := h.store.PutRetained(ctx, subject, store.Message{
@@ -1068,6 +1142,9 @@ func (h *Hook) storeRetained(subject, bareTopic string, pk packets.Packet) {
 		Properties: messageProps(pk.Properties),
 		StoredAt:   0, // PutRetained stamps it
 	})
+
+	endSpan(span, err)
+
 	if err != nil {
 		h.log.Error("storing retained message", "subject", subject, "error", err)
 	}
@@ -1123,7 +1200,7 @@ func (h *Hook) replayRetained(cl *mqtt.Client, id tenant.ID, filter packets.Subs
 
 	if len(messages) > 0 {
 		h.count(func(m *obs.Metrics) {
-			m.RetainedReplayed.WithLabelValues(string(id)).Add(float64(len(messages)))
+			m.RetainedReplayed.WithLabelValues(m.Tenant(string(id))).Add(float64(len(messages)))
 		})
 	}
 
@@ -1249,34 +1326,127 @@ func (h *Hook) forget(clientID string) {
 // the internal listener returned early, so a node holding thousands of
 // connections on it reported none, and the gauge was blind to the one
 // listener a load test is most likely to use.
-func (h *Hook) onConnected(cl *mqtt.Client, identity tenant.Identity) {
+//
+// limited says the limiter counted the connection, so that whoever releases
+// it from the gauge releases it from the limiter too, exactly once.
+func (h *Hook) onConnected(cl *mqtt.Client, identity tenant.Identity, limited bool) {
 	h.tenants.Store(cl.ID, identity)
 
 	h.mu.Lock()
-	h.open[cl] = identity.Tenant
+	h.open[cl] = openConn{tenant: identity.Tenant, limited: limited}
+
+	conns, ok := h.openByTenant[identity.Tenant]
+	if !ok {
+		conns = make(map[*mqtt.Client]struct{})
+		h.openByTenant[identity.Tenant] = conns
+	}
+
+	conns[cl] = struct{}{}
 	h.mu.Unlock()
 
 	h.count(func(m *obs.Metrics) {
-		m.ConnectionsTotal.WithLabelValues(string(identity.Tenant)).Inc()
-		m.ConnectionsOpen.WithLabelValues(string(identity.Tenant)).Inc()
+		m.ConnectionsTotal.WithLabelValues(m.Tenant(string(identity.Tenant))).Inc()
+		m.ConnectionsOpen.WithLabelValues(m.Tenant(string(identity.Tenant))).Inc()
 	})
 }
 
 // onDisconnected records a connection going away. It is safe to call more
-// than once for the same connection; only the first call counts.
-func (h *Hook) onDisconnected(cl *mqtt.Client) {
+// than once for the same connection; only the first call counts, and it
+// reports whether this call was that one.
+func (h *Hook) onDisconnected(cl *mqtt.Client) bool {
 	h.mu.Lock()
-	id, counted := h.open[cl]
+	conn, counted := h.open[cl]
 	delete(h.open, cl)
+
+	if conns := h.openByTenant[conn.tenant]; counted && conns != nil {
+		delete(conns, cl)
+
+		// A tenant whose last device left takes no room.
+		if len(conns) == 0 {
+			delete(h.openByTenant, conn.tenant)
+		}
+	}
 	h.mu.Unlock()
 
 	if !counted {
-		return
+		return false
+	}
+
+	if conn.limited {
+		h.limits.Release(conn.tenant)
 	}
 
 	h.count(func(m *obs.Metrics) {
-		m.ConnectionsOpen.WithLabelValues(string(id)).Dec()
+		m.ConnectionsOpen.WithLabelValues(m.Tenant(string(conn.tenant))).Dec()
 	})
+
+	return true
+}
+
+// reapInterval is how often counted connections that mochi closed without
+// an OnDisconnect are released. A leaked slot is also reported to every
+// other node, so this bounds how long the cluster counts one, not only this
+// node.
+const reapInterval = 5 * time.Second
+
+// reapClosed releases every connection still counted as open that mochi has
+// already closed, and reports how many there were.
+//
+// mochi calls OnConnectAuthenticate, which counts a connection, and later
+// OnDisconnect, which releases it; but between the two, attachClient
+// returns without OnDisconnect when the CONNACK write fails or when
+// resending a resumed session's inflight messages fails. The second is
+// ordinary: a device with a backlog whose link drops, or which is taken
+// over, while the backlog is being resent. Each one leaked a slot for the
+// life of the process, so a tenant of flaky mobile devices at its limit was
+// slowly locked out on every node. attachClient always stops the client on
+// its way out, so a closed client still counted here is exactly such a
+// leak, or a normal disconnect a moment before its OnDisconnect, which
+// onDisconnected's once-only release makes harmless.
+//
+// mastmq/mochi v2.7.15 calls OnDisconnect on both of those paths now; this
+// stays as the guarantee that a slot cannot leak for good whatever path
+// mochi grows next.
+func (h *Hook) reapClosed() int {
+	h.mu.Lock()
+
+	var closed []*mqtt.Client
+
+	for cl := range h.open {
+		if cl.Closed() {
+			closed = append(closed, cl)
+		}
+	}
+	h.mu.Unlock()
+
+	reaped := 0
+
+	for _, cl := range closed {
+		if h.onDisconnected(cl) {
+			reaped++
+		}
+	}
+
+	if reaped > 0 {
+		h.log.Debug("released connections mochi closed without a disconnect", "connections", reaped)
+	}
+
+	return reaped
+}
+
+// reapLoop runs reapClosed every reapInterval until the hook stops.
+func (h *Hook) reapLoop() {
+	ticker := time.NewTicker(reapInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-h.stop:
+			return
+		case <-ticker.C:
+			h.reapClosed()
+		}
+	}
 }
 
 // count records a metric when metrics are enabled, so every call site stays
