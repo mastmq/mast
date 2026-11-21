@@ -44,6 +44,8 @@ While a cluster is up, `reads` prints per node what each reader took off `mast_q
 
 ## Things learned running it
 
+**A total does not say which kill lost it.** `drill live` prints each lost message's device and publish time, and the drills are scripts, so split one: for dead-edge detection (#34), `drill-live.sh` with only its edge kill went from 64 to 1,556 lost on `main` to none in three runs of three, while the core kill and the graceful restart alone lost the same handful on both builds — every lost message published within one tenth of a second, about ten seconds after the graceful restart (#40). The full drill had hidden that behind one number per run. The edge kill now costs about 2,300 duplicates and a p99 of about 38 seconds instead, since a device that already moved receives the gap through its edge's straggler check.
+
 **Run every delivery drill at least four times and against a baseline.** Loss under chaos depends on which core happened to hold which consumer when it died; one failure surfaced once in four runs. A single green run proves nothing, and a number with no baseline beside it cannot say whether the change helped.
 
 **Load runs inside the network, never through a published port.** On colima a published port is a userspace proxy, and that is what gets measured. `run` puts the generator on the `mastfire` network with two CPUs of its own.
