@@ -41,4 +41,11 @@ var (
 	// any other node can answer, which would report a cluster as one node,
 	// and one so long that every list and stats request waits it out.
 	ErrBadAdminGather = errors.New("config: admin.gather must be positive and at most 5s")
+
+	// ErrInvalidSampler guards against a typo that would otherwise fall
+	// back to sampling everything, or nothing, without a word.
+	ErrInvalidSampler = errors.New("config: invalid tracing.sampler")
+
+	// ErrBadSamplerArg is returned for a sampling ratio outside [0, 1].
+	ErrBadSamplerArg = errors.New("config: tracing.sampler_arg must be a ratio between 0 and 1")
 )

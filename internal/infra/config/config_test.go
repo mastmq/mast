@@ -227,6 +227,17 @@ func TestValidate(t *testing.T) {
 			func(c *config.Config) { c.Admin.Gather = 0 },
 			nil,
 		},
+		{"unknown sampler", func(c *config.Config) { c.Tracing.Sampler = "ratio" }, config.ErrInvalidSampler},
+		{"sampling ratio above one", func(c *config.Config) { c.Tracing.SamplerArg = "1.5" }, config.ErrBadSamplerArg},
+		{"sampling ratio not a number", func(c *config.Config) { c.Tracing.SamplerArg = "1%" }, config.ErrBadSamplerArg},
+		{
+			"a ratio sampler",
+			func(c *config.Config) {
+				c.Tracing.Sampler = "parentbased_traceidratio"
+				c.Tracing.SamplerArg = "0.01"
+			},
+			nil,
+		},
 	}
 
 	for _, tc := range cases {

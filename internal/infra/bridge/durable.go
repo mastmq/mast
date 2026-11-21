@@ -10,6 +10,7 @@ import (
 	mqtt "github.com/mastmq/mochi/v2"
 	"github.com/mastmq/mochi/v2/packets"
 	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // headerDurable marks a core NATS copy of a message that was also stored on
@@ -56,16 +57,25 @@ func (h *Hook) startDurable() {
 // publishDurable stores a QoS 1 or 2 message on the durable stream and
 // returns once it is replicated. Only then may the publisher be told the
 // broker has it.
-func (h *Hook) publishDurable(msg *nats.Msg) error {
+//
+// ctx carries the trace the store is a step of; its deadline is this
+// function's own.
+func (h *Hook) publishDurable(ctx context.Context, msg *nats.Msg) error {
+	ctx, span := h.startChild(ctx, "mast.store.durable", trace.SpanKindClient)
+
 	stored := nats.NewMsg(store.DurablePrefix + strings.TrimPrefix(msg.Subject, fabricPrefix))
 	stored.Data = msg.Data
 
 	maps.Copy(stored.Header, msg.Header)
 
-	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, storeTimeout)
 	defer cancel()
 
-	if err := h.store.PublishDurable(ctx, stored, msg.Header.Get(headerID)); err != nil {
+	err := h.store.PublishDurable(ctx, stored, msg.Header.Get(headerID))
+
+	endSpan(span, err)
+
+	if err != nil {
 		h.count(func(m *obs.Metrics) { m.DurableFailures.Inc() })
 
 		return err
@@ -111,5 +121,5 @@ func (h *Hook) onDurable(subject string, header nats.Header, data []byte) {
 	}
 
 	fabric := fabricPrefix + strings.TrimPrefix(subject, store.DurablePrefix)
-	h.inject(fabric, header, data, "", "")
+	h.inject(fabric, header, data, "", "", viaStream)
 }

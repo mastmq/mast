@@ -48,6 +48,8 @@ import (
 	mqtt "github.com/mastmq/mochi/v2"
 	"github.com/mastmq/mochi/v2/packets"
 	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // hookID names this hook in mochi's logs.
@@ -154,6 +156,10 @@ type Hook struct {
 
 	metrics *obs.Metrics
 
+	// tracer opens the message-path spans, and is nil when tracing is off.
+	// See trace.go.
+	tracer trace.Tracer
+
 	// internalListener is the mochi listener id whose connections skip
 	// authentication, and internalTenant is where they land.
 	internalListener string
@@ -182,6 +188,10 @@ type Options struct {
 	// DurableQoS carries QoS 1 and 2 across the fabric on the durable
 	// stream, which the store must already have opened.
 	DurableQoS bool
+
+	// TracerProvider traces the message path. Nil disables tracing, which
+	// then costs the publish and delivery paths one comparison each.
+	TracerProvider trace.TracerProvider
 }
 
 // New builds a bridge over an established NATS connection.
@@ -227,6 +237,7 @@ func New(
 		noticeSub:        nil,
 		adminSub:         nil,
 		nodeID:           opts.NodeID,
+		tracer:           tracerFrom(opts.TracerProvider),
 	}
 	h.subs = newRegistry(nc, h.onNATSMessage)
 
@@ -481,6 +492,15 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 
 	msg := h.fabricMessage(subject, pk)
 
+	ctx := context.Background()
+
+	if h.tracer != nil {
+		var span trace.Span
+
+		ctx, span = h.startPublish(cl, id, pk, msg)
+		defer span.End()
+	}
+
 	// QoS 1 and 2 are stored before anything else happens, the retained
 	// copy included: mochi sends the PUBACK or PUBREC when this returns,
 	// and that acknowledgement is a promise the fabric alone cannot keep.
@@ -488,7 +508,8 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	// a second lost everything published for its clients in that second,
 	// and the publishers had been told it was delivered (#11).
 	if pk.FixedHeader.Qos > 0 && h.durable.Load() {
-		if err := h.publishDurable(msg); err != nil {
+		if err := h.publishDurable(ctx, msg); err != nil {
+			trace.SpanFromContext(ctx).SetStatus(codes.Error, "refused: the durable stream could not store it")
 			h.log.Warn("refusing a publish the fabric could not store",
 				"client", cl.ID, "tenant", string(id), "error", err)
 
@@ -499,14 +520,19 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	}
 
 	if pk.FixedHeader.Retain {
-		h.storeRetained(subject, unmount(id, pk.TopicName), pk)
+		h.storeRetained(ctx, subject, unmount(id, pk.TopicName), pk)
 	}
 
 	// Still published on core NATS: shared groups are served from the
 	// queue copy, and a node not reading the stream relies on the plain one.
-	if err := h.nc.PublishMsg(msg); err != nil {
+	_, span := h.startChild(ctx, "nats.publish", trace.SpanKindProducer)
+
+	err = h.nc.PublishMsg(msg)
+	if err != nil {
 		h.log.Error("forwarding publish to nats", "subject", subject, "error", err)
 	}
+
+	endSpan(span, err)
 
 	h.count(func(m *obs.Metrics) { m.MessagesIn.WithLabelValues(string(id)).Inc() })
 
@@ -625,7 +651,7 @@ func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 	props := packets.Properties{User: will.User}
 
 	if will.Retain {
-		h.storeRetained(subject, will.TopicName, packets.Packet{
+		h.storeRetained(context.Background(), subject, will.TopicName, packets.Packet{
 			FixedHeader: packets.FixedHeader{Qos: will.Qos, Retain: true},
 			Payload:     will.Payload,
 			Properties:  props,
@@ -644,7 +670,7 @@ func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 	// Nobody is waiting on an acknowledgement for a will, so a failed store
 	// falls back to the plain fabric rather than losing the will outright.
 	if will.Qos > 0 && h.durable.Load() {
-		if err := h.publishDurable(msg); err != nil {
+		if err := h.publishDurable(context.Background(), msg); err != nil {
 			h.log.Warn("storing a will on the durable stream", "client", cl.ID, "error", err)
 		} else {
 			msg.Header.Set(headerDurable, "1")
@@ -817,14 +843,15 @@ func (h *Hook) onNATSMessage(msg *nats.Msg) {
 		}
 	}
 
-	h.inject(msg.Subject, msg.Header, msg.Data, queue, queueSubject)
+	h.inject(msg.Subject, msg.Header, msg.Data, queue, queueSubject, viaCore)
 }
 
 // inject hands a message from the fabric — core NATS or the durable stream
 // — to mochi for this node's local subscribers. queue is empty for a plain
 // copy; for a queue copy it names the group NATS picked this node for, and
-// queueSubject the subscription it arrived on.
-func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, queueSubject string) {
+// queueSubject the subscription it arrived on. via says which of the two
+// paths it took, for its trace.
+func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, queueSubject, via string) {
 	tenantID, mqttTopic, err := topic.DecodeTopic(subject)
 	if err != nil {
 		h.log.Warn("undecodable subject from nats", "subject", subject, "error", err)
@@ -869,6 +896,11 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 		props.MessageExpiryInterval = carried.MessageExpiry
 	}
 
+	var span trace.Span
+	if h.tracer != nil {
+		span, props.User = h.startDeliver(header, props.User, tenantID, mqttTopic, queue, via)
+	}
+
 	err = h.server.InjectPacket(h.injector, packets.Packet{
 		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: qos},
 		TopicName:   mounted,
@@ -879,6 +911,9 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 		PacketID:   uint16(qos),
 		Properties: props,
 	})
+
+	endSpan(span, err)
+
 	if err != nil {
 		h.log.Error("injecting message from the fabric", "subject", subject, "error", err)
 
@@ -1060,12 +1095,14 @@ func queueName(id tenant.ID, share string) string {
 
 // storeRetained records a retained publish, or clears it when the payload is
 // empty, which is what MQTT says a retained publish with no payload means.
-func (h *Hook) storeRetained(subject, bareTopic string, pk packets.Packet) {
+func (h *Hook) storeRetained(ctx context.Context, subject, bareTopic string, pk packets.Packet) {
 	if h.store == nil {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	ctx, span := h.startChild(ctx, "mast.store.retained", trace.SpanKindClient)
+
+	ctx, cancel := context.WithTimeout(ctx, storeTimeout)
 	defer cancel()
 
 	err := h.store.PutRetained(ctx, subject, store.Message{
@@ -1076,6 +1113,9 @@ func (h *Hook) storeRetained(subject, bareTopic string, pk packets.Packet) {
 		Properties: messageProps(pk.Properties),
 		StoredAt:   0, // PutRetained stamps it
 	})
+
+	endSpan(span, err)
+
 	if err != nil {
 		h.log.Error("storing retained message", "subject", subject, "error", err)
 	}

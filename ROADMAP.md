@@ -14,7 +14,7 @@ A gap listed here is still a gap. [Delivery guarantees](https://github.com/mastm
 
 **Admin API** ([#28](https://github.com/mastmq/mast/issues/28)). An HTTP API, off by default, to list and inspect a tenant's sessions, disconnect a client and read a tenant's counts from any node.
 
-**OpenTelemetry tracing** ([#29](https://github.com/mastmq/mast/issues/29)). One trace for one message, from the publisher's listener through the fabric to the subscriber's session, at close to no cost when sampled out.
+**OpenTelemetry tracing** ([#29](https://github.com/mastmq/mast/issues/29)). One trace for one message, from the publisher's listener through the fabric to the subscriber's session, at close to no cost when sampled out. Done on main for the next release: the `[tracing]` block, off by default, exports spans over OTLP/HTTP and carries W3C trace context across nodes and through MQTT 5 user properties. [Tracing](README.md#tracing) shows how to turn it on.
 
 ## Releases and CI
 

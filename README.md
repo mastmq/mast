@@ -31,6 +31,7 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 - **MQTT 5 message properties** — content type, response topic, correlation data, payload format, user properties and message expiry travel with the message across the fabric and through retained messages and offline queues, so MQTT 5 request/response works between nodes. An expired retained or queued message is not delivered
 - **HTTP authentication and authorization** — post the MQTT fields to your own service and let it name the tenant and rule on each topic
 - **Portable sessions** — subscriptions live in a shared bucket and the offline queue on a shared stream, filled by the core tier, so a device that reconnects to a different node finds its session and whatever QoS 1 or 2 traffic it missed, even when the edge it last used has since been restarted. Verified by a cluster test and by killing cores and edges under load in a three-core, three-edge cluster
+- **Tracing, when asked for** — OpenTelemetry spans for a publish, its durable store, its NATS hop and every node's delivery of it, exported over OTLP/HTTP. Trace context crosses nodes in W3C headers on the NATS message, and an MQTT 5 client that sends a `traceparent` user property has its publish traced inside its own trace and its subscribers handed the span that delivered to them. Off by default, and off it costs the publish path a comparison; see [Tracing](#tracing)
 - **Cross-node takeover** — a second connection with an existing client id disconnects the first wherever in the cluster it is, which MQTT requires and a single node cannot do alone. Client ids are scoped to their tenant, so one tenant cannot displace another's device by reusing an id
 
 An [admin API](#admin-api), off by default, lists and disconnects a tenant's sessions across the cluster. End-to-end tests cover it; the fire drills have not run against it yet.
@@ -155,6 +156,24 @@ Environment variables are prefixed `MAST__` and nest with a double underscore, s
 The observability listener (`obs.addr`, `127.0.0.1:9090` by default) serves `/metrics`, `/healthz`, `/readyz` and `/debug/pprof`.
 
 `/healthz` is liveness: it answers 200 for as long as the process runs and answers. `/readyz` answers 200 only when the node can serve, and 503 with the reason when it cannot. An edge is ready when it is serving MQTT and its leaf connection to the core is up; a core or an all-in-one node is ready when its embedded nats-server and JetStream are, by nats-server's own health check. Point a readiness probe at `/readyz` and a liveness probe at `/healthz`, never the other way round: an edge whose core is away is not fixed by a restart, and a liveness probe on `/readyz` would restart every edge in the fleet whenever the core tier is.
+
+## Tracing
+
+Off by default. Turn it on with `tracing.enabled = true` (or `MAST__TRACING__ENABLED=true`) and point it at a collector's OTLP/HTTP port:
+
+```toml
+[tracing]
+enabled = true
+endpoint = "http://otel-collector:4318"
+sampler = "parentbased_traceidratio"
+sampler_arg = "0.01"
+```
+
+Each key left empty defers to its standard variable — `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` — and `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_BSP_*` work as they do for any OpenTelemetry SDK. With nothing set, every trace is sampled and goes to `http://localhost:4318`.
+
+A publish opens `mqtt.publish` on the node it arrives at, with `mast.store.durable`, `mast.store.retained` and `nats.publish` under it, and every node that delivers it opens `mqtt.deliver` under the publish. An MQTT 5 client that sends a `traceparent` user property (and optionally `tracestate`) puts that publish inside its own trace, and a subscriber receives the message with `traceparent` rewritten to the delivery span, so it can carry the same trace on. A message without one is not given one, and a message whose publish was not traced (a will, or one that came through an edge with tracing off) keeps the client's `traceparent` as it was sent. The client's sampled flag is not obeyed: the configured sampler decides for every publish, on a trace id of its own, so a client can neither force its messages to be traced on every node nor hide them. Choose `parentbased_traceidratio` to keep a trace whole across nodes; plain `traceidratio` decides again on each delivering node from the trace id, which the client chose. Spans are batched and dropped, never queued without bound, when a collector is slow or away.
+
+Not traced yet: the replay of an offline queue or a retained message, wills, and the core's queuer.
 
 ## Verifying a release
 
