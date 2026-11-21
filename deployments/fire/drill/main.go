@@ -407,10 +407,12 @@ func live() {
 	}
 
 	lost, dups := 0, 0
+	var missed []string
 	tl.mu.Lock()
 	for p := range acked {
 		if n := tl.seen[p]; n == 0 {
 			lost++
+			missed = append(missed, p)
 		} else if n > 1 {
 			dups += n - 1
 		}
@@ -423,6 +425,18 @@ func live() {
 			return 0
 		}
 		return lat.v[int(q*float64(len(lat.v)-1))].Round(time.Millisecond)
+	}
+	// Which device and when: a total alone cannot say which kill a loss
+	// belongs to. Seconds are from the start of publishing.
+	if len(missed) > 0 {
+		byDev := map[string][]string{}
+		for _, p := range missed {
+			parts := strings.Split(p, ":")
+			var ns int64
+			fmt.Sscan(parts[2], &ns)
+			byDev[parts[0]] = append(byDev[parts[0]], fmt.Sprintf("%.1fs", time.Unix(0, ns).Sub(start).Seconds()))
+		}
+		fmt.Printf("live: lost on %d devices: %v\n", len(byDev), byDev)
 	}
 	fmt.Printf("live: acked=%d lost=%d duplicates=%d never-acked=%d dropped-by-generator=%d subscriber-reconnects=%d latency p50=%v p99=%v p999=%v max=%v\n",
 		len(acked), lost, dups, refused.Load(), behind.Load(), reconnects.Load(), pc(0.5), pc(0.99), pc(0.999), pc(1))
