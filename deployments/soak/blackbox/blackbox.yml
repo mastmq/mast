@@ -1,0 +1,11 @@
+# Probes each node's /readyz, which answers 503 with a reason when the node
+# cannot serve. The chart's readiness alerts read kube_pod_status_ready from
+# kube-state-metrics; prometheus/rules/readiness.yaml derives that series
+# from these probes so the rendered rules work here unchanged.
+modules:
+  readyz:
+    prober: http
+    timeout: 3s
+    http:
+      method: GET
+      valid_status_codes: [200]

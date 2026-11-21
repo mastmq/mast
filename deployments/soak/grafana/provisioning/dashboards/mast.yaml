@@ -1,0 +1,10 @@
+# grafana/dashboards/mast.json is the chart's dashboards/mast.json, copied by
+# ./soak.sh rules. Edit it in mastmq/charts, not here.
+apiVersion: 1
+providers:
+  - name: mast
+    folder: mast
+    type: file
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

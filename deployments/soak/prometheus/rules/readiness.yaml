@@ -1,0 +1,15 @@
+# The chart's readiness alerts read kube_pod_status_ready, which
+# kube-state-metrics publishes in Kubernetes from the probe the kubelet runs
+# on /readyz. Here the blackbox exporter runs that probe, and these rules
+# turn its answer into the same series, so the rendered alerts need no edit.
+groups:
+  - name: soak.readiness
+    rules:
+      - record: kube_pod_status_ready
+        expr: max by (namespace, pod) (1 - probe_success{job="readyz"})
+        labels:
+          condition: "false"
+      - record: kube_pod_status_ready
+        expr: max by (namespace, pod) (probe_success{job="readyz"})
+        labels:
+          condition: "true"

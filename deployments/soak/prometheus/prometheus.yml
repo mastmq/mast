@@ -1,0 +1,59 @@
+# The chart's dashboard and alerts select on the labels a ServiceMonitor
+# scrape adds in Kubernetes: namespace, service and pod. Each target here
+# carries the labels its pod would have under `helm install mast -n soak`,
+# so both work unchanged. Edge pods are named like a Deployment's
+# (mast-edge-<hash>-<id>), because MastEdgeCannotReachCore matches that
+# shape; `node` is the compose service, for reading.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yaml
+
+scrape_configs:
+  - job_name: mast
+    static_configs:
+      - targets: [core-0:9090]
+        labels: {namespace: soak, service: mast-core, pod: mast-core-0, node: core-0}
+      - targets: [core-1:9090]
+        labels: {namespace: soak, service: mast-core, pod: mast-core-1, node: core-1}
+      - targets: [core-2:9090]
+        labels: {namespace: soak, service: mast-core, pod: mast-core-2, node: core-2}
+      - targets: [edge-0:9090]
+        labels: {namespace: soak, service: mast-edge-internal, pod: mast-edge-soak-0, node: edge-0}
+      - targets: [edge-1:9090]
+        labels: {namespace: soak, service: mast-edge-internal, pod: mast-edge-soak-1, node: edge-1}
+      - targets: [standalone:9090]
+        labels: {namespace: soak-standalone, service: mast-internal, pod: mast-0, node: standalone}
+
+  # /readyz through the blackbox exporter, with the same labels, for
+  # rules/readiness.yaml.
+  - job_name: readyz
+    metrics_path: /probe
+    params:
+      module: [readyz]
+    static_configs:
+      - targets: [http://core-0:9090/readyz]
+        labels: {namespace: soak, pod: mast-core-0, node: core-0}
+      - targets: [http://core-1:9090/readyz]
+        labels: {namespace: soak, pod: mast-core-1, node: core-1}
+      - targets: [http://core-2:9090/readyz]
+        labels: {namespace: soak, pod: mast-core-2, node: core-2}
+      - targets: [http://edge-0:9090/readyz]
+        labels: {namespace: soak, pod: mast-edge-soak-0, node: edge-0}
+      - targets: [http://edge-1:9090/readyz]
+        labels: {namespace: soak, pod: mast-edge-soak-1, node: edge-1}
+      - targets: [http://standalone:9090/readyz]
+        labels: {namespace: soak-standalone, pod: mast-0, node: standalone}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]

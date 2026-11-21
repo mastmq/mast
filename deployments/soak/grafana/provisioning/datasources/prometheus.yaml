@@ -1,0 +1,15 @@
+# The dashboard picks its data source from a variable that lists every
+# Prometheus one, so the default here is the one it opens on.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+  - name: Jaeger
+    uid: jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686

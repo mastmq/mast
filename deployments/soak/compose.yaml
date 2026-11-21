@@ -1,0 +1,157 @@
+# A long-running mast stack to soak: three cores, two edges and a standalone
+# node, with Prometheus, the chart's alerts and dashboard, and traces through
+# an OpenTelemetry collector into Jaeger. Start it with ./soak.sh up; the
+# README says what each port is.
+name: mastsoak
+
+x-env: &env
+  MAST_CONFIG: /etc/mast/mast.toml
+  MAST__TRACING__SAMPLER_ARG: ${TRACE_RATIO:-0.05}
+  GOGC: ${GOGC:-100}
+
+x-core-env: &core-env
+  <<: *env
+  MAST__ROLE: core
+  MAST__NATS__CLIENT_ADDR: 0.0.0.0:4222
+  MAST__CORE__LISTEN_ADDR: 0.0.0.0:6222
+  MAST__CORE__ROUTES: nats-route://core-0:6222,nats-route://core-1:6222,nats-route://core-2:6222
+  MAST__CORE__LEAF_ADDR: 0.0.0.0:7422
+  MAST__CORE__STORE_DIR: /home/nonroot/data
+  MAST__CORE__REPLICAS: "3"
+
+x-edge-env: &edge-env
+  <<: *env
+  MAST__ROLE: edge
+  MAST__EDGE__CORE_URLS: nats-leaf://core-0:7422,nats-leaf://core-1:7422,nats-leaf://core-2:7422
+  # Unauthenticated, tenant "default", and reachable only on the compose
+  # network: for connection-scale load, where a token per client is the
+  # generator's work rather than the broker's.
+  MAST__MQTT__INTERNAL_ADDR: 0.0.0.0:1884
+
+x-mast: &mast
+  image: ${MAST_IMAGE:-mast:soak}
+  # Not "always": a node a fault drill stopped on purpose must stay down
+  # until the drill starts it. on-failure still brings back a crash.
+  restart: on-failure
+  networks: [soak]
+  volumes:
+    - ./mast.toml:/etc/mast/mast.toml:ro
+    - ./secrets:/etc/mast/secrets:ro
+
+services:
+  core-0:
+    <<: *mast
+    hostname: core-0
+    environment: {<<: *core-env, MAST__NATS__NAME: core-0, OTEL_RESOURCE_ATTRIBUTES: service.instance.id=core-0}
+    deploy: {resources: {limits: {cpus: "${CORE_CPUS:-1.0}", memory: 1g}}}
+  core-1:
+    <<: *mast
+    hostname: core-1
+    environment: {<<: *core-env, MAST__NATS__NAME: core-1, OTEL_RESOURCE_ATTRIBUTES: service.instance.id=core-1}
+    deploy: {resources: {limits: {cpus: "${CORE_CPUS:-1.0}", memory: 1g}}}
+  core-2:
+    <<: *mast
+    hostname: core-2
+    environment: {<<: *core-env, MAST__NATS__NAME: core-2, OTEL_RESOURCE_ATTRIBUTES: service.instance.id=core-2}
+    deploy: {resources: {limits: {cpus: "${CORE_CPUS:-1.0}", memory: 1g}}}
+
+  edge-0:
+    <<: *mast
+    hostname: edge-0
+    environment: {<<: *edge-env, MAST__NATS__NAME: edge-0, OTEL_RESOURCE_ATTRIBUTES: service.instance.id=edge-0}
+    depends_on: [core-0, core-1, core-2]
+    ports:
+      - 127.0.0.1:${EDGE0_MQTT_PORT:-1883}:1883
+      - 127.0.0.1:${ADMIN_PORT:-8080}:8080
+    deploy: {resources: {limits: {cpus: "1.0", memory: 1g}}}
+  edge-1:
+    <<: *mast
+    hostname: edge-1
+    environment: {<<: *edge-env, MAST__NATS__NAME: edge-1, OTEL_RESOURCE_ATTRIBUTES: service.instance.id=edge-1}
+    depends_on: [core-0, core-1, core-2]
+    ports:
+      - 127.0.0.1:${EDGE1_MQTT_PORT:-1884}:1883
+    deploy: {resources: {limits: {cpus: "1.0", memory: 1g}}}
+
+  # A second, independent broker in the shape of an edge site or a lab: one
+  # process, file-backed JetStream, no cluster. Its alerts are the chart's
+  # standalone rules, under the namespace label soak-standalone.
+  standalone:
+    <<: *mast
+    hostname: standalone
+    environment:
+      <<: *env
+      MAST__ROLE: all-in-one
+      MAST__NATS__NAME: standalone
+      MAST__CORE__STORE_DIR: /home/nonroot/data
+      OTEL_RESOURCE_ATTRIBUTES: service.instance.id=standalone
+    ports:
+      - 127.0.0.1:${STANDALONE_MQTT_PORT:-1885}:1883
+      - 127.0.0.1:${STANDALONE_ADMIN_PORT:-8081}:8080
+    deploy: {resources: {limits: {cpus: "1.0", memory: 1g}}}
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.164.0
+    restart: unless-stopped
+    networks: [soak]
+    command: [--config=/etc/otelcol/config.yaml]
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol/config.yaml:ro
+    depends_on: [jaeger]
+
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0
+    restart: unless-stopped
+    networks: [soak]
+    ports:
+      - 127.0.0.1:${JAEGER_PORT:-16686}:16686
+
+  blackbox:
+    image: prom/blackbox-exporter:v0.29.1
+    restart: unless-stopped
+    networks: [soak]
+    command: [--config.file=/etc/blackbox/blackbox.yml]
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+
+  prometheus:
+    image: prom/prometheus:v3.13.2
+    restart: unless-stopped
+    networks: [soak]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus:/prometheus
+    ports:
+      - 127.0.0.1:${PROMETHEUS_PORT:-9090}:9090
+
+  grafana:
+    image: grafana/grafana:13.1.10
+    restart: unless-stopped
+    networks: [soak]
+    environment:
+      # Bound to loopback only, so the login is the host's and not
+      # Grafana's: no password exists to leak or to forget.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/mast.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana:/var/lib/grafana
+    ports:
+      - 127.0.0.1:${GRAFANA_PORT:-3000}:3000
+    depends_on: [prometheus]
+
+volumes:
+  prometheus:
+  grafana:
+
+networks:
+  soak: {name: mastsoak}

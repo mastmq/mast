@@ -1,0 +1,112 @@
+# Rendered by ./soak.sh rules from mastmq/charts 360f3ea: do not edit.
+# helm template mast charts/mast -n soak -f charts/mast/ci/monitoring-values.yaml
+groups:
+  # Whether the pods are there and serving. These read kube-state-metrics
+  # rather than mast, because a pod that is not serving often has no
+  # metrics to say so, and up only knows whether a scrape answered.
+  - name: mast.availability
+    rules:
+      # An edge's /readyz fails while its leaf link to the core is down,
+      # so a not-ready edge is, past its first seconds, an edge that
+      # cannot reach the core. It keeps its devices connected and carries
+      # nothing across the cluster, and the Service has stopped sending it
+      # new ones. The probe event on the pod carries /readyz's reason.
+      - alert: MastEdgeCannotReachCore
+        expr: |
+          max by (namespace, pod) (
+            kube_pod_status_ready{namespace="soak", pod=~"mast-edge-[a-z0-9]+-[a-z0-9]+", condition="false"}
+          ) == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: mast edge {{ $labels.pod }} is not ready
+          description: "{{ $labels.pod }} has failed /readyz for five minutes. On an edge that means its leaf connection to the core is down; kubectl describe pod shows the reason /readyz gave."
+      - alert: MastCoreNotReady
+        expr: |
+          max by (namespace, pod) (
+            kube_pod_status_ready{namespace="soak", pod=~"mast-core-[0-9]+", condition="false"}
+          ) == 1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: mast core {{ $labels.pod }} is not ready
+          description: "{{ $labels.pod }} has failed nats-server's JetStream health check for ten minutes: no meta leader, or streams not current. Two of three cores in this state is lost quorum, and every KV write stalls."
+      - alert: MastMetricsDown
+        expr: up{namespace="soak", service=~"mast-core|mast-edge-internal"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: mast {{ $labels.pod }} does not answer scrapes
+          description: "Prometheus has not scraped {{ $labels.pod }} for five minutes. The process is down or wedged, and every other mast alert is blind for it."
+  # What the broker itself counts. Each of these is a message that was
+  # refused or lost, or a reader that stopped, none of which a pod status
+  # shows.
+  - name: mast.delivery
+    rules:
+      # Each failure is a QoS 1 or 2 publish the broker refused rather
+      # than acknowledged, so a publisher is retrying. It almost always
+      # means the core's JetStream would not store: quorum lost, or the
+      # stream full.
+      - alert: MastDurablePublishFailures
+        expr: sum by (namespace, pod) (increase(mast_durable_publish_failures_total{namespace="soak", service=~"mast-core|mast-edge-internal"}[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: mast {{ $labels.pod }} is refusing QoS 1 and 2 publishes
+          description: "{{ $value | humanize }} durable publishes failed on {{ $labels.pod }} in five minutes. The durable stream on the core would not store them, so publishers were told to retry."
+      # Every reader of the durable stream on every node climbs at the
+      # stream's rate. One standing still while another moves has lost its
+      # consumer: a bridge that stopped delivers nothing to that node's
+      # subscribers, a queuer that stopped keeps nothing for absent ones.
+      - alert: MastDurableReaderStalled
+        expr: |
+          (sum by (namespace, pod, reader) (rate(mast_durable_read_total{namespace="soak", service=~"mast-core|mast-edge-internal"}[10m])) == 0)
+          and on (namespace)
+          (max by (namespace) (rate(mast_durable_read_total{namespace="soak", service=~"mast-core|mast-edge-internal"}[10m])) > 0)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: mast {{ $labels.reader }} on {{ $labels.pod }} stopped reading the durable stream
+          description: "The {{ $labels.reader }} reader on {{ $labels.pod }} has read nothing for twenty minutes while other readers kept reading. It has lost its consumer; restarting the pod recreates it."
+      # Any value above zero is messages this node had accepted and then
+      # discarded, because a NATS subscription's pending queue overflowed.
+      # No other metric shows the loss.
+      - alert: MastSlowConsumer
+        expr: sum by (namespace, pod) (increase(mast_nats_slow_consumers_total{namespace="soak", service=~"mast-core|mast-edge-internal"}[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: mast {{ $labels.pod }} dropped messages to a slow consumer
+          description: "{{ $labels.pod }} discarded accepted messages because a NATS subscription fell behind. The node is overloaded for its fan-out."
+  # The queuer keeps messages for persistent sessions whose client is
+  # away. It runs on every core (or on the one standalone node).
+  - name: mast.queuer
+    rules:
+      # Every core's queuer reads the same stream and the same session
+      # records, so they should agree on how many sessions are away. One
+      # that disagrees for half an hour has missed records, and a client
+      # that reconnects through it finds a different queue.
+      - alert: MastQueuersDisagree
+        expr: |
+          (max by (namespace) (mast_queuer_away_sessions{namespace="soak", service="mast-core"})
+            - min by (namespace) (mast_queuer_away_sessions{namespace="soak", service="mast-core"})) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: mast cores disagree on how many sessions are away
+          description: "The cores' queuers have reported different away-session counts for thirty minutes (spread {{ $value }}). They read the same stream and should match."
+      # A count that climbs and never falls is devices that never came
+      # back. It is a fleet problem long before it is a storage one.
+      - alert: MastQueuerBacklog
+        expr: max by (namespace) (mast_queuer_away_sessions{namespace="soak", service="mast-core"}) > 10000
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: mast is keeping messages for many absent sessions
+          description: "The queuer has kept messages for more than 10000 absent sessions (metrics.prometheusRule.queuerAwaySessionsThreshold) for an hour; now {{ $value }}."

@@ -1,0 +1,27 @@
+# mast exports OTLP over HTTP; the collector batches and hands the spans to
+# Jaeger over gRPC. A collector in between rather than Jaeger's own OTLP
+# port, because that is the shape a real deployment has, and where sampling
+# or a second backend would go.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  otlp_grpc/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_grpc/jaeger]

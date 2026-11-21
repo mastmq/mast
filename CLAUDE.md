@@ -53,6 +53,8 @@ Litmus test for `domain`: can the package be tested with no network, no filesyst
 
 `deployments/fire` is the Docker cluster and the chaos drills: three cores, three edges, SIGKILLs. A change to delivery or storage is not done until it has been through it, at least four runs against a baseline build; its README says how.
 
+`deployments/soak` is the long-running stack: three cores, two edges and a standalone node with JWT tenants and limits, the admin API, traces into Jaeger, and Prometheus and Grafana loaded with the chart's own alerts and dashboard (`./soak.sh rules` re-renders them). `./smoke.sh` checks every feature end to end. It found three defects that every unit and cluster test had passed: spans posted to `/`, a PUBACK reason code MQTT 5 does not allow, and every edge counting the cluster's QoS 1 traffic as its own.
+
 ## Invariants
 
 These are properties the tests and the docs both depend on. Breaking one is a data-loss or isolation bug, not a style question.
