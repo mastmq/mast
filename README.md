@@ -136,7 +136,7 @@ Three limits, under `[limits]` in the config. Each one's scope is where it can b
 | Limit | Scope | Over the limit |
 | --- | --- | --- |
 | `max_connections` | cluster-wide, approximate | CONNACK 0x97 Quota exceeded (MQTT 5), 0x03 Server unavailable (3.1.1) |
-| `publish_rate`, `publish_burst` | per tenant, per node | QoS 0 dropped; MQTT 5 QoS 1 gets PUBACK 0x96 Message rate too high; MQTT 5 QoS 2 and 3.1.1 QoS 1/2 are disconnected |
+| `publish_rate`, `publish_burst` | per tenant, per node | QoS 0 dropped; MQTT 5 QoS 1 gets PUBACK 0x97 Quota exceeded (0x96 is legal only in a DISCONNECT); MQTT 5 QoS 2 and 3.1.1 QoS 1/2 are disconnected |
 | `offline_queue` | per absent session | the oldest queued messages are discarded |
 
 `offline_queue` defaults to 100 and applies with no `[limits]` section at all. Before limits existed, a device that came back to the node it left was resent everything mochi held for it, up to mochi's inflight maximum of thousands, while a device that came back on another node got the stream's newest 100. Now both get the newest 100. Set `offline_queue` higher, under `[limits]` or for one tenant, to keep more.

@@ -19,7 +19,9 @@ import (
 	"github.com/mastmq/mast/internal/infra/config"
 )
 
-// MQTT 5 reason codes the limits answer with.
+// MQTT 5 reason codes the limits answer with. Rate too high is legal only
+// in a DISCONNECT, so a refused QoS 1 publish is acknowledged with Quota
+// exceeded.
 const (
 	reasonRateTooHigh   = 0x96
 	reasonQuotaExceeded = 0x97
@@ -162,8 +164,11 @@ func TestConnectionLimitFreesOnDisconnect(t *testing.T) {
 }
 
 // TestPublishRateV5 covers a tenant override from configuration and the
-// MQTT 5 answer to a QoS 1 publish past the rate: a PUBACK with 0x96, so the
-// publisher knows the message was not taken.
+// MQTT 5 answer to a QoS 1 publish past the rate: a PUBACK with Quota
+// exceeded, so the publisher knows the message was not taken. It once
+// expected Message rate too high (0x96), which MQTT 5 allows only in a
+// DISCONNECT; paho.golang read it without complaint, and the soak stack's
+// mosquitto_pub dropped the connection on it as a protocol error.
 func TestPublishRateV5(t *testing.T) {
 	addr, obsAddr := startLimited(t, func(l *config.Limits) {
 		l.Tenants = map[string]config.TenantLimits{
@@ -187,8 +192,8 @@ func TestPublishRateV5(t *testing.T) {
 		codes = append(codes, resp.ReasonCode)
 	}
 
-	if !slices.Equal(codes[:2], []byte{0, 0}) || codes[2] != reasonRateTooHigh {
-		t.Errorf("PUBACK codes for a burst of 2 then one more = %#x, want [0 0 %#x]", codes, reasonRateTooHigh)
+	if !slices.Equal(codes[:2], []byte{0, 0}) || codes[2] != reasonQuotaExceeded {
+		t.Errorf("PUBACK codes for a burst of 2 then one more = %#x, want [0 0 %#x]", codes, reasonQuotaExceeded)
 	}
 
 	if got := readMetric(t, obsAddr, `mast_limit_exceeded_total{limit="publish_rate",tenant="acme"} `); got != 1 {

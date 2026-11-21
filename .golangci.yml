@@ -23,6 +23,10 @@ linters:
         - '^github\.com/nats-io/.*'
         - '^github\.com/mastmq/mochi/.*'
         - '^crypto/tls\..*'
+    misspell:
+      # Eclipse Mosquitto's clients are what a comment names when it says
+      # which strict MQTT client found a protocol error.
+      ignore-rules: [mosquitto]
     revive:
       rules:
         - name: exported

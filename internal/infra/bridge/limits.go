@@ -101,14 +101,19 @@ func (h *Hook) overRate(cl *mqtt.Client, id tenant.ID) bool {
 // rateLimited answers a publish past its tenant's rate.
 //
 // QoS 0 is dropped: nothing acknowledges it, and MQTT allows discarding it.
-// MQTT 5 QoS 1 gets a PUBACK with Message rate too high (0x96), so the
-// client knows the message was not accepted and can slow down. MQTT 5 QoS 2
-// is disconnected with 0x96 instead, because mochi answers a failing reason
-// code with a PUBACK even for QoS 2, which a client waiting for a PUBREC
-// cannot read. MQTT 3.1.1 has no negative acknowledgement at all, so its
-// only honest answer to a QoS 1 or 2 publish it will not take is closing
-// the connection; acknowledging and dropping would be a lie the device
-// cannot detect.
+// MQTT 5 QoS 1 gets a PUBACK with Quota exceeded (0x97), so the client
+// knows the message was not accepted and can slow down. It used to get
+// Message rate too high (0x96), which reads better and is not allowed
+// there: section 3.4.2.1 lists every PUBACK reason code and 0x96 is a
+// DISCONNECT code only. paho.golang accepted it anyway, which is why the
+// tests passed; mosquitto_pub dropped the connection on it as a
+// protocol error, so a strict client heard a broken connection instead of
+// a refusal. MQTT 5 QoS 2 is disconnected with 0x96, where it is legal,
+// because mochi answers a failing reason code with a PUBACK even for QoS 2,
+// which a client waiting for a PUBREC cannot read. MQTT 3.1.1 has no
+// negative acknowledgement at all, so its only honest answer to a QoS 1 or
+// 2 publish it will not take is closing the connection; acknowledging and
+// dropping would be a lie the device cannot detect.
 func (h *Hook) rateLimited(cl *mqtt.Client, pk packets.Packet, id tenant.ID) (packets.Packet, error) {
 	h.count(func(m *obs.Metrics) {
 		m.LimitExceeded.WithLabelValues(m.Tenant(string(id)), limitPublishRate).Inc()
@@ -118,7 +123,7 @@ func (h *Hook) rateLimited(cl *mqtt.Client, pk packets.Packet, id tenant.ID) (pa
 	case pk.FixedHeader.Qos == 0:
 		return pk, packets.ErrRejectPacket
 	case cl.Properties.ProtocolVersion >= mqtt5 && pk.FixedHeader.Qos == 1:
-		return pk, packets.ErrMessageRateTooHigh
+		return pk, packets.ErrQuotaExceeded
 	case cl.Properties.ProtocolVersion >= mqtt5:
 		if err := h.server.DisconnectClient(cl, packets.ErrMessageRateTooHigh); err != nil {
 			h.log.Debug("disconnecting a client over its tenant's rate", "client", cl.ID, "error", err)
