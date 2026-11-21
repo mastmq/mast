@@ -81,6 +81,20 @@ type Metrics struct {
 	// messages for. It should match on every core.
 	QueuerAway prometheus.Gauge
 
+	// QueuerNodesDead counts nodes this core declared dead because their
+	// heartbeats stopped. Each one was killed outright, or was cut off or
+	// stalled for longer than the threshold — in which case its devices may
+	// receive what was queued for them twice. A node that said goodbye
+	// before going silent is not counted, so a rolling deploy does not
+	// move it.
+	QueuerNodesDead prometheus.Counter
+	// QueuerReaped counts sessions this core took over from dead nodes.
+	QueuerReaped prometheus.Counter
+	// QueuerReplayed counts messages queued by replaying the durable stream
+	// for them: what was published between a node's death and its
+	// detection.
+	QueuerReplayed prometheus.Counter
+
 	// LimitExceeded counts what a tenant's limits refused, by tenant and by
 	// limit: "connections", "publish_rate", or "offline_queue" for queued
 	// messages discarded on reconnect because the queue held more than the
@@ -150,17 +164,20 @@ func NewMetrics(reg prometheus.Registerer, src Sources, maxTenants int) *Metrics
 		OfflineQueued:    factory("offline_queued_total", "Messages stored for a client that was absent.", "tenant"),
 		OfflineDelivered: factory("offline_delivered_total", "Messages replayed to a client that came back.", "tenant"),
 		NATSSubs:         nil,
-		DurableFailures: prometheus.NewCounter(prometheus.CounterOpts{ //nolint:exhaustruct_v5 // defaults are right
-			Namespace: namespace,
-			Name:      "durable_publish_failures_total",
-			Help:      "QoS 1 and 2 publishes refused because the durable stream would not store them.",
-		}),
+		DurableFailures: counter(reg, "durable_publish_failures_total",
+			"QoS 1 and 2 publishes refused because the durable stream would not store them."),
 		DurableRead: factory("durable_read_total", "Messages read off the durable stream.", "reader"),
 		QueuerAway: prometheus.NewGauge(prometheus.GaugeOpts{ //nolint:exhaustruct_v5 // defaults are right
 			Namespace: namespace,
 			Name:      "queuer_away_sessions",
 			Help:      "Sessions this node's queuer keeps messages for, because no connection holds them.",
 		}),
+		QueuerNodesDead: counter(reg, "queuer_nodes_dead_total",
+			"Nodes declared dead because their heartbeats stopped."),
+		QueuerReaped: counter(reg, "queuer_reaped_sessions_total",
+			"Sessions taken over from nodes declared dead."),
+		QueuerReplayed: counter(reg, "queuer_replayed_total",
+			"Messages queued by replaying the durable stream after a node was declared dead."),
 		LimitExceeded: factory("limit_exceeded_total",
 			"Connections, publishes and queued messages refused or discarded by a tenant limit.", "tenant", "limit"),
 		tenants: &tenantLabels{max: maxTenants, known: sync.Map{}, mu: sync.Mutex{}, count: 0, full: atomic.Bool{}},
@@ -175,10 +192,24 @@ func NewMetrics(reg prometheus.Registerer, src Sources, maxTenants int) *Metrics
 		reg.MustRegister(m.NATSSubs)
 	}
 
-	reg.MustRegister(m.DurableFailures, m.QueuerAway)
+	reg.MustRegister(m.QueuerAway)
 	registerNATSCounts(reg, src.NATS)
 
 	return m
+}
+
+// counter registers one unlabelled counter.
+//
+//nolint:ireturn // the client library offers a counter only as an interface
+func counter(reg prometheus.Registerer, name, help string) prometheus.Counter {
+	c := prometheus.NewCounter(prometheus.CounterOpts{ //nolint:exhaustruct_v5 // defaults are right
+		Namespace: namespace,
+		Name:      name,
+		Help:      help,
+	})
+	reg.MustRegister(c)
+
+	return c
 }
 
 // OtherTenants is the label value every tenant past the bound shares. A

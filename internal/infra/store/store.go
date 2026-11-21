@@ -122,6 +122,13 @@ type Session struct {
 	// token of its session claim. A node noticing a disconnect late must not
 	// mark away a session another node's connection already holds.
 	Owner string `json:"owner,omitempty"`
+	// Node is the node whose connection holds the session, by its embedded
+	// server's id, written with Present. The cores watch every node's
+	// heartbeat, and a node that stops beating without having recorded its
+	// sessions as away — killed outright — has its sessions queued for as
+	// if it had. A record without it, from a node older than the field, is
+	// never judged that way.
+	Node string `json:"node,omitempty"`
 }
 
 // Store is the durable state of a mast cluster.
@@ -380,9 +387,102 @@ func (s *Store) OpenDurable(ctx context.Context, replicas int, maxAge time.Durat
 		Replicas:   replicas,
 		MaxAge:     maxAge,
 		Duplicates: min(durableDedupWindow, maxAge),
+		// Read back by time when a node dies without saying so: the queuer
+		// replays what was published since the node was last heard from,
+		// with batched direct gets any replica answers, rather than a
+		// consumer.
+		AllowDirect: true,
 	})
 	if err != nil {
 		return fmt.Errorf("store: stream %s: %w", streamDurable, err)
+	}
+
+	return nil
+}
+
+// ReplayDurable calls fn with every message the durable stream stored at or
+// after since, oldest first, in the same form [DurableHandler] receives a
+// message from the consumer: the subject as stored, the headers with
+// [nats.JSTimeStamp] set to when it was stored, and the payload.
+//
+// It reads with batched direct gets, not a consumer. It runs when a node
+// is declared dead, to queue what was published between its last
+// heartbeat and the moment the cores noticed, which no live reader can go
+// back for.
+func (s *Store) ReplayDurable(ctx context.Context, since time.Time, fn DurableHandler) (int, error) {
+	read := 0
+
+	err := s.direct.eachSince(ctx, s.apiPrefix, streamDurable, DurablePrefix+">", since,
+		func(m *nats.Msg, _ uint64) bool {
+			read++
+
+			fn(m.Header.Get(nats.JSSubject), m.Header, m.Data)
+
+			return true
+		})
+	if err != nil {
+		return read, fmt.Errorf("store: replaying %s: %w", streamDurable, err)
+	}
+
+	return read, nil
+}
+
+// Reachable reports whether the sessions bucket's stream has a leader this
+// node can reach, and whether that leader is in touch with a majority of
+// its replicas. A node cut off from the rest of the cluster fails one or
+// the other, and it is the one node whose opinion of who else is alive
+// must not be acted on: every other node would look dead to it.
+//
+// Reaching the leader alone was the first check, and it is not enough. A
+// core cut off together with the edge it serves may itself lead the
+// stream, and it answers its own request: Raft keeps a leader without
+// quorum for up to twenty seconds, past the ten in which an edge is
+// declared dead. Its view of its replicas tells the truth sooner. Each one
+// answers the leader's heartbeat every second, and one that has not been
+// heard from for [replicaSilence] is on the far side of a split.
+func (s *Store) Reachable(ctx context.Context) error {
+	stream, err := s.js.Stream(ctx, kvStreamPrefix+bucketSessions)
+	if err != nil {
+		return fmt.Errorf("store: reaching the sessions stream: %w", err)
+	}
+
+	return quorate(stream.CachedInfo().Cluster)
+}
+
+// replicaSilence is how long a stream leader may go without hearing from a
+// replica before the replica is counted as out of reach. Raft heartbeats
+// every second, so three is two missed beats of slack: the same allowance
+// nats-server gives a follower judging its own leader.
+const replicaSilence = 3 * time.Second
+
+// errNoQuorum is a stream leader that is not in touch with a majority of
+// its replicas.
+var errNoQuorum = errors.New("store: the sessions stream's leader cannot hear a majority of its replicas")
+
+// quorate reports whether a stream's leader, as its own info describes it,
+// hears a majority of the stream's replicas, itself included. A stream that
+// is not replicated has no one to be cut off from.
+func quorate(cluster *jetstream.ClusterInfo) error {
+	if cluster == nil {
+		return nil
+	}
+
+	if cluster.Leader == "" {
+		return fmt.Errorf("%w: no leader", errNoQuorum)
+	}
+
+	heard := 1 // the leader, which answered
+
+	for _, r := range cluster.Replicas {
+		// Active is zero for a replica never heard from, as well as for
+		// one heard from this instant; only the second counts.
+		if r != nil && !r.Offline && r.Active > 0 && r.Active < replicaSilence {
+			heard++
+		}
+	}
+
+	if size := len(cluster.Replicas) + 1; 2*heard <= size {
+		return fmt.Errorf("%w: %d of %d", errNoQuorum, heard, size)
 	}
 
 	return nil

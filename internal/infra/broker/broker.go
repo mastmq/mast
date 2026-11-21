@@ -459,7 +459,7 @@ func (b *Broker) provision(life context.Context, cfg config.Config, metrics *obs
 
 // startQueuer begins queueing for absent sessions from st.
 func (b *Broker) startQueuer(st *store.Store, cfg config.Config, metrics *obs.Metrics) error {
-	q, err := offline.Start(b.life, st, cfg.Session.Expiry, metrics, b.log)
+	q, err := offline.Start(b.life, st, b.nats.Conn(), cfg.Session.Expiry, metrics, b.log)
 	if err != nil {
 		return fmt.Errorf("broker: starting the queuer: %w", err)
 	}

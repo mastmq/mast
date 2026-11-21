@@ -271,6 +271,10 @@ func (h *Hook) Attach(server *mqtt.Server) {
 	h.listenForNotices()
 	h.listenForAdmin()
 
+	if h.nodeID != "" {
+		go h.beat()
+	}
+
 	if h.store != nil && h.sessionExpiry > 0 {
 		go h.refreshSessions()
 	}
@@ -297,6 +301,8 @@ func (h *Hook) Stop() error {
 		if h.adminSub != nil {
 			_ = h.adminSub.Unsubscribe()
 		}
+
+		h.sayGoodbye()
 	})
 
 	return nil

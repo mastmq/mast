@@ -89,6 +89,13 @@ func (h *Hook) sessionRecord(cl *mqtt.Client, id tenant.ID, bareClientID string,
 
 	owner := h.ownerOf(cl)
 
+	// Only a held record names its node: the cores read it to know which
+	// sessions to queue for if this node dies without a word.
+	node := ""
+	if present {
+		node = h.nodeID
+	}
+
 	return store.Session{
 		ClientID:      bareClientID,
 		Tenant:        string(id),
@@ -96,6 +103,7 @@ func (h *Hook) sessionRecord(cl *mqtt.Client, id tenant.ID, bareClientID string,
 		UpdatedAt:     time.Time{}, // the store stamps it
 		Present:       present,
 		Owner:         owner,
+		Node:          node,
 	}
 }
 
