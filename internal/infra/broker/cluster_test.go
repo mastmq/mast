@@ -963,3 +963,45 @@ func TestClusterReturnedDeviceIsNotQueuedFor(t *testing.T) {
 		t.Errorf("messages the device received live were replayed at its next return: %v", got)
 	}
 }
+
+// TestClusterStreamReadsCountOnlyWhatIsDelivered covers a node reading a
+// QoS 1 message from the durable stream with no client of its own
+// subscribed. Every node reads the whole stream, and each used to inject
+// every message it read, so mast_messages_out_total on every edge counted
+// every QoS 1 and 2 message in the cluster, and a traced one got an
+// mqtt.deliver span on nodes that delivered nothing. The soak stack's edge
+// with no subscriber reported 1,700 messages out.
+func TestClusterStreamReadsCountOnlyWhatIsDelivered(t *testing.T) {
+	c := startCluster(t)
+
+	sub := connect(t, c.addrs[0], "listener", "acme")
+	sub.subscribeQoS(t, "orders/+", 1)
+	c.awaitInterest(t, sub, "acme")
+
+	before := readMetric(t, c.obs[0], `mast_messages_out_total{tenant="acme"} `)
+
+	const n = 5
+
+	pub := connect(t, c.addrs[1], "talker", "acme")
+	publishQoS1(t, pub, "orders/new", "o", n)
+
+	// The publisher's own edge reads its messages back from the stream;
+	// wait until it has, so a zero below is a decision and not a race.
+	read := `mast_durable_read_total{reader="bridge"} `
+	if !awaitMetric(t, c.obs[1], read, n) {
+		t.Fatalf("edge 1 read %v of %d messages from the stream", readMetric(t, c.obs[1], read), n)
+	}
+
+	if !waitFor(func() bool { return len(sub.messages()) >= n }) {
+		t.Fatalf("the subscriber received %d of %d", len(sub.messages()), n)
+	}
+
+	out := `mast_messages_out_total{tenant="acme"} `
+	if got := readMetric(t, c.obs[1], out); got != 0 {
+		t.Errorf("edge 1, with no subscriber, counted %v messages out; want 0", got)
+	}
+
+	if got := readMetric(t, c.obs[0], out) - before; got < n {
+		t.Errorf("edge 0, with the subscriber, counted %v messages out; want at least %d", got, n)
+	}
+}
