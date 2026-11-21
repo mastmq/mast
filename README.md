@@ -204,18 +204,18 @@ Not traced yet: the replay of an offline queue or a retained message, wills, and
 From v0.3.2, every image pushed to `ghcr.io/mastmq/mast` is signed keylessly with cosign, from the workflow that built it, and carries an SBOM and SLSA provenance. Check the signature of a release image against the identity of the workflow and the tag:
 
 ```console
-$ cosign verify ghcr.io/mastmq/mast:0.3.2 \
+$ cosign verify ghcr.io/mastmq/mast:0.4.0 \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-identity https://github.com/mastmq/mast/.github/workflows/docker.yaml@refs/tags/v0.3.2
-$ docker buildx imagetools inspect ghcr.io/mastmq/mast:0.3.2 --format '{{ json .SBOM }}'
-$ docker buildx imagetools inspect ghcr.io/mastmq/mast:0.3.2 --format '{{ json .Provenance }}'
+    --certificate-identity https://github.com/mastmq/mast/.github/workflows/docker.yaml@refs/tags/v0.4.0
+$ docker buildx imagetools inspect ghcr.io/mastmq/mast:0.4.0 --format '{{ json .SBOM }}'
+$ docker buildx imagetools inspect ghcr.io/mastmq/mast:0.4.0 --format '{{ json .Provenance }}'
 ```
 
 From the same release, the archives and the checksum file carry GitHub build provenance. Verify a downloaded file with the GitHub CLI:
 
 ```console
-$ gh attestation verify mast_0.3.2_linux_amd64.tar.gz -R mastmq/mast
-$ sha256sum -c --ignore-missing mast_0.3.2_checksums.txt
+$ gh attestation verify mast_0.4.0_linux_amd64.tar.gz -R mastmq/mast
+$ sha256sum -c --ignore-missing mast_0.4.0_checksums.txt
 ```
 
 ## Development
