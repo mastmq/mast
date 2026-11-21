@@ -136,7 +136,7 @@ Three limits, under `[limits]` in the config. Each one's scope is where it can b
 | Limit | Scope | Over the limit |
 | --- | --- | --- |
 | `max_connections` | cluster-wide, approximate | CONNACK 0x97 Quota exceeded (MQTT 5), 0x03 Server unavailable (3.1.1) |
-| `publish_rate`, `publish_burst` | per tenant, per node | QoS 0 dropped; MQTT 5 QoS 1 gets PUBACK 0x96 Message rate too high; MQTT 5 QoS 2 and 3.1.1 QoS 1/2 are disconnected |
+| `publish_rate`, `publish_burst` | per tenant, per node | QoS 0 dropped; MQTT 5 QoS 1 gets PUBACK 0x97 Quota exceeded (0x96 is legal only in a DISCONNECT); MQTT 5 QoS 2 and 3.1.1 QoS 1/2 are disconnected |
 | `offline_queue` | per absent session | the oldest queued messages are discarded |
 
 `offline_queue` defaults to 100 and applies with no `[limits]` section at all. Before limits existed, a device that came back to the node it left was resent everything mochi held for it, up to mochi's inflight maximum of thousands, while a device that came back on another node got the stream's newest 100. Now both get the newest 100. Set `offline_queue` higher, under `[limits]` or for one tenant, to keep more.
@@ -193,7 +193,7 @@ sampler = "parentbased_traceidratio"
 sampler_arg = "0.01"
 ```
 
-Each key left empty defers to its standard variable — `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` — and `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_BSP_*` work as they do for any OpenTelemetry SDK. With nothing set, every trace is sampled and goes to `http://localhost:4318`.
+Each key left empty defers to its standard variable — `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` — and `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_BSP_*` work as they do for any OpenTelemetry SDK. With nothing set, every trace is sampled and goes to `http://localhost:4318`. An `endpoint` with no path posts to the collector's `/v1/traces`, as `OTEL_EXPORTER_OTLP_ENDPOINT` does; one with a path is used as it is, as `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is.
 
 A publish opens `mqtt.publish` on the node it arrives at, with `mast.store.durable`, `mast.store.retained` and `nats.publish` under it, and every node that delivers it opens `mqtt.deliver` under the publish. An MQTT 5 client that sends a `traceparent` user property (and optionally `tracestate`) puts that publish inside its own trace, and a subscriber receives the message with `traceparent` rewritten to the delivery span, so it can carry the same trace on. A message without one is not given one, and a message whose publish was not traced (a will, or one that came through an edge with tracing off) keeps the client's `traceparent` as it was sent. The client's sampled flag is not obeyed: the configured sampler decides for every publish, on a trace id of its own, so a client can neither force its messages to be traced on every node nor hide them. Choose `parentbased_traceidratio` to keep a trace whole across nodes; plain `traceidratio` decides again on each delivering node from the trace id, which the client chose. Spans are batched and dropped, never queued without bound, when a collector is slow or away.
 

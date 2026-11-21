@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -44,6 +45,32 @@ import (
 // serviceName is what a span says it came from unless OTEL_SERVICE_NAME or
 // OTEL_RESOURCE_ATTRIBUTES says otherwise.
 const serviceName = "mast"
+
+// tracesPath is where an OTLP/HTTP collector takes spans.
+const tracesPath = "/v1/traces"
+
+// TracesURL is the URL spans are posted to for a configured endpoint.
+//
+// tracing.endpoint is documented, here and in the chart and the Ansible
+// role, as the collector's address — "http://otel-collector:4318" — which
+// is what OTEL_EXPORTER_OTLP_ENDPOINT holds and what collectors print. The
+// exporter's WithEndpointURL takes its URL as the whole traces URL, path
+// included, so that address posted to "/" and every collector answered
+// 404: tracing turned on as documented exported nothing, and said so only
+// in a warning per batch. An endpoint with no path gets the standard one,
+// as the SDK gives OTEL_EXPORTER_OTLP_ENDPOINT; one with a path is a full
+// URL, as OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is, and is used as it is. A
+// string that does not parse is passed on for the exporter to refuse.
+func TracesURL(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || (u.Path != "" && u.Path != "/") {
+		return endpoint
+	}
+
+	u.Path = tracesPath
+
+	return u.String()
+}
 
 // Provider is a running tracer provider and the exporter behind it.
 type Provider struct {
@@ -74,7 +101,7 @@ func Start(ctx context.Context, cfg config.Tracing, log *slog.Logger, attrs ...a
 
 	var opts []otlptracehttp.Option
 	if cfg.Endpoint != "" {
-		opts = append(opts, otlptracehttp.WithEndpointURL(cfg.Endpoint))
+		opts = append(opts, otlptracehttp.WithEndpointURL(TracesURL(cfg.Endpoint)))
 	}
 
 	exporter, err := otlptracehttp.New(ctx, opts...)

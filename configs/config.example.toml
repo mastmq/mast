@@ -176,8 +176,9 @@ max_tenant_labels = 1000
 # MQTT 5 and 0x03 Server unavailable on 3.1.1. 0 is unlimited.
 max_connections = 0
 # PUBLISH packets per second per tenant, enforced per node. QoS 0 past it is
-# dropped; MQTT 5 QoS 1 gets PUBACK 0x96 Message rate too high; MQTT 5 QoS 2
-# and MQTT 3.1.1 QoS 1/2 are disconnected. 0 is unlimited.
+# dropped; MQTT 5 QoS 1 gets PUBACK 0x97 Quota exceeded; MQTT 5 QoS 2 is
+# disconnected with 0x96 Message rate too high, and MQTT 3.1.1 QoS 1/2 are
+# disconnected. 0 is unlimited.
 publish_rate = 0
 # Publishes that may arrive at once before the rate applies. 0 is one
 # second's worth.
@@ -217,7 +218,8 @@ gather = "500ms"
 # and OTEL_EXPORTER_OTLP_HEADERS are honoured as they are anywhere else.
 enabled = false
 # The OTLP/HTTP collector, e.g. "http://otel-collector:4318"; an http scheme
-# means plain text. Empty: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, then
+# means plain text. With no path, spans go to its /v1/traces; a URL with a
+# path is used as it is. Empty: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, then
 # OTEL_EXPORTER_OTLP_ENDPOINT, then http://localhost:4318.
 endpoint = ""
 # An OTEL_TRACES_SAMPLER name: always_on, always_off, traceidratio,
