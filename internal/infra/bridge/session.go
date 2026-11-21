@@ -118,6 +118,10 @@ func (h *Hook) claimSession(id tenant.ID, bareClientID string, cl *mqtt.Client) 
 	owner := newOwner()
 	mountedClientID := cl.ID
 
+	// A new connection to the session, clean or not, cancels a will still
+	// waiting out its delay here [MQTT-3.1.3-9], as mochi does for its own.
+	h.wills.cancel(mountedClientID)
+
 	// Kept against the connection as well as the client id. The id's claim
 	// passes to whichever connection took it last, and a record written for
 	// an old connection must carry that connection's token, or its late
@@ -209,6 +213,11 @@ func (h *Hook) onSessionNotice(msg *nats.Msg) {
 	// Our own notice.
 	if owner == notice.Owner {
 		return
+	}
+
+	// The device is back, on another node, inside its will's delay.
+	if h.wills.cancel(mounted) {
+		h.log.Debug("delayed will cancelled by a connection elsewhere", "client", clientID, "node", notice.Node)
 	}
 
 	cl, ok := h.server.Clients.Get(mounted)

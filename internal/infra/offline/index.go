@@ -22,7 +22,9 @@ import "strings"
 // Matching mirrors mochi's exactly, quirks included, because mochi's index
 // on the edge is what decides live delivery, and a message the device would
 // not have been sent live must not be kept for it either. The property test
-// holds the two to the same answers.
+// holds the two to the same answers: this index under a tenant mount against
+// mochi's with none, since the bridge corrects mochi's answer for the mount
+// on the edge (excludeDollar).
 type index struct {
 	root node
 }
@@ -86,32 +88,44 @@ func (x *index) unsubscribe(filter, key string) {
 }
 
 // match calls fn with every session subscribed to a filter that matches
-// topic, once per session, at the highest QoS among its matching filters.
-func (x *index) match(topic string, fn func(key string, qos byte)) {
+// topic under mount, once per session, at the highest QoS among its
+// matching filters.
+//
+// Every filter here is mounted under its tenant, and the mount is matched
+// apart from the topic because the rule that keeps a filter starting with a
+// wildcard from a topic starting with '$' applies to the topic's first
+// level, not the tenant's. Matching the mounted string whole, as mochi does
+// on the edge, never applied it (#35).
+func (x *index) match(mount, topic string, fn func(key string, qos byte)) {
 	if topic == "" {
+		return
+	}
+
+	top := x.root.child(mount, false)
+	if top == nil {
 		return
 	}
 
 	found := map[string]byte{}
 
-	x.scan(topic, &x.root, strings.HasPrefix(topic, "$"), false, found)
+	x.scan(topic, top, top, strings.HasPrefix(topic, "$"), false, found)
 
 	for key, qos := range found {
 		fn(key, qos)
 	}
 }
 
-// scan is mochi's scanSubscribers over this node type. dollar is whether
-// the whole topic starts with "$", which no filter whose first level is a
-// wildcard may match [MQTT-4.7.1-1]; wildTop is whether the filter being
-// followed has such a first level.
+// scan is mochi's scanSubscribers over this node type, from root, the
+// mount's node. dollar is whether the topic starts with "$", which no
+// filter whose first level is a wildcard may match [MQTT-4.7.2-1]; wildTop
+// is whether the filter being followed has such a first level.
 //
 // topic here is what is left of it, and may be empty: "a/" has an empty
 // last level, which a filter can name. Stopping on an empty remainder
 // missed it.
-func (x *index) scan(topic string, n *node, dollar, wildTop bool, found map[string]byte) {
+func (x *index) scan(topic string, n, root *node, dollar, wildTop bool, found map[string]byte) {
 	key, rest, hasNext := strings.Cut(topic, "/")
-	top := n == &x.root
+	top := n == root
 
 	for _, part := range [2]string{key, "+"} {
 		next := n.child(part, false)
@@ -122,7 +136,7 @@ func (x *index) scan(topic string, n *node, dollar, wildTop bool, found map[stri
 		wild := wildTop || (top && part == "+")
 
 		if hasNext {
-			x.scan(rest, next, dollar, wild, found)
+			x.scan(rest, next, root, dollar, wild, found)
 		} else {
 			next.gatherLast(part, dollar && wild, found)
 		}

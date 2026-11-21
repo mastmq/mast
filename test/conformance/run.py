@@ -34,25 +34,9 @@ DEADLINE = 60
 # Each entry is a broker gap with an issue, or a place where the suite
 # assumes something mast is not wrong to do differently. Keep the reason next
 # to the name, and remove the entry in the change that fixes it.
-DOLLAR = "wildcards match $ topics over NATS, mastmq/mast#35"
-ACK_PROPS = (
-    "PUBACK echoes the publisher's user properties, which the suite's client "
-    "cannot parse, mastmq/mast#39"
-)
 EXPECTED = {
-    "v3": {
-        "test_dollar_topics": DOLLAR,
-    },
+    "v3": {},
     "v5": {
-        "test_dollar_topics": DOLLAR,
-        "test_user_properties": ACK_PROPS,
-        "test_retained_message": ACK_PROPS,
-        "test_publication_expiry": (
-            "an expired message still reaches a reconnecting session, "
-            "mastmq/mast#36"
-        ),
-        "test_subscribe_options": "No Local is ignored, mastmq/mast#37",
-        "test_will_delay": "Will Delay Interval is ignored, mastmq/mast#38",
         # Not a gap. mast refuses the filter (the policy service in authz.py
         # denies it) with reason 0x87, Not authorized, which MQTT 5 defines
         # for exactly this. The suite's packet parser still allows only the

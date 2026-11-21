@@ -649,7 +649,7 @@ func (q *Queuer) match(msg fabricMessage, id string, stored time.Time) []store.Q
 
 	var items []store.Queued
 
-	q.index.match(msg.tenant+"/"+msg.stored.Topic, func(key string, qos byte) {
+	q.index.match(msg.tenant, msg.stored.Topic, func(key string, qos byte) {
 		away, ok := q.absent[key]
 		if !ok || q.expired(away, now) {
 			return

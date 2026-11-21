@@ -64,15 +64,25 @@ const (
 	// headerID names one publish, so a node that receives it on several
 	// overlapping subscriptions can tell the copies apart from new messages.
 	headerID = "Mast-Id"
+	// headerOrigin is the mounted client id of an MQTT 5 publisher, which
+	// No Local needs on every node the message reaches. MQTT 3 has no No
+	// Local, so its publishes do without and the v3 path costs nothing more.
+	headerOrigin = "Mast-Origin"
 )
 
 // storeTimeout bounds a single call to the durable store. It sits on the
 // subscribe and publish paths, so it is short.
 const storeTimeout = 5 * time.Second
 
-// retainHandlingNever is MQTT 5's "do not send retained messages on
-// subscribe" subscription option.
-const retainHandlingNever = 2
+// MQTT 5's Retain Handling subscription option: send retained messages on
+// subscribe only if the subscription is new, or never.
+const (
+	retainHandlingIfNew = 1
+	retainHandlingNever = 2
+)
+
+// mqttV5 is the protocol level of MQTT 5 in a CONNECT.
+const mqttV5 = 5
 
 // packetIDMask narrows mochi's uint32 allocation to the 16 bits an MQTT
 // packet identifier actually has.
@@ -101,6 +111,8 @@ type Hook struct {
 	// on, and [Hook.OnSelectSubscribers] needs to know.
 	injector *mqtt.Client
 	seen     *seen
+	// wills holds the wills waiting out their delay.
+	wills *delayedWills
 	// ids generates the Mast-Id of every message this node publishes.
 	ids sync.Pool
 
@@ -250,6 +262,7 @@ func New(
 		durable:          atomic.Bool{},
 		stopDurable:      nil,
 		sessions:         newSessions(),
+		wills:            newDelayedWills(),
 		owners:           sync.Map{},
 		noticeSub:        nil,
 		adminSub:         nil,
@@ -267,6 +280,14 @@ func (h *Hook) Attach(server *mqtt.Server) {
 	// Built exactly as mochi builds its own, so an injected message is
 	// indistinguishable from one sent through [mqtt.Server.Publish].
 	h.injector = server.NewClient(nil, mqtt.LocalListener, mqtt.InlineClientId, true)
+	// Except in one thing. An injected packet takes the protocol level of
+	// the client that injects it, and mochi expires an inflight message
+	// only when that level is 5 [MQTT-3.3.2-5], so with the zero mochi
+	// leaves on its own inline client, a message held for an absent
+	// session was delivered on reconnect however long ago it expired
+	// (#36). It carries MQTT 5 properties, so 5 is also the truth. What a
+	// subscriber is sent is encoded at its own level either way.
+	h.injector.Properties.ProtocolVersion = mqttV5
 
 	h.listenForNotices()
 	h.listenForAdmin()
@@ -302,6 +323,7 @@ func (h *Hook) Stop() error {
 			_ = h.adminSub.Unsubscribe()
 		}
 
+		h.wills.stop()
 		h.sayGoodbye()
 	})
 
@@ -321,6 +343,7 @@ func (h *Hook) Provides(b byte) bool {
 		mqtt.OnPacketRead,
 		mqtt.OnACLCheck,
 		mqtt.OnPublish,
+		mqtt.OnSubscribe,
 		mqtt.OnSubscribed,
 		mqtt.OnUnsubscribed,
 		mqtt.OnDisconnect,
@@ -463,11 +486,41 @@ func (h *Hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 		return pk
 	}
 
-	if id, ok := h.tenantOf(cl); ok {
-		pk.TopicName = unmount(id, pk.TopicName)
+	id, ok := h.tenantOf(cl)
+	if !ok {
+		return pk
 	}
 
+	if !pk.FixedHeader.Retain && retainedRoute(pk.Properties.ServerReference) &&
+		cl.Properties.ProtocolVersion == mqttV5 && retainsAsPublished(cl, id, pk.TopicName) {
+		pk.FixedHeader.Retain = true
+	}
+
+	pk.TopicName = unmount(id, pk.TopicName)
+
 	return pk
+}
+
+// retainsAsPublished reports whether one of a client's subscriptions that
+// selects a mounted topic asked for Retain As Published.
+//
+// A live message is injected with retain unset, because mochi would
+// otherwise keep it in its own retained index and replay it beside the
+// bucket's copy, and mochi then has nothing to keep for a subscriber that
+// asked to see the flag as published (#42). So the flag is
+// put back here, on the way out, for the packets whose route says the
+// publish was retained: rare enough that looking at the client's
+// subscriptions costs nothing that matters.
+func retainsAsPublished(cl *mqtt.Client, id tenant.ID, mountedTopic string) bool {
+	bareTopic := unmount(id, mountedTopic)
+
+	for filter, sub := range cl.State.Subscriptions.GetAll() {
+		if sub.RetainAsPublished && topic.Matches(bare(id, filter), bareTopic) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // OnACLCheck consults the policy with the tenant resolved at authentication
@@ -568,6 +621,30 @@ func (h *Hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	return pk, packets.CodeSuccessIgnore
 }
 
+// OnSubscribe turns Retain Handling 1, "send retained messages only if the
+// subscription is new", into 2, "never", for a filter the client already
+// holds.
+//
+// mochi knows which filters existed, but only after this hook, and tells
+// nobody but its own retained replay, which mast does not use: the bucket
+// is replayed in OnSubscribed instead, and so every resubscribe was sent
+// the retained messages again (#42). Rewriting the option is the one way to
+// carry the answer there; the stored option is only ever read at subscribe
+// time, so nothing else sees the change.
+func (h *Hook) OnSubscribe(cl *mqtt.Client, pk packets.Packet) packets.Packet {
+	for i, filter := range pk.Filters {
+		if filter.RetainHandling != retainHandlingIfNew {
+			continue
+		}
+
+		if _, existed := cl.State.Subscriptions.Get(filter.Filter); existed {
+			pk.Filters[i].RetainHandling = retainHandlingNever
+		}
+	}
+
+	return pk
+}
+
 // OnSubscribed opens the NATS subscriptions the granted filters require.
 func (h *Hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []byte) {
 	id, ok := h.tenantOf(cl)
@@ -661,6 +738,11 @@ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 // then pointing the packet at a topic no filter can match keeps every
 // message on exactly one path — out to NATS and back — which is the same
 // rule ordinary publishes follow.
+//
+// A will with a delay is forwarded when the delay ends instead, unless a new
+// connection to the session cancels it first; see [delayedWills]. mochi has
+// already capped the delay at the session expiry interval, which is the
+// other end the spec allows it [MQTT-3.1.3-9].
 func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 	id, ok := h.tenantOf(cl)
 	if !ok {
@@ -675,42 +757,15 @@ func (h *Hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 		return will, nil
 	}
 
-	// mochi's Will keeps only the user properties of the will's own
-	// property set, so those are all there is to carry.
-	props := packets.Properties{User: will.User}
+	if will.WillDelayInterval > 0 {
+		clientID := cl.ID
+		delay := time.Duration(will.WillDelayInterval) * time.Second
 
-	if will.Retain {
-		h.storeRetained(context.Background(), subject, will.TopicName, packets.Packet{
-			FixedHeader: packets.FixedHeader{Qos: will.Qos, Retain: true},
-			Payload:     will.Payload,
-			Properties:  props,
-		})
+		h.wills.schedule(clientID, delay, func() { h.forwardWill(clientID, subject, will) })
+		h.log.Debug("will delayed", "client", clientID, "delay", delay)
+	} else {
+		h.forwardWill(cl.ID, subject, will)
 	}
-
-	msg := nats.NewMsg(subject)
-	msg.Data = will.Payload
-	msg.Header.Set(headerQoS, strconv.Itoa(int(will.Qos)))
-	msg.Header.Set(headerID, h.newMessageID())
-
-	if err := setPropsHeader(msg, messageProps(props)); err != nil {
-		h.log.Warn("forwarding will without its properties", "subject", subject, "error", err)
-	}
-
-	// Nobody is waiting on an acknowledgement for a will, so a failed store
-	// falls back to the plain fabric rather than losing the will outright.
-	if will.Qos > 0 && h.durable.Load() {
-		if err := h.publishDurable(context.Background(), msg); err != nil {
-			h.log.Warn("storing a will on the durable stream", "client", cl.ID, "error", err)
-		} else {
-			msg.Header.Set(headerDurable, "1")
-		}
-	}
-
-	if err := h.nc.PublishMsg(msg); err != nil {
-		h.log.Error("forwarding will to nats", "subject", subject, "error", err)
-	}
-
-	h.log.Debug("will forwarded", "client", cl.ID, "topic", will.TopicName)
 
 	// Send mochi somewhere nothing is listening. Every filter is mounted
 	// under a tenant, and a tenant cannot contain '$', so this matches none
@@ -752,9 +807,19 @@ func (h *Hook) OnSelectSubscribers(subs *mqtt.Subscribers, pk packets.Packet) *m
 		return subs // not injected by the bridge
 	}
 
+	h.excludeDollar(subs, pk.TopicName)
+
 	if r.queue == "" {
 		clear(subs.Shared)
 		clear(subs.SharedSelected)
+
+		// mochi checks No Local against the packet's origin, which for an
+		// injected message is the inline client, so it never matched (#37).
+		// A shared subscription cannot set No Local [MQTT-3.8.3-4], which
+		// is why only a plain copy carries the origin.
+		if sub, ok := subs.Subscriptions[r.origin]; ok && r.origin != "" && sub.NoLocal {
+			delete(subs.Subscriptions, r.origin)
+		}
 
 		return subs
 	}
@@ -770,6 +835,78 @@ func (h *Hook) OnSelectSubscribers(subs *mqtt.Subscribers, pk packets.Packet) *m
 	}
 
 	return subs
+}
+
+// excludeDollar takes out of a fan-out the subscriptions MQTT says a topic
+// beginning with '$' must not reach: those whose filter starts with a
+// wildcard [MQTT-4.7.2-1].
+//
+// mochi applies that rule itself, but to the whole topic, and here every
+// topic and filter is mounted under its tenant, so the first level mochi
+// sees is the tenant and the rule never fires. NATS matched the copy on the
+// encoded subject without it too (#35).
+//
+// mochi has already merged each client's matching filters into one entry
+// by then, so an entry cannot simply be dropped: a client holding "+/+" and
+// "$SYS/#" is still owed the message, at the QoS and with the identifiers
+// of the filter that does match. Such an entry is rebuilt from the client's
+// own subscriptions. It costs a look at every matched client, and only for
+// a '$' topic, which no hot path publishes to.
+func (h *Hook) excludeDollar(subs *mqtt.Subscribers, mountedTopic string) {
+	slash := strings.IndexByte(mountedTopic, '/')
+	if slash < 0 || !strings.HasPrefix(mountedTopic[slash+1:], "$") {
+		return
+	}
+
+	id, bareTopic := tenant.ID(mountedTopic[:slash]), mountedTopic[slash+1:]
+
+	for filter := range subs.Shared {
+		_, rest, _ := splitShare(filter)
+		if topic.StartsWithWildcard(unmount(id, rest)) {
+			delete(subs.Shared, filter)
+		}
+	}
+
+	for clientID := range subs.Subscriptions {
+		cl, ok := h.server.Clients.Get(clientID)
+		if !ok {
+			delete(subs.Subscriptions, clientID)
+
+			continue
+		}
+
+		merged, ok := matchingSubscription(cl, id, bareTopic)
+		if !ok {
+			delete(subs.Subscriptions, clientID)
+
+			continue
+		}
+
+		subs.Subscriptions[clientID] = merged
+	}
+}
+
+// matchingSubscription merges a client's plain subscriptions that select a
+// topic, the way mochi merges them, and reports whether there were any.
+func matchingSubscription(cl *mqtt.Client, id tenant.ID, bareTopic string) (packets.Subscription, bool) {
+	var (
+		merged packets.Subscription
+		found  bool
+	)
+
+	for filter, sub := range cl.State.Subscriptions.GetAll() {
+		if _, _, shared := splitShare(filter); shared || !topic.Matches(unmount(id, filter), bareTopic) {
+			continue
+		}
+
+		if !found {
+			merged, found = sub, true
+		}
+
+		merged = merged.Merge(sub)
+	}
+
+	return merged, found
 }
 
 // tenantOf returns the tenant resolved for a client at CONNECT.
@@ -801,6 +938,10 @@ func (h *Hook) fabricMessage(subject string, pk packets.Packet) *nats.Msg {
 
 	if pk.FixedHeader.Retain {
 		msg.Header.Set(headerRetain, "1")
+	}
+
+	if pk.ProtocolVersion == mqttV5 && pk.Origin != "" {
+		msg.Header.Set(headerOrigin, pk.Origin)
 	}
 
 	if err := setPropsHeader(msg, messageProps(pk.Properties)); err != nil {
@@ -899,7 +1040,13 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 		}
 	}
 
-	route := route{id: header.Get(headerID), tenant: tenant.ID(tenantID), queue: queue, subject: queueSubject}.String()
+	route := route{
+		id: header.Get(headerID), tenant: tenant.ID(tenantID), queue: queue, subject: queueSubject,
+		origin: "", retained: header.Get(headerRetain) != "",
+	}
+	if queue == "" {
+		route.origin = header.Get(headerOrigin)
+	}
 
 	// Inject at the QoS the publisher used. mochi then downgrades per
 	// subscription to the minimum of that and what each subscriber
@@ -915,7 +1062,7 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 	// never encodes it on a PUBLISH. That makes it the one field that can
 	// carry the route from here to OnSelectSubscribers and OnQosPublish
 	// without any chance of reaching a client.
-	props := packets.Properties{ServerReference: route}
+	props := packets.Properties{ServerReference: route.String()}
 
 	if carried := propsFromHeader(header); carried != nil {
 		applyProps(&props, carried)
@@ -958,49 +1105,94 @@ func (h *Hook) inject(subject string, header nats.Header, data []byte, queue, qu
 //
 // The id travels so that [Hook.OnQosPublish] can queue a message under the
 // same name the queuer on the core uses for it, which is what lets the
-// stream store the two writes once.
+// stream store the two writes once. A plain copy also carries the client id
+// that published it, for No Local, and both say whether the publish was
+// retained, for Retain As Published: mochi set neither from the inline
+// client that injects every message.
 type route struct {
-	id      string
-	tenant  tenant.ID
-	queue   string
-	subject string
+	id       string
+	tenant   tenant.ID
+	queue    string
+	subject  string
+	origin   string
+	retained bool
 }
 
 // routeSep separates a route's fields. NUL can occur in none of them: not
 // in an id, which the bridge generates, not in a tenant, which the codec
-// restricts, and not in a subject.
+// restricts, and not in a subject. A client id comes off the wire, so the
+// origin is the last field of a plain route and is read as the whole rest.
 const routeSep = "\x00"
 
 // Route kinds: a copy from a plain subscription, or one NATS delivered to a
-// single shared subscription group.
+// single shared subscription group, each in upper case when the publish was
+// retained, so [Hook.OnPacketEncode] can tell from the first byte alone.
 const (
-	routePlain = "p"
-	routeQueue = "q"
+	routePlain         = "p"
+	routeQueue         = "q"
+	routePlainRetained = "P"
+	routeQueueRetained = "Q"
 )
 
 func (r route) String() string {
 	if r.queue == "" {
-		return routePlain + routeSep + r.id
+		kind := routePlain
+		if r.retained {
+			kind = routePlainRetained
+		}
+
+		if r.origin == "" {
+			return kind + routeSep + r.id
+		}
+
+		return kind + routeSep + r.id + routeSep + r.origin
 	}
 
-	return routeQueue + routeSep + r.id + routeSep + string(r.tenant) + routeSep + r.queue + routeSep + r.subject
+	kind := routeQueue
+	if r.retained {
+		kind = routeQueueRetained
+	}
+
+	return kind + routeSep + r.id + routeSep + string(r.tenant) + routeSep + r.queue + routeSep + r.subject
 }
 
 // parseRoute reads a route back. ok is false for a packet the bridge did
 // not inject.
 func parseRoute(raw string) (route, bool) {
-	fields := strings.Split(raw, routeSep)
+	kind, rest, found := strings.Cut(raw, routeSep)
+	if !found {
+		return route{}, false //nolint:exhaustruct_v5 // nothing to return
+	}
 
-	const plainFields, queueFields = 2, 5
+	switch kind {
+	case routePlain, routePlainRetained:
+		id, origin, _ := strings.Cut(rest, routeSep)
 
-	switch {
-	case len(fields) == plainFields && fields[0] == routePlain:
-		return route{id: fields[1], tenant: "", queue: "", subject: ""}, true
-	case len(fields) == queueFields && fields[0] == routeQueue:
-		return route{id: fields[1], tenant: tenant.ID(fields[2]), queue: fields[3], subject: fields[4]}, true
+		return route{
+			id: id, tenant: "", queue: "", subject: "", origin: origin, retained: kind == routePlainRetained,
+		}, true
+	case routeQueue, routeQueueRetained:
+		const queueFields = 4
+
+		fields := strings.Split(rest, routeSep)
+		if len(fields) != queueFields {
+			return route{}, false //nolint:exhaustruct_v5 // nothing to return
+		}
+
+		return route{
+			id: fields[0], tenant: tenant.ID(fields[1]), queue: fields[2], subject: fields[3],
+			origin: "", retained: kind == routeQueueRetained,
+		}, true
 	default:
 		return route{}, false //nolint:exhaustruct_v5 // nothing to return
 	}
+}
+
+// retainedRoute reports from a server reference alone whether the bridge
+// injected the packet from a retained publish. It is on every outgoing
+// PUBLISH, so it parses nothing.
+func retainedRoute(ref string) bool {
+	return ref != "" && (ref[0] == routePlainRetained[0] || ref[0] == routeQueueRetained[0])
 }
 
 // servesQueue reports whether a mounted shared filter is the one a NATS queue
@@ -1183,10 +1375,16 @@ func (h *Hook) deliverRetained(cl *mqtt.Client, id tenant.ID, pk packets.Packet,
 
 // replayRetained sends this client every retained message one filter matches.
 func (h *Hook) replayRetained(cl *mqtt.Client, id tenant.ID, filter packets.Subscription) {
-	subjects, err := topic.FilterSubjects(string(id), unmount(id, filter.Filter))
+	bareFilter := unmount(id, filter.Filter)
+
+	subjects, err := topic.FilterSubjects(string(id), bareFilter)
 	if err != nil {
 		return
 	}
+
+	// The bucket is matched on encoded subjects, where '$' is just another
+	// character, so the rule that keeps "+/+" from "$SYS/x" is applied here.
+	wildTop := topic.StartsWithWildcard(bareFilter)
 
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
@@ -1205,6 +1403,10 @@ func (h *Hook) replayRetained(cl *mqtt.Client, id tenant.ID, filter packets.Subs
 	}
 
 	for _, msg := range messages {
+		if wildTop && strings.HasPrefix(msg.Topic, "$") {
+			continue // [MQTT-4.7.2-1]
+		}
+
 		if err := h.writeRetained(cl, id, filter, msg); err != nil {
 			h.log.Debug("delivering retained message",
 				"client", cl.ID, "topic", msg.Topic, "error", err)

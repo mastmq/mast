@@ -539,7 +539,7 @@ func newReplayWriter(q *Queuer, node string, targets []replayTarget) *replayWrit
 func (w *replayWriter) add(ctx context.Context, msg fabricMessage, header nats.Header) {
 	at, id := storedAt(header), header.Get(headerID)
 
-	w.idx.match(msg.tenant+"/"+msg.stored.Topic, func(key string, qos byte) {
+	w.idx.match(msg.tenant, msg.stored.Topic, func(key string, qos byte) {
 		if u := w.until[key]; !u.IsZero() && !at.Before(u.Add(clockSlack)) {
 			return
 		}

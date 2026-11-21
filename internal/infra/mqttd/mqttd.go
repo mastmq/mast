@@ -30,6 +30,13 @@ func New(cfg config.Config, hook *bridge.Hook, log *slog.Logger) (*mqtt.Server, 
 
 	server := mqtt.New(opts)
 	server.Options.Capabilities.MaximumClientWritesPending = clampWrites(cfg.MQTT.MaxWritesPending)
+	// mochi copies a PUBLISH's properties into the PUBACK or PUBREC that
+	// answers it unless told not to. User properties are allowed on an ack,
+	// so it is not a protocol violation, but they are addressed to the
+	// subscribers, the publisher already has them, and every QoS 1 or 2
+	// publish paid to send them twice. Clients that expect a bare ack drop
+	// the connection on it: the Paho test client did (#39).
+	server.Options.Capabilities.Compatibilities.NoInheritedPropertiesOnAck = true
 
 	hook.Attach(server)
 

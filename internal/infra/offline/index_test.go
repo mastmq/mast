@@ -5,9 +5,11 @@ import (
 	"maps"
 	"math/rand/v2"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
+	mqtttopic "github.com/mastmq/mast/internal/domain/topic"
 	mqtt "github.com/mastmq/mochi/v2"
 	"github.com/mastmq/mochi/v2/packets"
 )
@@ -54,6 +56,13 @@ func TestIndexMatchesLikeMochi(t *testing.T) {
 		return strings.Join(parts, "/")
 	}
 
+	// The queuer mounts every filter under its tenant; mochi is given the
+	// bare filters, because the answer owed is the one for the topic the
+	// device sees.
+	const tenant = "acme"
+
+	mount := tenant + "/"
+
 	for round := range 200 {
 		ours, theirs := newIndex(), mqtt.NewTopicsIndex()
 		subscribed := map[string][]string{}
@@ -65,7 +74,7 @@ func TestIndexMatchesLikeMochi(t *testing.T) {
 				filter := path(true)
 				qos := []byte{0, 1, 2}[rng.IntN(3)]
 
-				ours.subscribe(filter, key, qos)
+				ours.subscribe(mount+filter, key, qos)
 				theirs.Subscribe(key, packets.Subscription{Filter: filter, Qos: qos})
 				subscribed[key] = append(subscribed[key], filter)
 			}
@@ -75,7 +84,7 @@ func TestIndexMatchesLikeMochi(t *testing.T) {
 		for s := range 10 {
 			key := fmt.Sprintf("s%d", s)
 			for _, filter := range subscribed[key] {
-				ours.unsubscribe(filter, key)
+				ours.unsubscribe(mount+filter, key)
 				theirs.Unsubscribe(filter, key)
 			}
 		}
@@ -90,11 +99,31 @@ func TestIndexMatchesLikeMochi(t *testing.T) {
 
 			got := map[string]byte{}
 
-			ours.match(topic, func(key string, qos byte) { got[key] = qos })
+			ours.match(tenant, topic, func(key string, qos byte) { got[key] = qos })
 
 			if !maps.Equal(got, want) {
 				t.Fatalf("round %d, topic %q: got %v, mochi %v", round, topic, got, want)
 			}
+
+			// topic.Matches is what the edge corrects mochi with, so it is
+			// held to the same answers.
+			assertMatchesAgrees(t, round, topic, subscribed, want)
+		}
+	}
+}
+
+// assertMatchesAgrees checks topic.Matches against mochi's answer for the
+// sessions the property test left subscribed, s10 to s29.
+func assertMatchesAgrees(t *testing.T, round int, topic string, subscribed map[string][]string, want map[string]byte) {
+	t.Helper()
+
+	for s := 10; s < 30; s++ {
+		key := fmt.Sprintf("s%d", s)
+		matched := slices.ContainsFunc(subscribed[key], func(f string) bool { return mqtttopic.Matches(f, topic) })
+
+		if _, ok := want[key]; ok != matched {
+			t.Fatalf("round %d, topic %q, filters %q: topic.Matches says %v, mochi %v",
+				round, topic, subscribed[key], matched, ok)
 		}
 	}
 }
