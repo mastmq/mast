@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/mastmq/mast/internal/domain/tenant"
+	"github.com/mastmq/mast/internal/infra/admin"
 	"github.com/mastmq/mast/internal/infra/bridge"
 	"github.com/mastmq/mast/internal/infra/config"
 	"github.com/mastmq/mast/internal/infra/mqttd"
@@ -44,6 +45,7 @@ type Broker struct {
 	server *mqtt.Server
 	store  *store.Store
 	obs    *obs.Server
+	admin  *admin.Server
 	log    *slog.Logger
 	// tracing exports the bridge's spans, and is nil when tracing is off.
 	tracing *tracing.Provider
@@ -73,6 +75,9 @@ type Broker struct {
 // which is the only way to learn it when the configured address asked for
 // port zero.
 func (b *Broker) ObsAddr() string { return b.obs.Addr() }
+
+// AdminAddr reports where the admin API is served, empty when it is off.
+func (b *Broker) AdminAddr() string { return b.admin.Addr() }
 
 // Store exposes the durable state, for tests and for administrative tools.
 func (b *Broker) Store() *store.Store { return b.store }
@@ -109,7 +114,7 @@ func Start(
 	life, shutdown := context.WithCancel(context.WithoutCancel(ctx))
 
 	b := &Broker{
-		nats: nats, hook: nil, server: nil, store: nil, obs: nil, log: log, tracing: nil,
+		nats: nats, hook: nil, server: nil, store: nil, obs: nil, admin: nil, log: log, tracing: nil,
 		serving: atomic.Bool{}, closeOnce: sync.Once{},
 		life: life, shutdown: shutdown, wg: sync.WaitGroup{},
 		queueMu: sync.Mutex{}, queuer: nil, queueStore: nil,
@@ -137,13 +142,18 @@ func Start(
 	// the peers it is waiting for.
 	if cfg.Role == config.RoleCore {
 		b.wg.Go(func() { b.runCore(b.life, cfg, metrics) })
-		b.serving.Store(true)
+	} else if err := b.startMQTTSide(ctx, cfg, resolver, policy, metrics); err != nil {
+		b.abort()
 
-		return b, nil
+		return nil, err
 	}
 
-	if err := b.startMQTTSide(ctx, cfg, resolver, policy, metrics); err != nil {
-		b.abort()
+	// Last, so that on an edge the store it reads is already open and set:
+	// the handlers read b.store from their own goroutines, and starting
+	// them before it was written would be a race.
+	b.admin, err = admin.Serve(ctx, cfg.Admin, nats.Conn(), b.sharedStore, log)
+	if err != nil {
+		b.Close()
 
 		return nil, err
 	}
@@ -319,6 +329,7 @@ func (b *Broker) Close() {
 }
 
 func (b *Broker) close() {
+	b.admin.Close()
 	b.obs.Close()
 
 	if b.server != nil {
@@ -343,6 +354,20 @@ func (b *Broker) close() {
 	b.queueMu.Unlock()
 
 	b.nats.Shutdown()
+}
+
+// sharedStore is the store this node reads the cluster's durable state
+// through: its own on a node that serves MQTT, the queuer's on a core once
+// it has provisioned, nil until then.
+func (b *Broker) sharedStore() *store.Store {
+	if b.store != nil {
+		return b.store
+	}
+
+	b.queueMu.Lock()
+	defer b.queueMu.Unlock()
+
+	return b.queueStore
 }
 
 // openAttempt bounds one attempt to open the store, inside the overall

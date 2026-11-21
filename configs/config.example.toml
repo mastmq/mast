@@ -156,6 +156,21 @@ durable_max_age = "5m"
 [obs]
 addr = "127.0.0.1:9090"  # /metrics, /healthz, /readyz and net/http/pprof
 
+[admin]
+# The administrative HTTP API: list a tenant's sessions, read one, disconnect
+# a client, and a tenant's counts, across the whole cluster from any node.
+# Empty serves no API. Its own listener, apart from obs.addr, because this
+# one can disconnect devices; keep it off the public network.
+addr = ""
+# The bearer token every request presents, read once at startup. Required
+# when addr is set, at least 16 bytes, surrounding whitespace ignored. There
+# is no setting for the token itself, so it cannot end up in this file.
+token_file = ""
+# How long to wait for every node to answer a list or stats request. A node
+# slower than this is missing from that response, which says how many nodes
+# answered. Every list and stats request waits this long; at most 5s.
+gather = "500ms"
+
 [tracing]
 # OpenTelemetry traces of the message path: publish, the durable store, the
 # fabric between nodes, and delivery. Off, no tracer exists and a publish

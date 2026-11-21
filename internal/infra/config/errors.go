@@ -33,6 +33,15 @@ var (
 	// on nothing, which is the failure the stream exists to prevent.
 	ErrBadDurableMaxAge = errors.New("config: fabric.durable_max_age must be positive when fabric.durable_qos is on")
 
+	// ErrAdminNeedsToken guards against an admin API anyone who can reach
+	// it may use: it lists every tenant's devices and disconnects them.
+	ErrAdminNeedsToken = errors.New("config: admin.addr requires admin.token_file")
+
+	// ErrBadAdminGather guards against a gather window that closes before
+	// any other node can answer, which would report a cluster as one node,
+	// and one so long that every list and stats request waits it out.
+	ErrBadAdminGather = errors.New("config: admin.gather must be positive and at most 5s")
+
 	// ErrInvalidSampler guards against a typo that would otherwise fall
 	// back to sampling everything, or nothing, without a word.
 	ErrInvalidSampler = errors.New("config: invalid tracing.sampler")

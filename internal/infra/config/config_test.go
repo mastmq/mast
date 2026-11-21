@@ -182,6 +182,51 @@ func TestValidate(t *testing.T) {
 			func(c *config.Config) { c.Auth.HTTP.Timeout = 0 },
 			nil,
 		},
+		{
+			"an admin api with no token",
+			func(c *config.Config) { c.Admin.Addr = ":9091" },
+			config.ErrAdminNeedsToken,
+		},
+		{
+			"an admin api that waits for no node",
+			func(c *config.Config) {
+				c.Admin.Addr = ":9091"
+				c.Admin.TokenFile = "/run/secrets/admin"
+				c.Admin.Gather = 0
+			},
+			config.ErrBadAdminGather,
+		},
+		{
+			"an admin api that waits longer than any request should",
+			func(c *config.Config) {
+				c.Admin.Addr = ":9091"
+				c.Admin.TokenFile = "/run/secrets/admin"
+				c.Admin.Gather = 10 * time.Second
+			},
+			config.ErrBadAdminGather,
+		},
+		{
+			"an admin api at the longest gather",
+			func(c *config.Config) {
+				c.Admin.Addr = ":9091"
+				c.Admin.TokenFile = "/run/secrets/admin"
+				c.Admin.Gather = config.MaxAdminGather
+			},
+			nil,
+		},
+		{
+			"an admin api with a token file",
+			func(c *config.Config) {
+				c.Admin.Addr = ":9091"
+				c.Admin.TokenFile = "/run/secrets/admin"
+			},
+			nil,
+		},
+		{
+			"no admin api ignores its settings",
+			func(c *config.Config) { c.Admin.Gather = 0 },
+			nil,
+		},
 		{"unknown sampler", func(c *config.Config) { c.Tracing.Sampler = "ratio" }, config.ErrInvalidSampler},
 		{"sampling ratio above one", func(c *config.Config) { c.Tracing.SamplerArg = "1.5" }, config.ErrBadSamplerArg},
 		{"sampling ratio not a number", func(c *config.Config) { c.Tracing.SamplerArg = "1%" }, config.ErrBadSamplerArg},

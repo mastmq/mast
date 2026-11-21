@@ -103,7 +103,36 @@ type Config struct {
 	Auth    Auth    `json:"auth"    koanf:"auth"`
 	Session Session `json:"session" koanf:"session"`
 	Fabric  Fabric  `json:"fabric"  koanf:"fabric"`
+	Admin   Admin   `json:"admin"   koanf:"admin"`
 	Tracing Tracing `json:"tracing" koanf:"tracing"`
+}
+
+// defaultAdminGather is how long the admin API waits for nodes to answer a
+// question every node answers. Inside a cluster a reply takes milliseconds;
+// the rest is room for a node busy with a reconnect storm.
+const defaultAdminGather = 500 * time.Millisecond
+
+// MaxAdminGather bounds the admin API's gather window. Every list and stats
+// request waits the whole window, so a window of seconds is already a slow
+// API; one longer than this is a typo or a cluster too far apart for this
+// design, not a setting to accept quietly.
+const MaxAdminGather = 5 * time.Second
+
+// Admin configures the administrative HTTP API: listing a tenant's sessions,
+// reading one, disconnecting a client, and a tenant's counts.
+type Admin struct {
+	// Addr is the API's own listener. Empty, the default, serves no API.
+	// It is separate from obs.addr because that one is scraped by anything
+	// with network access to it, and this one can disconnect devices.
+	Addr string `json:"addr" koanf:"addr"`
+	// TokenFile holds the bearer token every request must present. There
+	// is no setting for the token itself: a secret in a config file ends
+	// up in version control, and a secret in an environment variable ends
+	// up in a process listing.
+	TokenFile string `json:"token_file" koanf:"token_file"`
+	// Gather is how long to wait for every node's answer. A node that
+	// answers later is missing from that response.
+	Gather time.Duration `json:"gather" koanf:"gather"`
 }
 
 // Tracing configures OpenTelemetry tracing of the message path.
@@ -384,6 +413,11 @@ func Default() Config {
 			DurableMaxAge: defaultDurableMaxAge,
 		},
 		Auth: defaultAuth(),
+		Admin: Admin{
+			Addr:      "",
+			TokenFile: "",
+			Gather:    defaultAdminGather,
+		},
 		Tracing: Tracing{
 			Enabled:    false,
 			Endpoint:   "",
@@ -519,11 +553,33 @@ func (c Config) Validate() error {
 		return fmt.Errorf("%w: got %v", ErrBadDurableMaxAge, c.Fabric.DurableMaxAge)
 	}
 
+	if err := c.validateAdmin(); err != nil {
+		return err
+	}
+
 	if err := c.validateTracing(); err != nil {
 		return err
 	}
 
 	return c.validateAuth()
+}
+
+// validateAdmin refuses an admin API that would be open, or that could
+// never hear from another node.
+func (c Config) validateAdmin() error {
+	if c.Admin.Addr == "" {
+		return nil
+	}
+
+	if c.Admin.TokenFile == "" {
+		return ErrAdminNeedsToken
+	}
+
+	if c.Admin.Gather <= 0 || c.Admin.Gather > MaxAdminGather {
+		return fmt.Errorf("%w: got %v", ErrBadAdminGather, c.Admin.Gather)
+	}
+
+	return nil
 }
 
 // validateTracing checks the sampler eagerly, even with tracing off, so that

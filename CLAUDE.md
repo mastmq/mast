@@ -32,6 +32,7 @@ Litmus test for `domain`: can the package be tested with no network, no filesyst
 | --- | --- |
 | `domain/topic` | the MQTT-topic ↔ NATS-subject codec. The most safety-critical package in the repo |
 | `domain/tenant` | `ID`, `Credentials`, `Identity`, and the `Resolver` / `Policy` interfaces |
+| `domain/admin` | the admin API's view types, its control-plane subjects, and the merge that pages a tenant's sessions across nodes and the store |
 | `infra/bridge` | the mochi-mqtt hook that is the whole broker. `bridge.go` is ~770 lines; `subs.go` is the refcounted NATS subscription registry |
 | `infra/broker` | assembles a node from natsd + store + bridge + mqttd. Home of the end-to-end tests |
 | `infra/natsd` | the embedded `nats-server` and the in-process `nats.Conn` |
@@ -43,6 +44,7 @@ Litmus test for `domain`: can the package be tested with no network, no filesyst
 | `infra/jwtauth` | local token verification |
 | `infra/config` | koanf: defaults → TOML → env → flags |
 | `infra/obs` | Prometheus metrics, `/healthz` (liveness), `/readyz` (readiness: an edge's leaf link, a core's JetStream), pprof |
+| `infra/admin` | the admin HTTP API: bearer token from a file, scatter and gather over `mast.admin.>`, the stored half from `store` |
 | `infra/tracing` | builds the OpenTelemetry tracer provider and OTLP/HTTP exporter. The spans themselves are in `bridge/trace.go` |
 | `infra/memlimit` | sets GOMEMLIMIT from the container's cgroup limit, which Go does not read by itself |
 
@@ -139,6 +141,8 @@ Both tokens go through `topic.EncodeToken`, which is the single-token form of th
 A notice carries the **connection's** owner token, not the node's. The node that publishes is also subscribed, so it has to recognise its own notice, and identifying by node would make two connections on one node indistinguishable. `NodeID` exists only so a log line can say where a client went, and it is the embedded server's id rather than the configured name — the name defaults to the role, so every edge pod would answer to `mast-edge`.
 
 **A node holds one subscription to the control plane, `mast.session.>`, not one per client.** The per-client version was the obvious shape and cost a goroutine, a SUB round trip and a cluster-wide interest update per CONNECT, held for as long as the session lived — an edge with 25k sleeping persistent sessions held 25k subscriptions for them. Now every notice in the cluster reaches every node and a map lookup on the subject decides whether it matters, before the JSON is even decoded. `BenchmarkConnect` reports `nats-subs/client`; it must stay at zero. The bench repo's RESULTS.md once recorded this design as 6.5× slower in a two-edge storm; the 2026-10-05 entry there shows that was the harness, and that a storm comparison needs exact-name kills of the previous brokers and a minute of idle between runs before its numbers mean anything.
+
+`mast.admin.>` is the admin API's control plane, under the same rule: outside `t.`, one subscription per node (`bridge/admin.go`), tenant and client id in the body rather than the subject. A list or stats request waits `admin.gather` for every node; a get or a disconnect is answered only by the node holding the client. An admin disconnect is `DisconnectClient` with *administrative action*, deliberately not a session notice — a takeover empties the session for a new owner that here does not exist. Every answer is one NATS message, so it must fit `max_payload`: a list reply is filled to the budget and marked truncated (`admin.EncodeList`), `admin.Merge` ends the page at the lowest cut, and an answer that cannot be sent becomes an `admin.Failure`. A refused reply is indistinguishable from an absent node, which is how a page once lost a node's clients for good. See `docs/ARCHITECTURE.md`.
 
 A failed claim logs and continues rather than refusing the connection. Without it a client can end up live in two places, which is the bug this prevents; refusing outright would turn duplicate delivery into an outage.
 

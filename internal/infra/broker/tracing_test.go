@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/eclipse/paho.golang/paho"
+	"github.com/mastmq/mast/internal/domain/admin"
 	"github.com/mastmq/mast/internal/infra/config"
 	natsgo "github.com/nats-io/nats.go"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -239,5 +240,79 @@ func TestTracingOffLeavesTheMessageAlone(t *testing.T) {
 		}
 	case <-time.After(settle):
 		t.Fatal("nothing crossed the fabric")
+	}
+}
+
+// TestClusterAdminWithTracing runs the admin API on every node and tracing
+// on the edges at once. The two arrived in separate branches that each
+// adjusted the cluster's configuration their own way — one for every node,
+// one for edges only — and each touched the bridge's NATS side, so this
+// holds that an edge doing both still traces a message across the fabric
+// and still answers and acts on an admin request for a client it holds.
+func TestClusterAdminWithTracing(t *testing.T) {
+	sink := newOTLPSink(t)
+
+	c := startClusterWith(t, func(cfg *config.Config) {
+		cfg.Tracing.Enabled = true
+		cfg.Tracing.Endpoint = sink.url
+		cfg.Tracing.Sampler = "always_on"
+	}, withAdmin(t))
+
+	subNode, pubNode := c.edges[0].NATS().ID(), c.edges[1].NATS().ID()
+
+	sub := dialV5(t, c.addrs[0], "dashboard")
+	sub.subscribe(t, "telemetry/+")
+
+	pub := dialV5(t, c.addrs[1], "sensor")
+
+	delivered := waitForLeaf(func() bool {
+		pub.publish(t, &paho.Publish{Topic: "telemetry/temp", QoS: 1, Payload: []byte("21.5")})
+
+		return len(sub.received()) > 0
+	})
+	if !delivered {
+		t.Fatal("the publish never crossed the fabric")
+	}
+
+	// Asked of the core, which has tracing off and holds no client.
+	var s admin.Session
+
+	ok := waitForLeaf(func() bool {
+		var status int
+
+		status, s = getSession(t, c.core.AdminAddr(), "acme", "dashboard")
+
+		return status == http.StatusOK && s.Connected
+	})
+	if !ok || s.Node != subNode {
+		t.Fatalf("the core's view of the subscriber = %+v, want connected on %s", s, subNode)
+	}
+
+	// Asked of the subscriber's edge, for the publisher the other edge holds.
+	status, body := call(t, http.MethodPost, c.edges[0].AdminAddr(), "/v1/tenants/acme/sessions/sensor/disconnect")
+	if status != http.StatusOK {
+		t.Fatalf("disconnect: %d %s", status, body)
+	}
+
+	gone := waitForLeaf(func() bool {
+		status, _ := getSession(t, c.core.AdminAddr(), "acme", "sensor")
+
+		return status == http.StatusNotFound
+	})
+	if !gone {
+		t.Fatal("a disconnect asked of one edge did not drop the clean client on the other")
+	}
+
+	// Closing an edge flushes what its exporter still holds.
+	c.stopEdge(1)
+	c.stopEdge(0)
+
+	for _, want := range []exportedSpan{
+		{name: "mqtt.publish", node: pubNode, traceID: "", spanID: "", parentID: ""},
+		{name: "mqtt.deliver", node: subNode, traceID: "", spanID: "", parentID: ""},
+	} {
+		if _, ok := sink.find(func(s exportedSpan) bool { return s.name == want.name && s.node == want.node }); !ok {
+			t.Errorf("no %s span exported from %s", want.name, want.node)
+		}
 	}
 }

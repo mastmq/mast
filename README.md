@@ -28,12 +28,13 @@ Verified by the end-to-end tests in `internal/infra/broker`, which drive a real 
 - **Shared subscriptions** — `$share/<group>/<filter>` maps onto a NATS queue group, and each message reaches exactly one member. Note that a queue group serves a local member first, so work stays on the producer's node rather than spreading round-robin across the group; see [ARCHITECTURE.md](docs/ARCHITECTURE.md) for why and what to do if that matters
 - One NATS subscription per distinct filter rather than per device, released when the last subscriber disconnects
 - **Cross-node delivery** — edges join the core as leaf nodes, and a message published on one edge reaches a subscriber on another, with tenant isolation holding across the boundary. QoS 0 crosses on core NATS; QoS 1 and 2 are stored on one replicated JetStream stream before the publisher is acknowledged, and each node reads it through one consumer of its own, so a node cut off from the core for a moment catches up rather than losing what was published for its clients. [Delivery guarantees](https://github.com/mastmq/docs/blob/main/guides/delivery-guarantees.md) sets out exactly what each QoS promises and where it still does not
-
 - **MQTT 5 message properties** — content type, response topic, correlation data, payload format, user properties and message expiry travel with the message across the fabric and through retained messages and offline queues, so MQTT 5 request/response works between nodes. An expired retained or queued message is not delivered
 - **HTTP authentication and authorization** — post the MQTT fields to your own service and let it name the tenant and rule on each topic
 - **Portable sessions** — subscriptions live in a shared bucket and the offline queue on a shared stream, filled by the core tier, so a device that reconnects to a different node finds its session and whatever QoS 1 or 2 traffic it missed, even when the edge it last used has since been restarted. Verified by a cluster test and by killing cores and edges under load in a three-core, three-edge cluster
 - **Tracing, when asked for** — OpenTelemetry spans for a publish, its durable store, its NATS hop and every node's delivery of it, exported over OTLP/HTTP. Trace context crosses nodes in W3C headers on the NATS message, and an MQTT 5 client that sends a `traceparent` user property has its publish traced inside its own trace and its subscribers handed the span that delivered to them. Off by default, and off it costs the publish path a comparison; see [Tracing](#tracing)
 - **Cross-node takeover** — a second connection with an existing client id disconnects the first wherever in the cluster it is, which MQTT requires and a single node cannot do alone. Client ids are scoped to their tenant, so one tenant cannot displace another's device by reusing an id
+
+An [admin API](#admin-api), off by default, lists and disconnects a tenant's sessions across the cluster. End-to-end tests cover it; the fire drills have not run against it yet.
 
 Not yet: per-tenant quotas, connection rate limiting, full QoS for shared subscriptions whose members span nodes, and queueing for a connected device between its edge being killed outright and its reconnecting elsewhere. Each of these has an issue, and the [roadmap](ROADMAP.md) lists them with the rest of what comes next.
 
@@ -125,6 +126,24 @@ The tenant comes from `auth.jwt.tenant_claim`, and `auth.jwt.superuser_claim` by
 ### Both
 
 Two things worth knowing before you point this at production. Authorization is asked **on every publish**, so it is cached with a TTL — set `cache_ttl = "0s"` if decisions must take effect instantly, and accept a network round trip per message. And authentication **always fails closed** whatever `on_error` says, because admitting a connection whose tenant is unknown would mean inventing an isolation boundary; `on_error` governs authorization only.
+
+## Admin API
+
+An HTTP API for operators, off until `admin.addr` is set. It has its own listener, apart from the metrics one, because it can disconnect devices. Every request carries `Authorization: Bearer <token>`, where the token is read once at startup from `admin.token_file`; there is no setting for the token itself, so it cannot end up in a config file or an environment listing. The comparison is constant-time.
+
+| Request | Answers |
+| --- | --- |
+| `GET /v1/tenants/{tenant}/sessions?limit=&cursor=` | a page of the tenant's sessions, connected or stored, in client id order; `next` is the cursor for the following page |
+| `GET /v1/tenants/{tenant}/sessions/{client}` | one session: where it is connected, its subscriptions, what is in flight and what is queued |
+| `POST /v1/tenants/{tenant}/sessions/{client}/disconnect` | disconnects the client with MQTT 5's *administrative action* reason, on whichever node holds it; a persistent session is kept, as if the device had gone by itself |
+| `GET /v1/tenants/{tenant}/stats` | connections, subscriptions, stored sessions and queued messages |
+
+Any node answers for the cluster, a core included. Connected clients are known only to the node holding them, so the API asks every node over the control plane and waits `admin.gather` for answers; a list or stats request always waits that long, and says in `nodes` how many answered. A get or a disconnect returns as soon as the holding node replies. A client id containing `/` is sent escaped, as `%2F`. A node's answer crosses the cluster as one NATS message, so a page stops early when a node's clients and their filters would not fit in one, and `next` carries on from there; a client whose filters alone do not fit comes back with the first of them and `subscriptions_truncated` set, while `stats` still counts them all.
+
+```console
+$ curl -H "Authorization: Bearer $(cat /run/secrets/mast-admin)" localhost:9091/v1/tenants/acme/stats
+{"tenant":"acme","connections":2,"subscriptions":3,"stored_sessions":2,"queued_messages":1,"nodes":2}
+```
 
 ## Configuration
 

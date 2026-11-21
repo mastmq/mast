@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/mastmq/mast/internal/domain/tenant"
-	"github.com/mastmq/mast/internal/domain/topic"
 	"github.com/mastmq/mast/internal/infra/obs"
 	"github.com/mastmq/mast/internal/infra/store"
 	mqtt "github.com/mastmq/mochi/v2"
@@ -14,15 +13,10 @@ import (
 )
 
 // sessionKey is where a client's durable state lives in the key-value
-// buckets.
-//
-// Both tokens are escaped for the same reason the control-plane subject
-// escapes them, and because the codec's character set was chosen so that an
-// encoded token is also a valid JetStream key. A client id arrives from the
-// wire; unescaped it could collide with another client's key or fail to
-// store at all.
+// buckets. The format belongs to the store, which lists and counts by it;
+// see [store.SessionKey].
 func sessionKey(id tenant.ID, clientID string) string {
-	return topic.EncodeToken(string(id)) + "." + topic.EncodeToken(clientID)
+	return store.SessionKey(string(id), clientID)
 }
 
 // persistSession records what a connected client is subscribed to, so
