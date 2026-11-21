@@ -12,7 +12,7 @@ A gap listed here is still a gap. [Delivery guarantees](https://github.com/mastm
 
 **Shared subscriptions across nodes** ([#27](https://github.com/mastmq/mast/issues/27)). A `$share` group whose members span nodes is served on core NATS, so the cross-node hop is at-most-once and distribution is local-first. Serving groups from the replicated stream needs a consumer per group, bounded, which is a different design.
 
-**Admin API** ([#28](https://github.com/mastmq/mast/issues/28)). An HTTP API, off by default, to list and inspect a tenant's sessions, disconnect a client and read a tenant's counts from any node.
+**Admin API** ([#28](https://github.com/mastmq/mast/issues/28)). An HTTP API, off by default, to list and inspect a tenant's sessions, disconnect a client and read a tenant's counts from any node. Done on main for the next release: the `[admin]` block serves it on its own listener with a bearer token read from a file, and the Helm chart (`admin.*`) and the Ansible role (`mast_admin_*`) can turn it on. [Admin API](README.md#admin-api) shows the endpoints.
 
 **OpenTelemetry tracing** ([#29](https://github.com/mastmq/mast/issues/29)). One trace for one message, from the publisher's listener through the fabric to the subscriber's session, at close to no cost when sampled out. Done on main for the next release: the `[tracing]` block, off by default, exports spans over OTLP/HTTP and carries W3C trace context across nodes and through MQTT 5 user properties. [Tracing](README.md#tracing) shows how to turn it on.
 
